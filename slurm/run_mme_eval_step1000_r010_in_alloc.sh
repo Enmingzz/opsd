@@ -1,0 +1,67 @@
+#!/bin/bash
+# Evaluate divprune_lite retention ratio 0.10 on MME using an existing 4xL40S allocation.
+set -euo pipefail
+
+source /project/6101803/enmingzz/env/vsi-official.sh
+cd /project/6101803/enmingzz
+
+export HF_HOME=/scratch/enmingzz/hf_cache
+export TRANSFORMERS_CACHE=/scratch/enmingzz/hf_cache
+export TOKENIZERS_PARALLELISM=false
+
+OUT_DIR=/scratch/enmingzz/temp/opsd_runs/real_single_r025/mme_r010
+EVAL_JSONL=/scratch/enmingzz/temp/opsd_data/mme_test.jsonl
+IMAGE_ROOT=/scratch/enmingzz/temp/opsd_data/mme_images
+ADAPTER=/scratch/enmingzz/temp/opsd_runs/real_single_r025/divprune_kl_single_r025_ddp4/step_1000
+mkdir -p "${OUT_DIR}/shards"
+
+run_shard() {
+  local shard="$1"
+  local gpu="$2"
+  local out="${OUT_DIR}/shards/eval_step1000_r010_mme_shard${shard}.jsonl"
+  local log="${OUT_DIR}/shards/eval_step1000_r010_mme_shard${shard}.log"
+  echo "Starting MME r=0.10 shard ${shard} on GPU ${gpu} at $(date)"
+  CUDA_VISIBLE_DEVICES="${gpu}" python opsd/scripts/eval_qwen25vl_pruned_student.py \
+    --model_name_or_path Qwen/Qwen2.5-VL-7B-Instruct \
+    --adapter_path "${ADAPTER}" \
+    --eval_jsonl "${EVAL_JSONL}" \
+    --image_root "${IMAGE_ROOT}" \
+    --output_jsonl "${out}" \
+    --keep_ratio 0.10 \
+    --pruner divprune_lite \
+    --student_input_mode drop_tokens \
+    --max_new_tokens 16 \
+    --num_shards 4 \
+    --shard_index "${shard}" \
+    --skip_full_token_base true \
+    --attn_implementation flash_attention_2 \
+    > "${log}" 2>&1
+  echo "Finished MME r=0.10 shard ${shard} at $(date)"
+}
+
+run_shard 0 0 &
+pid0=$!
+run_shard 1 1 &
+pid1=$!
+run_shard 2 2 &
+pid2=$!
+run_shard 3 3 &
+pid3=$!
+
+wait "${pid0}"
+wait "${pid1}"
+wait "${pid2}"
+wait "${pid3}"
+
+cat \
+  "${OUT_DIR}/shards/eval_step1000_r010_mme_shard0.jsonl" \
+  "${OUT_DIR}/shards/eval_step1000_r010_mme_shard1.jsonl" \
+  "${OUT_DIR}/shards/eval_step1000_r010_mme_shard2.jsonl" \
+  "${OUT_DIR}/shards/eval_step1000_r010_mme_shard3.jsonl" \
+  > "${OUT_DIR}/eval_step1000_r010_mme_full.jsonl"
+
+python opsd/scripts/score_mme_eval.py \
+  --eval_jsonl "${OUT_DIR}/eval_step1000_r010_mme_full.jsonl" \
+  --output_dir "${OUT_DIR}/score_step1000_r010_full"
+
+echo "MME r=0.10 eval complete at $(date)"

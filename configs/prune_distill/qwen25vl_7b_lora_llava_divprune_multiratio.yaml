@@ -1,0 +1,35 @@
+model_name_or_path: Qwen/Qwen2.5-VL-7B-Instruct
+student_input_mode: drop_tokens
+pruner: divprune_lite
+divprune_grid_floor: true
+divprune_grid_size: 4
+divprune_chunk_size: 8192
+loss: kl_only
+enable_ce_baseline: false
+distill_mode: teacher_rollout
+on_policy_mix: 0.0
+temperature: 2.0
+kd_topk: 0
+kd_alpha: 1.0
+ce_alpha: 0.0
+keep_ratios: [0.5, 0.25, 0.125]
+ratio_sampling_probs: [0.25, 0.5, 0.25]
+sample_budget_each_step: true
+max_new_tokens: 32
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+lr: 2.0e-5
+weight_decay: 0.0
+num_train_epochs: 1
+gradient_accumulation_steps: 16
+max_steps: 1000
+save_every: 500
+eval_every: 500
+log_every: 10
+teacher_confidence_weighting: true
+filter_teacher_wrong: false
+bf16: true
+attn_implementation: flash_attention_2
+seed: 42

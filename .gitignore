@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments and editors
+.env
+.venv/
+venv/
+.idea/
+.vscode/
+
+# Experiment outputs and large artifacts
+outputs/
+results/
+checkpoints/
+wandb/
+logs/
+cache/
+.cache/
+
+# Model and dataset artifacts
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+*.pkl
+*.parquet
+*.jsonl
+*.arrow
+
+# Slurm runtime output
+slurm-*.out
+slurm-*.err
+*.out
+*.err
+
+# OS files
+.DS_Store
