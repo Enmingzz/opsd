@@ -63,21 +63,32 @@ Our wrapper already matched the official attention/key extraction path:
 
 VLMEvalKit registration is correct for the pure VisionZip baseline:
 
-- model mode: `visionzip_base`
+- model mode: `official_visionzip_base`
 - no LoRA adapter loaded
 - ratios: 5%, 10%, 20%, 30%
 - direct-answer prompt mode
 - max generation: MME/POPE 16, MMStar 32
 
-New official-split evaluation has been submitted:
+Important correction on 2026-06-10: the earlier official-split job under
+`visionzip_base_official_split_vlmevalkit_mme_mmstar_pope_ratios_005_010_020_030`
+did not actually run the official model. VLMEvalKit wrote `status=done`, but
+each dataset carried `error_message="No module named 'transformers.models.qwen2_5_vl'`
+and no metrics. That directory must be ignored.
 
-- Slurm job: `3909846`
+The wrapper now calls `bootstrap_qwen25()` before importing the official
+`qwen2_5vl_visionzip.py`, so it uses the Qwen2.5-VL-capable transformers from
+`/scratch/enmingzz/temp/qwen25_bootstrap` instead of VLMEvalKit's older local
+transformers.
+
+New official Qwen2.5-VL VisionZip evaluation has been submitted:
+
+- Slurm job: `3924021`
 - Account: `aip-btaati`
 - GPU request: `4*l40s`
 - Script: `/project/6101803/enmingzz/opsd/scripts/eval_visionzip_base_official_split_vlmevalkit_mme_mmstar_pope.sh`
 - Sbatch: `/project/6101803/enmingzz/opsd/slurm_jobs/eval_visionzip_base_official_split_vlmevalkit_mme_mmstar_pope_btaati_8h.sbatch`
-- Work dir: `/scratch/enmingzz/outputs/visionzip_aokvqa_reasoning/eval_vlmevalkit/visionzip_base_official_split_vlmevalkit_mme_mmstar_pope_ratios_005_010_020_030`
-- Project summary: `/project/6101803/enmingzz/opsd/report/visionzip_base_official_split_vlmevalkit_mme_mmstar_pope_ratios_005_010_020_030.md`
+- Work dir: `/scratch/enmingzz/outputs/visionzip_aokvqa_reasoning/eval_vlmevalkit/visionzip_base_official_qwen25vl_vlmevalkit_mme_mmstar_pope_ratios_005_010_020_030`
+- Project summary: `/project/6101803/enmingzz/opsd/report/visionzip_base_official_qwen25vl_vlmevalkit_mme_mmstar_pope_ratios_005_010_020_030.md`
 
 ## Checks Run
 
@@ -95,6 +106,10 @@ New official-split evaluation has been submitted:
   - `opsd_qwen25vl_visionzip_base_r010`
   - `opsd_qwen25vl_visionzip_base_r020`
   - `opsd_qwen25vl_visionzip_base_r030`
+- VLMEvalKit config import check also confirms the four VisionZip reasoning
+  baseline names are registered with `model_mode="official_visionzip_base"`.
+- Import preflight confirms official `qwen2_5vl_visionzip.py` loads after
+  bootstrapping Qwen2.5-VL transformers.
 
 ## Old-Split Scores For Reference Only
 

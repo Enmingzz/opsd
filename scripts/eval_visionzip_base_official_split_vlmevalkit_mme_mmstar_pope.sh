@@ -5,9 +5,10 @@ PROJECT_ROOT="/project/6101803/enmingzz"
 REPO_ROOT="${PROJECT_ROOT}/opsd"
 OUT_ROOT="/scratch/enmingzz/outputs/visionzip_aokvqa_reasoning"
 VLMEVALKIT_ROOT="${PROJECT_ROOT}/vlm/official_thinking_in_space/third_party/VLMEvalKit"
+OFFICIAL_VISIONZIP_QWEN25VL_ROOT="${PROJECT_ROOT}/vlm/official_thinking_in_space/third_party/VisionZip/Qwen2_5_VL"
 OPENCV_ROOT="/cvmfs/soft.computecanada.ca/easybuild/software/2023/x86-64-v3/CUDA/gcc12/cuda12.2/opencv/4.11.0"
 
-EVAL_NAME="visionzip_base_official_split_vlmevalkit_mme_mmstar_pope_ratios_005_010_020_030"
+EVAL_NAME="visionzip_base_official_qwen25vl_vlmevalkit_mme_mmstar_pope_ratios_005_010_020_030"
 WORK_DIR="${OUT_ROOT}/eval_vlmevalkit/${EVAL_NAME}"
 LOG_DIR="${OUT_ROOT}/logs/full/eval_${EVAL_NAME}"
 REPORT_DIR="${OUT_ROOT}/reports/${EVAL_NAME}"
@@ -23,12 +24,22 @@ export PYTORCH_ALLOC_CONF="expandable_segments:True"
 export PYTHONNOUSERSITE=1
 unset MMEVAL_ROOT
 
-export PYTHONPATH="${VLMEVALKIT_ROOT}:${PROJECT_ROOT}:${PROJECT_ROOT}/vlm/official_thinking_in_space:${OPENCV_ROOT}/lib/python3.11/site-packages:${PYTHONPATH:-}"
+export PYTHONPATH="${OFFICIAL_VISIONZIP_QWEN25VL_ROOT}:${VLMEVALKIT_ROOT}:${PROJECT_ROOT}:${PROJECT_ROOT}/vlm/official_thinking_in_space:${OPENCV_ROOT}/lib/python3.11/site-packages:${PYTHONPATH:-}"
 export LD_LIBRARY_PATH="${OPENCV_ROOT}/lib64:${OPENCV_ROOT}/lib:${LD_LIBRARY_PATH:-}"
 
 mkdir -p "${WORK_DIR}" "${LOG_DIR}" "${REPORT_DIR}" "${LMUData}" "${REPO_ROOT}/report"
 
 cd "${VLMEVALKIT_ROOT}"
+
+python - <<'PY'
+from opsd.visionzip_aokvqa.qwen_wrapper import bootstrap_qwen25
+
+bootstrap_qwen25()
+from qwen2_5vl_visionzip import Qwen2_5_VLForConditionalGeneration  # noqa: F401
+from transformers import AutoProcessor  # noqa: F401
+
+print("Official Qwen2.5-VL VisionZip import preflight passed.")
+PY
 
 MODELS=(
   "opsd_qwen25vl_visionzip_base_r005"
@@ -78,9 +89,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-work_dir = Path("/scratch/enmingzz/outputs/visionzip_aokvqa_reasoning/eval_vlmevalkit/visionzip_base_official_split_vlmevalkit_mme_mmstar_pope_ratios_005_010_020_030")
-report_dir = Path("/scratch/enmingzz/outputs/visionzip_aokvqa_reasoning/reports/visionzip_base_official_split_vlmevalkit_mme_mmstar_pope_ratios_005_010_020_030")
-project_report = Path("/project/6101803/enmingzz/opsd/report/visionzip_base_official_split_vlmevalkit_mme_mmstar_pope_ratios_005_010_020_030.md")
+work_dir = Path("/scratch/enmingzz/outputs/visionzip_aokvqa_reasoning/eval_vlmevalkit/visionzip_base_official_qwen25vl_vlmevalkit_mme_mmstar_pope_ratios_005_010_020_030")
+report_dir = Path("/scratch/enmingzz/outputs/visionzip_aokvqa_reasoning/reports/visionzip_base_official_qwen25vl_vlmevalkit_mme_mmstar_pope_ratios_005_010_020_030")
+project_report = Path("/project/6101803/enmingzz/opsd/report/visionzip_base_official_qwen25vl_vlmevalkit_mme_mmstar_pope_ratios_005_010_020_030.md")
 
 rows = []
 for status_file in sorted(work_dir.glob("opsd_qwen25vl_visionzip_base_r*/T*/status.json")):
@@ -102,13 +113,17 @@ for status_file in sorted(work_dir.glob("opsd_qwen25vl_visionzip_base_r*/T*/stat
         "mmstar": mmstar.get("split=none|Overall"),
         "pope": pope.get("split=Overall|Overall"),
         "status": {name: datasets.get(name, {}).get("status", "missing") for name in ["MME", "MMStar", "POPE"]},
+        "errors": {name: datasets.get(name, {}).get("error_message") for name in ["MME", "MMStar", "POPE"]},
         "status_file": status_file,
     })
+if not rows:
+    raise SystemExit(f"No status.json files found under {work_dir}")
 
 lines = [
-    "# VisionZip Base Official-Split VLMEvalKit Evaluation",
+    "# VisionZip Base Official Qwen2.5-VL VLMEvalKit Evaluation",
     "",
     "- Model: `Qwen2.5-VL-7B-Instruct`, no LoRA adapter",
+    "- Implementation: official `Qwen2_5_VL/qwen2_5vl_visionzip.py`",
     "- VisionZip split: contextual = `int(0.05 * original_visual_tokens)`, dominant = retention budget minus contextual",
     "- Datasets: `MME`, `MMStar`, `POPE`",
     "- Mode: direct answer",
@@ -120,6 +135,9 @@ lines = [
 ]
 for row in rows:
     status = ", ".join(f"{k}:{v}" for k, v in row["status"].items())
+    errors = {k: v for k, v in row["errors"].items() if v}
+    if errors:
+        status += "; errors=" + "; ".join(f"{k}:{v}" for k, v in errors.items())
     mmstar = "" if row["mmstar"] is None else f"{float(row['mmstar']) * 100:.2f}"
     lines.append(
         "| {ratio} | {status} | {mme_total} | {mme_perception} | {mme_reasoning} | {mmstar} | {pope} |".format(
@@ -147,6 +165,17 @@ project_report.parent.mkdir(parents=True, exist_ok=True)
 (report_dir / "summary.md").write_text(text)
 project_report.write_text(text)
 print(f"Wrote {project_report}")
+
+failed = []
+for row in rows:
+    for dataset, status in row["status"].items():
+        error = row["errors"].get(dataset)
+        if status != "done" or error:
+            failed.append(f"{row['ratio']} {dataset}: status={status}, error={error}")
+    if row["mme_total"] is None or row["mmstar"] is None or row["pope"] is None:
+        failed.append(f"{row['ratio']}: missing one or more metrics")
+if failed:
+    raise SystemExit("Evaluation produced invalid status/metrics:\n" + "\n".join(failed))
 PY
 
 echo "[$(date --iso-8601=seconds)] Finished official-split VisionZip VLMEvalKit evaluation"
