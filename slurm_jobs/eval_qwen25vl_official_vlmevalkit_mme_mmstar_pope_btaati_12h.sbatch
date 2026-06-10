@@ -8,11 +8,11 @@
 #SBATCH --mem=80G
 #SBATCH --time=12:00:00
 #SBATCH --job-name=qwen25vl_eval
-#SBATCH --output=/project/6101803/enmingzz/outputs/visionzip_aokvqa_reasoning/logs/full/eval_qwen25vl_official_7b_vlmevalkit_mme_mmstar_pope/slurm-%j.out
-#SBATCH --error=/project/6101803/enmingzz/outputs/visionzip_aokvqa_reasoning/logs/full/eval_qwen25vl_official_7b_vlmevalkit_mme_mmstar_pope/slurm-%j.err
+#SBATCH --output=/scratch/enmingzz/outputs/visionzip_aokvqa_reasoning/logs/full/eval_qwen25vl_official_7b_qwen25bootstrap_vlmevalkit_mme_mmstar_pope/slurm-%j.out
+#SBATCH --error=/scratch/enmingzz/outputs/visionzip_aokvqa_reasoning/logs/full/eval_qwen25vl_official_7b_qwen25bootstrap_vlmevalkit_mme_mmstar_pope/slurm-%j.err
 
 set -euo pipefail
 
-mkdir -p /project/6101803/enmingzz/outputs/visionzip_aokvqa_reasoning/logs/full/eval_qwen25vl_official_7b_vlmevalkit_mme_mmstar_pope
+mkdir -p /scratch/enmingzz/outputs/visionzip_aokvqa_reasoning/logs/full/eval_qwen25vl_official_7b_qwen25bootstrap_vlmevalkit_mme_mmstar_pope
 
 /bin/bash /project/6101803/enmingzz/opsd/scripts/eval_qwen25vl_official_vlmevalkit_mme_mmstar_pope.sh

@@ -3,12 +3,13 @@ set -euo pipefail
 
 PROJECT_ROOT="/project/6101803/enmingzz"
 REPO_ROOT="${PROJECT_ROOT}/opsd"
-OUT_ROOT="${PROJECT_ROOT}/outputs/visionzip_aokvqa_reasoning"
+OUT_ROOT="/scratch/enmingzz/outputs/visionzip_aokvqa_reasoning"
 VLMEVALKIT_ROOT="${PROJECT_ROOT}/vlm/official_thinking_in_space/third_party/VLMEvalKit"
+QWEN25_BOOTSTRAP="/scratch/enmingzz/temp/qwen25_bootstrap"
 OPENCV_ROOT="/cvmfs/soft.computecanada.ca/easybuild/software/2023/x86-64-v3/CUDA/gcc12/cuda12.2/opencv/4.11.0"
 
 MODEL_NAME="Qwen2.5-VL-7B-Instruct"
-EVAL_NAME="qwen25vl_official_7b_vlmevalkit_mme_mmstar_pope"
+EVAL_NAME="qwen25vl_official_7b_qwen25bootstrap_vlmevalkit_mme_mmstar_pope"
 WORK_DIR="${OUT_ROOT}/eval_vlmevalkit/${EVAL_NAME}"
 LOG_DIR="${OUT_ROOT}/logs/full/eval_${EVAL_NAME}"
 REPORT_DIR="${OUT_ROOT}/reports/${EVAL_NAME}"
@@ -24,12 +25,24 @@ export PYTORCH_ALLOC_CONF="expandable_segments:True"
 export PYTHONNOUSERSITE=1
 unset MMEVAL_ROOT
 
-export PYTHONPATH="${VLMEVALKIT_ROOT}:${PROJECT_ROOT}:${PROJECT_ROOT}/vlm/official_thinking_in_space:${OPENCV_ROOT}/lib/python3.11/site-packages:${PYTHONPATH:-}"
+export PYTHONPATH="${QWEN25_BOOTSTRAP}:${VLMEVALKIT_ROOT}:${PROJECT_ROOT}:${PROJECT_ROOT}/vlm/official_thinking_in_space:${OPENCV_ROOT}/lib/python3.11/site-packages:${PYTHONPATH:-}"
 export LD_LIBRARY_PATH="${OPENCV_ROOT}/lib64:${OPENCV_ROOT}/lib:${LD_LIBRARY_PATH:-}"
 
 mkdir -p "${WORK_DIR}" "${LOG_DIR}" "${REPORT_DIR}" "${LMUData}" "${REPO_ROOT}/report"
 
 cd "${VLMEVALKIT_ROOT}"
+
+python - <<'PY'
+from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+from vlmeval.config import supported_VLM
+
+assert "Qwen2.5-VL-7B-Instruct" in supported_VLM
+print(
+    "Qwen2.5-VL base import preflight passed:",
+    Qwen2_5_VLForConditionalGeneration.__name__,
+    AutoProcessor.__name__,
+)
+PY
 
 echo "[$(date --iso-8601=seconds)] Starting official VLMEvalKit ${MODEL_NAME}"
 echo "Work dir: ${WORK_DIR}"
@@ -46,30 +59,34 @@ find "${WORK_DIR}" -name status.json -type f | sort > "${REPORT_DIR}/status_file
 python - <<'PY'
 from __future__ import annotations
 
-import csv
+import json
 from pathlib import Path
 
-work_dir = Path("/project/6101803/enmingzz/outputs/visionzip_aokvqa_reasoning/eval_vlmevalkit/qwen25vl_official_7b_vlmevalkit_mme_mmstar_pope")
-report_dir = Path("/project/6101803/enmingzz/outputs/visionzip_aokvqa_reasoning/reports/qwen25vl_official_7b_vlmevalkit_mme_mmstar_pope")
-project_report = Path("/project/6101803/enmingzz/opsd/report/qwen25vl_official_7b_vlmevalkit_mme_mmstar_pope.md")
+work_dir = Path("/scratch/enmingzz/outputs/visionzip_aokvqa_reasoning/eval_vlmevalkit/qwen25vl_official_7b_qwen25bootstrap_vlmevalkit_mme_mmstar_pope")
+report_dir = Path("/scratch/enmingzz/outputs/visionzip_aokvqa_reasoning/reports/qwen25vl_official_7b_qwen25bootstrap_vlmevalkit_mme_mmstar_pope")
+project_report = Path("/project/6101803/enmingzz/opsd/report/qwen25vl_official_7b_qwen25bootstrap_vlmevalkit_mme_mmstar_pope.md")
 
 
-def latest(pattern: str) -> Path | None:
-    files = sorted(work_dir.rglob(pattern), key=lambda p: p.stat().st_mtime)
-    return files[-1] if files else None
+status_files = sorted(work_dir.glob("Qwen2.5-VL-7B-Instruct/T*/status.json"), key=lambda p: p.stat().st_mtime)
+if not status_files:
+    raise SystemExit(f"No status.json found under {work_dir}")
+status_file = status_files[-1]
+status = json.loads(status_file.read_text())
+datasets = status.get("datasets", {})
 
+def dataset_metrics(name: str) -> tuple[str, dict, str | None]:
+    row = datasets.get(name, {})
+    return row.get("status", "missing"), row.get("metrics", {}), row.get("error_message")
 
-def read_single_row_csv(path: Path | None) -> dict[str, str]:
-    if path is None or not path.exists():
-        return {}
-    with path.open(newline="") as f:
-        rows = list(csv.DictReader(f))
-    return rows[0] if rows else {}
+mme_status, mme, mme_error = dataset_metrics("MME")
+mmstar_status, mmstar, mmstar_error = dataset_metrics("MMStar")
+pope_status, pope, pope_error = dataset_metrics("POPE")
 
-
-mme = read_single_row_csv(latest("*_MME_score.csv"))
-mmstar = read_single_row_csv(latest("*_MMStar_acc.csv"))
-pope = read_single_row_csv(latest("*_POPE_score.csv"))
+mme_total = None
+if "perception" in mme and "reasoning" in mme:
+    mme_total = float(mme["perception"]) + float(mme["reasoning"])
+mmstar_overall = mmstar.get("split=none|Overall")
+pope_score = pope.get("split=Overall|Overall")
 
 lines = [
     "# Qwen2.5-VL-7B-Instruct Official VLMEvalKit Evaluation",
@@ -78,28 +95,36 @@ lines = [
     "- Wrapper: official VLMEvalKit `Qwen2VLChat` registration",
     "- Datasets: `MME`, `MMStar`, `POPE`",
     "- Mode: direct, no VisionZip pruning, no LoRA adapter",
+    "- Transformers: Qwen2.5 bootstrap path `/scratch/enmingzz/temp/qwen25_bootstrap`",
     f"- Work dir: `{work_dir}`",
+    f"- Status file: `{status_file}`",
     "",
     "## Scores",
     "",
-    "| Benchmark | Main score | Source file |",
-    "|---|---:|---|",
+    "| Benchmark | Status | Main score | Details |",
+    "|---|---|---:|---|",
 ]
 
-mme_total = mme.get("total") or mme.get("Overall") or mme.get("score") or ""
-mmstar_overall = mmstar.get("Overall") or ""
-pope_score = pope.get("Overall") or pope.get("overall") or pope.get("accuracy") or pope.get("acc") or ""
-
-files = {
-    "MME": latest("*_MME_score.csv"),
-    "MMStar": latest("*_MMStar_acc.csv"),
-    "POPE": latest("*_POPE_score.csv"),
-}
-values = {"MME": mme_total, "MMStar": mmstar_overall, "POPE": pope_score}
-for name in ["MME", "MMStar", "POPE"]:
-    value = values[name] or "pending"
-    source = str(files[name]) if files[name] else "missing"
-    lines.append(f"| {name} | {value} | `{source}` |")
+lines.append(
+    "| MME | {status} | {score} | perception={perception}, reasoning={reasoning} |".format(
+        status=mme_status,
+        score="" if mme_total is None else f"{mme_total:.2f}",
+        perception="" if "perception" not in mme else f"{float(mme['perception']):.2f}",
+        reasoning="" if "reasoning" not in mme else f"{float(mme['reasoning']):.2f}",
+    )
+)
+lines.append(
+    "| MMStar | {status} | {score} | Overall Acc (%) |".format(
+        status=mmstar_status,
+        score="" if mmstar_overall is None else f"{float(mmstar_overall) * 100:.2f}",
+    )
+)
+lines.append(
+    "| POPE | {status} | {score} | split=Overall|Overall |".format(
+        status=pope_status,
+        score="" if pope_score is None else f"{float(pope_score):.2f}",
+    )
+)
 
 lines.extend([
     "",
@@ -116,6 +141,23 @@ project_report.parent.mkdir(parents=True, exist_ok=True)
 (report_dir / "summary.md").write_text(text)
 project_report.write_text(text)
 print(f"Wrote {project_report}")
+
+failures = []
+for name, state, error in [
+    ("MME", mme_status, mme_error),
+    ("MMStar", mmstar_status, mmstar_error),
+    ("POPE", pope_status, pope_error),
+]:
+    if state != "done" or error:
+        failures.append(f"{name}: status={state}, error={error}")
+if mme_total is None:
+    failures.append("MME: missing perception/reasoning metrics")
+if mmstar_overall is None:
+    failures.append("MMStar: missing Overall metric")
+if pope_score is None:
+    failures.append("POPE: missing Overall metric")
+if failures:
+    raise SystemExit("Invalid base Qwen2.5-VL evaluation:\n" + "\n".join(failures))
 PY
 
 echo "[$(date --iso-8601=seconds)] Finished official VLMEvalKit ${MODEL_NAME}"
