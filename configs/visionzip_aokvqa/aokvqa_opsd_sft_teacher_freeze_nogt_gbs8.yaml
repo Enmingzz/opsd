@@ -1,0 +1,62 @@
+base_model: Qwen/Qwen2.5-VL-7B-Instruct
+
+dataset:
+  name: HuggingFaceM4/A-OKVQA
+  use_splits:
+    - train
+    - validation
+  image_root: ""
+  limit: 0
+
+training:
+  method: opsd_nogt
+  max_steps: 18208
+  start_step: 0
+  seed: 42
+  bf16: true
+  attn_implementation: flash_attention_2
+  device_map: auto
+  use_lora: true
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  learning_rate: 2.0e-5
+  weight_decay: 0.0
+  save_every: 1000
+  gradient_accumulation_steps: 1
+  micro_batch_size: 2
+
+generation:
+  max_new_tokens: 512
+  temperature: 0.7
+  top_p: 0.9
+  top_k: 0
+  manual_pruned_generate: true
+
+pruning:
+  train_retention_ratios:
+    - 0.1
+    - 0.2
+    - 0.3
+    - 0.4
+  train_retention_ratio_weights:
+    - 1
+    - 1
+    - 1
+    - 1
+  allow_embedding_fallback: false
+
+opsd:
+  teacher_adapter_path: TO_BE_FILLED_BY_RUN_SCRIPT
+  teacher_strategy: external
+  fixed_teacher: true
+  use_ema_teacher: false
+  temperature: 1.0

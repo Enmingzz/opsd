@@ -1,0 +1,793 @@
+diff --git a/run.py b/run.py
+index 01f3a68..50abd07 100644
+--- a/run.py
++++ b/run.py
+@@ -38,16 +38,21 @@ LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 1))
+ GPU_LIST = get_gpu_list()
+ if LOCAL_WORLD_SIZE > 1 and len(GPU_LIST):
+     NGPU = len(GPU_LIST)
+-    assert NGPU >= LOCAL_WORLD_SIZE, "The number of processes should be less than or equal to the number of GPUs"
+-    GPU_PER_PROC = NGPU // LOCAL_WORLD_SIZE
+-    DEVICE_START_IDX = GPU_PER_PROC * LOCAL_RANK
+-    CUDA_VISIBLE_DEVICES = [str(i) for i in GPU_LIST[DEVICE_START_IDX: DEVICE_START_IDX + GPU_PER_PROC]]
++    if LOCAL_WORLD_SIZE <= NGPU:
++        GPU_PER_PROC = NGPU // LOCAL_WORLD_SIZE
++        DEVICE_START_IDX = GPU_PER_PROC * LOCAL_RANK
++        CUDA_VISIBLE_DEVICES = [str(i) for i in GPU_LIST[DEVICE_START_IDX: DEVICE_START_IDX + GPU_PER_PROC]]
++        DEVICE_ASSIGNMENT = 'dedicated'
++    else:
++        CUDA_VISIBLE_DEVICES = [str(GPU_LIST[LOCAL_RANK % NGPU])]
++        DEVICE_ASSIGNMENT = f'oversubscribed:{LOCAL_WORLD_SIZE // NGPU}x_per_gpu'
++        os.environ.setdefault('VLMEVAL_DIST_BACKEND', 'gloo')
+     CUDA_VISIBLE_DEVICES = ','.join(CUDA_VISIBLE_DEVICES)
+-    # Set CUDA_VISIBLE_DEVICES
+     os.environ['CUDA_VISIBLE_DEVICES'] = CUDA_VISIBLE_DEVICES
+     print(
+         f'RANK: {RANK}, LOCAL_RANK: {LOCAL_RANK}, WORLD_SIZE: {WORLD_SIZE},'
+-        f'LOCAL_WORLD_SIZE: {LOCAL_WORLD_SIZE}, CUDA_VISIBLE_DEVICES: {CUDA_VISIBLE_DEVICES}'
++        f'LOCAL_WORLD_SIZE: {LOCAL_WORLD_SIZE}, CUDA_VISIBLE_DEVICES: {CUDA_VISIBLE_DEVICES},'
++        f'DEVICE_ASSIGNMENT: {DEVICE_ASSIGNMENT}'
+     )
+ 
+ 
+@@ -543,10 +548,12 @@ def run_local_mode(args):
+     commit_id = githash(digits=8)
+     if WORLD_SIZE > 1:
+         import torch.distributed as dist
++        dist_backend = os.environ.get('VLMEVAL_DIST_BACKEND', 'nccl')
+         dist.init_process_group(
+-            backend='nccl',
++            backend=dist_backend,
+             timeout=datetime.timedelta(seconds=int(os.environ.get('DIST_TIMEOUT', 3600)))
+         )
++        logger.info(f'Initialized torch.distributed backend={dist_backend}')
+         eval_id_holder = [build_eval_id() if RANK == 0 else None]
+         dist.broadcast_object_list(eval_id_holder, src=0)
+         eval_id = eval_id_holder[0]
+diff --git a/vlmeval/config.py b/vlmeval/config.py
+index 4487710..d11a36c 100644
+--- a/vlmeval/config.py
++++ b/vlmeval/config.py
+@@ -2654,3 +2654,480 @@ model_groups.append(nanovlm_series)
+ 
+ for grp in model_groups:
+     supported_VLM.update(grp)
++
++# OPSD official VisionZip Qwen2.5-VL baselines for AutoDL evaluation
++supported_VLM.update({
++    'opsd_qwen25vl_visionzip_base_r005': partial(
++        vlm.Qwen25VLOfficialVisionZipChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        visionzip_dominant_ratio=0.00,
++        visionzip_contextual_ratio=0.05,
++        default_max_new_tokens=32,
++    ),
++    'opsd_qwen25vl_visionzip_base_r010': partial(
++        vlm.Qwen25VLOfficialVisionZipChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        visionzip_dominant_ratio=0.05,
++        visionzip_contextual_ratio=0.05,
++        default_max_new_tokens=32,
++    ),
++    'opsd_qwen25vl_visionzip_base_r020': partial(
++        vlm.Qwen25VLOfficialVisionZipChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        visionzip_dominant_ratio=0.15,
++        visionzip_contextual_ratio=0.05,
++        default_max_new_tokens=32,
++    ),
++    'opsd_qwen25vl_visionzip_base_r030': partial(
++        vlm.Qwen25VLOfficialVisionZipChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        visionzip_dominant_ratio=0.25,
++        visionzip_contextual_ratio=0.05,
++        default_max_new_tokens=32,
++    ),
++
++    # Ratios reported in the official VisionZip Qwen2.5-VL README:
++    # 50% = 45% dominant + 5% contextual; 70% = 65% dominant + 5% contextual.
++    'opsd_qwen25vl_visionzip_official_r050': partial(
++        vlm.Qwen25VLOfficialVisionZipChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        visionzip_dominant_ratio=0.45,
++        visionzip_contextual_ratio=0.05,
++        default_max_new_tokens=32,
++    ),
++    'opsd_qwen25vl_visionzip_official_r070': partial(
++        vlm.Qwen25VLOfficialVisionZipChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        visionzip_dominant_ratio=0.65,
++        visionzip_contextual_ratio=0.05,
++        default_max_new_tokens=32,
++    ),
++
++    # Debug check: keep effectively all visual tokens while still exercising the VisionZip wrapper/manual decode path.
++    'opsd_qwen25vl_visionzip_wrapper_r100check': partial(
++        vlm.Qwen25VLOfficialVisionZipChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        visionzip_dominant_ratio=0.999,
++        visionzip_contextual_ratio=0.01,
++        default_max_new_tokens=32,
++    ),
++})
++
++# OPSD AOKVQA-trained LoRA adapters, evaluated through the same official VisionZip Qwen2.5-VL wrapper.
++supported_VLM.update({
++    'opsd_aokvqa_ema_nogt_final_r005': partial(
++        vlm.Qwen25VLOfficialVisionZipChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        attn_implementation='flash_attention_2',
++        visionzip_dominant_ratio=0.00,
++        visionzip_contextual_ratio=0.05,
++        default_max_new_tokens=32,
++        adapter_path='/root/autodl-tmp/opsd_eval/outputs/visionzip_aokvqa_reasoning/checkpoints/aokvqa_first4_officialvz_20260610_154040/03_ema_opsd_nogt_official_gbs8/final',
++    ),
++    'opsd_aokvqa_epic_final_r005': partial(
++        vlm.Qwen25VLOfficialVisionZipChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        attn_implementation='flash_attention_2',
++        visionzip_dominant_ratio=0.00,
++        visionzip_contextual_ratio=0.05,
++        default_max_new_tokens=32,
++        adapter_path='/root/autodl-tmp/opsd_eval/outputs/visionzip_aokvqa_reasoning/checkpoints/aokvqa_first4_officialvz_20260610_154040/02_epic_tcd_full_teacher_official_gbs8/final',
++    ),
++    'opsd_aokvqa_ema_nogt_final_r010': partial(
++        vlm.Qwen25VLOfficialVisionZipChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        attn_implementation='flash_attention_2',
++        visionzip_dominant_ratio=0.05,
++        visionzip_contextual_ratio=0.05,
++        default_max_new_tokens=32,
++        adapter_path='/root/autodl-tmp/opsd_eval/outputs/visionzip_aokvqa_reasoning/checkpoints/aokvqa_first4_officialvz_20260610_154040/03_ema_opsd_nogt_official_gbs8/final',
++    ),
++    'opsd_aokvqa_epic_final_r010': partial(
++        vlm.Qwen25VLOfficialVisionZipChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        attn_implementation='flash_attention_2',
++        visionzip_dominant_ratio=0.05,
++        visionzip_contextual_ratio=0.05,
++        default_max_new_tokens=32,
++        adapter_path='/root/autodl-tmp/opsd_eval/outputs/visionzip_aokvqa_reasoning/checkpoints/aokvqa_first4_officialvz_20260610_154040/02_epic_tcd_full_teacher_official_gbs8/final',
++    ),
++    'opsd_aokvqa_ema_nogt_final_r030': partial(
++        vlm.Qwen25VLOfficialVisionZipChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        attn_implementation='flash_attention_2',
++        visionzip_dominant_ratio=0.25,
++        visionzip_contextual_ratio=0.05,
++        default_max_new_tokens=32,
++        adapter_path='/root/autodl-tmp/opsd_eval/outputs/visionzip_aokvqa_reasoning/checkpoints/aokvqa_first4_officialvz_20260610_154040/03_ema_opsd_nogt_official_gbs8/final',
++    ),
++    'opsd_aokvqa_epic_final_r030': partial(
++        vlm.Qwen25VLOfficialVisionZipChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        attn_implementation='flash_attention_2',
++        visionzip_dominant_ratio=0.25,
++        visionzip_contextual_ratio=0.05,
++        default_max_new_tokens=32,
++        adapter_path='/root/autodl-tmp/opsd_eval/outputs/visionzip_aokvqa_reasoning/checkpoints/aokvqa_first4_officialvz_20260610_154040/02_epic_tcd_full_teacher_official_gbs8/final',
++    ),
++})
++
++
++
++# OPSD freeze-SFT-teacher LoRA adapter, evaluated through the official VisionZip Qwen2.5-VL wrapper.
++supported_VLM.update({
++    'opsd_aokvqa_freeze_sftteacher_final_r005': partial(
++        vlm.Qwen25VLOfficialVisionZipChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        attn_implementation='flash_attention_2',
++        visionzip_dominant_ratio=0.00,
++        visionzip_contextual_ratio=0.05,
++        default_max_new_tokens=32,
++        adapter_path='/root/autodl-tmp/opsd_eval/outputs/visionzip_aokvqa_reasoning/checkpoints/aokvqa_first4_officialvz_20260610_154040/04_freeze_sft_teacher_opsd_nogt_official_gbs8/final',
++    ),
++    'opsd_aokvqa_freeze_sftteacher_final_r010': partial(
++        vlm.Qwen25VLOfficialVisionZipChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        attn_implementation='flash_attention_2',
++        visionzip_dominant_ratio=0.05,
++        visionzip_contextual_ratio=0.05,
++        default_max_new_tokens=32,
++        adapter_path='/root/autodl-tmp/opsd_eval/outputs/visionzip_aokvqa_reasoning/checkpoints/aokvqa_first4_officialvz_20260610_154040/04_freeze_sft_teacher_opsd_nogt_official_gbs8/final',
++    ),
++    'opsd_aokvqa_freeze_sftteacher_final_r030': partial(
++        vlm.Qwen25VLOfficialVisionZipChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        attn_implementation='flash_attention_2',
++        visionzip_dominant_ratio=0.25,
++        visionzip_contextual_ratio=0.05,
++        default_max_new_tokens=32,
++        adapter_path='/root/autodl-tmp/opsd_eval/outputs/visionzip_aokvqa_reasoning/checkpoints/aokvqa_first4_officialvz_20260610_154040/04_freeze_sft_teacher_opsd_nogt_official_gbs8/final',
++    ),
++})
++
++# OPSD no-prune Qwen2.5-VL baseline for AutoDL MME comparison
++supported_VLM.update({
++    'opsd_qwen25vl_official_7b_sdpa': partial(
++        vlm.Qwen2VLChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        attn_implementation='sdpa',
++        max_new_tokens=16,
++    ),
++})
++
++# OPSD no-prune Qwen2.5-VL baseline with 32-token generation for fair VisionZip comparison
++supported_VLM.update({
++    'opsd_qwen25vl_official_7b_sdpa_mnt32': partial(
++        vlm.Qwen2VLChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        attn_implementation='sdpa',
++        max_new_tokens=32,
++    ),
++})
++
++# OPSD Qwen2.5-VL FlashAttention-2 configs for AutoDL evaluation
++supported_VLM.update({
++    'opsd_qwen25vl_official_7b_flashattn2': partial(
++        vlm.Qwen2VLChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        attn_implementation='flash_attention_2',
++        max_new_tokens=16,
++    ),
++    'opsd_qwen25vl_official_7b_flashattn2_mnt32': partial(
++        vlm.Qwen2VLChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        attn_implementation='flash_attention_2',
++        max_new_tokens=32,
++    ),
++    'opsd_qwen25vl_visionzip_flashattn2_r005': partial(
++        vlm.Qwen25VLOfficialVisionZipChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        attn_implementation='flash_attention_2',
++        visionzip_dominant_ratio=0.00,
++        visionzip_contextual_ratio=0.05,
++        default_max_new_tokens=32,
++    ),
++    'opsd_qwen25vl_visionzip_flashattn2_r010': partial(
++        vlm.Qwen25VLOfficialVisionZipChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        attn_implementation='flash_attention_2',
++        visionzip_dominant_ratio=0.05,
++        visionzip_contextual_ratio=0.05,
++        default_max_new_tokens=32,
++    ),
++    'opsd_qwen25vl_visionzip_flashattn2_r020': partial(
++        vlm.Qwen25VLOfficialVisionZipChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        attn_implementation='flash_attention_2',
++        visionzip_dominant_ratio=0.15,
++        visionzip_contextual_ratio=0.05,
++        default_max_new_tokens=32,
++    ),
++    'opsd_qwen25vl_visionzip_flashattn2_r030': partial(
++        vlm.Qwen25VLOfficialVisionZipChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        attn_implementation='flash_attention_2',
++        visionzip_dominant_ratio=0.25,
++        visionzip_contextual_ratio=0.05,
++        default_max_new_tokens=32,
++    ),
++    'opsd_qwen25vl_visionzip_flashattn2_r050': partial(
++        vlm.Qwen25VLOfficialVisionZipChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        attn_implementation='flash_attention_2',
++        visionzip_dominant_ratio=0.45,
++        visionzip_contextual_ratio=0.05,
++        default_max_new_tokens=32,
++    ),
++    'opsd_qwen25vl_visionzip_flashattn2_r070': partial(
++        vlm.Qwen25VLOfficialVisionZipChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        attn_implementation='flash_attention_2',
++        visionzip_dominant_ratio=0.65,
++        visionzip_contextual_ratio=0.05,
++        default_max_new_tokens=32,
++    ),
++    'opsd_qwen25vl_visionzip_flashattn2_r100check': partial(
++        vlm.Qwen25VLOfficialVisionZipChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        attn_implementation='flash_attention_2',
++        visionzip_dominant_ratio=0.999,
++        visionzip_contextual_ratio=0.01,
++        default_max_new_tokens=32,
++    ),
++})
++
++
++# OPSD official-first4 AOKVQA adapters. Appended as an override so both the clear
++# names and the older convenience aliases use the same official VisionZip eval path.
++# Official split: 5%=0% dominant+5% contextual, 10%=5%+5%, 20%=15%+5%, 30%=25%+5%.
++_OPSD_FIRST4_ROOT = '/root/autodl-tmp/opsd_eval/outputs/visionzip_aokvqa_reasoning/checkpoints/aokvqa_first4_officialvz_20260610_154040'
++_OPSD_OFFICIAL_VISIONZIP_ROOT = '/root/autodl-tmp/opsd_eval/VisionZip/Qwen2_5_VL'
++_OPSD_FIRST4_ADAPTERS = {
++    'sft': f'{_OPSD_FIRST4_ROOT}/01_sft_official_gbs8/final',
++    'epic': f'{_OPSD_FIRST4_ROOT}/02_epic_tcd_full_teacher_official_gbs8/final',
++    'ema_nogt': f'{_OPSD_FIRST4_ROOT}/03_ema_opsd_nogt_official_gbs8/final',
++    'freeze_sftteacher_nogt': f'{_OPSD_FIRST4_ROOT}/04_freeze_sft_teacher_opsd_nogt_official_gbs8/final',
++}
++_OPSD_OFFICIAL_VISIONZIP_RATIOS = {
++    'r005': (0.00, 0.05),
++    'r010': (0.05, 0.05),
++    'r020': (0.15, 0.05),
++    'r030': (0.25, 0.05),
++}
++
++def _opsd_first4_official_adapter(adapter_key, ratio_key):
++    dominant, contextual = _OPSD_OFFICIAL_VISIONZIP_RATIOS[ratio_key]
++    return partial(
++        vlm.Qwen25VLOfficialVisionZipChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        attn_implementation='flash_attention_2',
++        visionzip_root=_OPSD_OFFICIAL_VISIONZIP_ROOT,
++        visionzip_dominant_ratio=dominant,
++        visionzip_contextual_ratio=contextual,
++        default_max_new_tokens=32,
++        adapter_path=_OPSD_FIRST4_ADAPTERS[adapter_key],
++    )
++
++_OPSD_FIRST4_OFFICIAL_MODELS = {}
++for _adapter_key in _OPSD_FIRST4_ADAPTERS:
++    for _ratio_key in _OPSD_OFFICIAL_VISIONZIP_RATIOS:
++        _OPSD_FIRST4_OFFICIAL_MODELS[f'opsd_first4_officialvz_{_adapter_key}_{_ratio_key}'] = _opsd_first4_official_adapter(_adapter_key, _ratio_key)
++
++# Backward-compatible aliases. These used to point to older non-official training
++# outputs; keep the names but make them resolve to the current official run.
++for _ratio_key in _OPSD_OFFICIAL_VISIONZIP_RATIOS:
++    _OPSD_FIRST4_OFFICIAL_MODELS[f'opsd_aokvqa_sft_final_{_ratio_key}'] = _opsd_first4_official_adapter('sft', _ratio_key)
++    _OPSD_FIRST4_OFFICIAL_MODELS[f'opsd_aokvqa_epic_final_{_ratio_key}'] = _opsd_first4_official_adapter('epic', _ratio_key)
++    _OPSD_FIRST4_OFFICIAL_MODELS[f'opsd_aokvqa_ema_nogt_final_{_ratio_key}'] = _opsd_first4_official_adapter('ema_nogt', _ratio_key)
++    _OPSD_FIRST4_OFFICIAL_MODELS[f'opsd_aokvqa_freeze_sftteacher_final_{_ratio_key}'] = _opsd_first4_official_adapter('freeze_sftteacher_nogt', _ratio_key)
++
++supported_VLM.update(_OPSD_FIRST4_OFFICIAL_MODELS)
++
++
++# OPSD MMStar alignment configs for Qwen2.5-VL baseline.
++# These keep the same Qwen2.5-VL model and flash_attention_2, but avoid the
++# 32-token cap used for MME/POPE-oriented quick runs.
++supported_VLM.update({
++    'opsd_qwen25vl_official_7b_flashattn2_mmstar_mnt128': partial(
++        vlm.Qwen2VLChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        attn_implementation='flash_attention_2',
++        max_new_tokens=128,
++    ),
++    'opsd_qwen25vl_official_7b_flashattn2_mmstar_mnt2048': partial(
++        vlm.Qwen2VLChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=False,
++        attn_implementation='flash_attention_2',
++        max_new_tokens=2048,
++    ),
++    'opsd_qwen25vl_official_7b_flashattn2_mmstar_custom_mnt128': partial(
++        vlm.Qwen2VLChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=True,
++        attn_implementation='flash_attention_2',
++        max_new_tokens=128,
++    ),
++})
++
++# OPSD MMStar additional alignment configs: HF default processor bounds and custom 2048 generation.
++supported_VLM.update({
++    'opsd_qwen25vl_official_7b_flashattn2_mmstar_hfdefault_mnt128': partial(
++        vlm.Qwen2VLChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        use_custom_prompt=True,
++        attn_implementation='flash_attention_2',
++        max_new_tokens=128,
++    ),
++    'opsd_qwen25vl_official_7b_flashattn2_mmstar_hfdefault_nocustom_mnt128': partial(
++        vlm.Qwen2VLChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        use_custom_prompt=False,
++        attn_implementation='flash_attention_2',
++        max_new_tokens=128,
++    ),
++    'opsd_qwen25vl_official_7b_flashattn2_mmstar_custom_mnt2048': partial(
++        vlm.Qwen2VLChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=True,
++        attn_implementation='flash_attention_2',
++        max_new_tokens=2048,
++    ),
++})
++
++# OPSD MMStar official VisionZip/adapters aligned configs.
++# MMStar baseline alignment used custom MCQ prompt + max_new_tokens=2048:
++# Qwen2.5-VL-7B no prune = 61.47, close to reported 62.3 in the pruning table.
++def _opsd_vz_mmstar_model(ratio_key):
++    dominant, contextual = _OPSD_OFFICIAL_VISIONZIP_RATIOS[ratio_key]
++    return partial(
++        vlm.Qwen25VLOfficialVisionZipChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=True,
++        attn_implementation='flash_attention_2',
++        visionzip_root=_OPSD_OFFICIAL_VISIONZIP_ROOT,
++        visionzip_dominant_ratio=dominant,
++        visionzip_contextual_ratio=contextual,
++        default_max_new_tokens=2048,
++    )
++
++def _opsd_first4_mmstar_adapter(adapter_key, ratio_key):
++    dominant, contextual = _OPSD_OFFICIAL_VISIONZIP_RATIOS[ratio_key]
++    return partial(
++        vlm.Qwen25VLOfficialVisionZipChat,
++        model_path='Qwen/Qwen2.5-VL-7B-Instruct',
++        min_pixels=1280 * 28 * 28,
++        max_pixels=16384 * 28 * 28,
++        use_custom_prompt=True,
++        attn_implementation='flash_attention_2',
++        visionzip_root=_OPSD_OFFICIAL_VISIONZIP_ROOT,
++        visionzip_dominant_ratio=dominant,
++        visionzip_contextual_ratio=contextual,
++        default_max_new_tokens=2048,
++        adapter_path=_OPSD_FIRST4_ADAPTERS[adapter_key],
++    )
++
++_OPSD_MMSTAR_ALIGNED_MODELS = {}
++for _ratio_key in _OPSD_OFFICIAL_VISIONZIP_RATIOS:
++    _OPSD_MMSTAR_ALIGNED_MODELS['opsd_qwen25vl_visionzip_mmstar_' + _ratio_key] = _opsd_vz_mmstar_model(_ratio_key)
++for _adapter_key in _OPSD_FIRST4_ADAPTERS:
++    for _ratio_key in _OPSD_OFFICIAL_VISIONZIP_RATIOS:
++        _OPSD_MMSTAR_ALIGNED_MODELS['opsd_first4_officialvz_' + _adapter_key + '_mmstar_' + _ratio_key] = _opsd_first4_mmstar_adapter(_adapter_key, _ratio_key)
++
++supported_VLM.update(_OPSD_MMSTAR_ALIGNED_MODELS)
++
+diff --git a/vlmeval/vlm/__init__.py b/vlmeval/vlm/__init__.py
+index 639a5a1..bde4366 100644
+--- a/vlmeval/vlm/__init__.py
++++ b/vlmeval/vlm/__init__.py
+@@ -71,7 +71,7 @@ from .points import POINTS, POINTSV15
+ from .qh_360vl import QH_360VL
+ from .qianfan_vl import Qianfan_VL
+ from .qtunevl import QTuneVL, QTuneVLChat
+-from .qwen2_vl import Qwen2VLChat, Qwen2VLChatAguvis
++from .qwen2_vl import Qwen2VLChat, Qwen2VLChatAguvis, Qwen25VLOfficialVisionZipChat
+ from .qwen3_vl import Qwen3VLChat
+ from .qwen_vl import QwenVL, QwenVLChat
+ from .rbdash import RBDash
+diff --git a/vlmeval/vlm/qwen2_vl/__init__.py b/vlmeval/vlm/qwen2_vl/__init__.py
+index e853740..1dd94a7 100644
+--- a/vlmeval/vlm/qwen2_vl/__init__.py
++++ b/vlmeval/vlm/qwen2_vl/__init__.py
+@@ -1,2 +1,3 @@
+ from .model import Qwen2VLChat, Qwen2VLChatAguvis  # noqa: F401
+ from .prompt import Qwen2VLPromptMixin  # noqa: F401
++from .visionzip_official import Qwen25VLOfficialVisionZipChat  # noqa: F401
+diff --git a/vlmeval/vlm/qwen2_vl/model.py b/vlmeval/vlm/qwen2_vl/model.py
+index 722501f..f28dbf5 100644
+--- a/vlmeval/vlm/qwen2_vl/model.py
++++ b/vlmeval/vlm/qwen2_vl/model.py
+@@ -308,8 +308,9 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
+             torch.cuda.set_device(0)
+             self.device = 'cuda'
+         else:
++            attn_implementation = kwargs.get('attn_implementation', 'flash_attention_2')
+             self.model = MODEL_CLS.from_pretrained(
+-                model_path, torch_dtype='auto', device_map="auto", attn_implementation='flash_attention_2'
++                model_path, torch_dtype='auto', device_map="auto", attn_implementation=attn_implementation
+             )
+             self.model.eval()
+ 
+diff --git a/vlmeval/vlm/qwen2_vl/visionzip_official.py b/vlmeval/vlm/qwen2_vl/visionzip_official.py
+new file mode 100644
+index 0000000..7e669ca
+--- /dev/null
++++ b/vlmeval/vlm/qwen2_vl/visionzip_official.py
+@@ -0,0 +1,220 @@
++from __future__ import annotations
++
++import importlib.util
++import os
++import sys
++from pathlib import Path
++from typing import Any
++
++import torch
++from PIL import ImageFile
++
++ImageFile.LOAD_TRUNCATED_IMAGES = True
++
++from .model import Qwen2VLChat
++
++
++def _load_official_visionzip_class(visionzip_root: str | os.PathLike[str]):
++    module_path = Path(visionzip_root) / 'qwen2_5vl_visionzip.py'
++    if not module_path.exists():
++        raise FileNotFoundError(f'Official VisionZip Qwen2.5-VL file not found: {module_path}')
++    module_name = 'vlmeval_official_qwen25vl_visionzip'
++    existing = sys.modules.get(module_name)
++    if existing is not None and hasattr(existing, 'Qwen2_5_VLForConditionalGeneration'):
++        return existing.Qwen2_5_VLForConditionalGeneration
++    spec = importlib.util.spec_from_file_location(module_name, module_path)
++    if spec is None or spec.loader is None:
++        raise ImportError(f'Could not load module spec for {module_path}')
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[module_name] = module
++    spec.loader.exec_module(module)
++    return module.Qwen2_5_VLForConditionalGeneration
++
++
++class Qwen25VLOfficialVisionZipChat(Qwen2VLChat):
++    INSTALL_REQ = False
++    INTERLEAVE = True
++    VIDEO_LLM = False
++
++    def __init__(
++        self,
++        visionzip_root: str | None = None,
++        visionzip_dominant_ratio: float = 0.65,
++        visionzip_contextual_ratio: float = 0.05,
++        default_max_new_tokens: int = 32,
++        adapter_path: str | None = None,
++        **kwargs: Any,
++    ) -> None:
++        self.visionzip_root = visionzip_root or os.environ.get(
++            'VISIONZIP_QWEN25VL_ROOT',
++            '/root/autodl-tmp/opsd_eval/VisionZip/Qwen2_5_VL',
++        )
++        env_min_pixels = os.environ.get('VISIONZIP_MIN_PIXELS')
++        env_max_pixels = os.environ.get('VISIONZIP_MAX_PIXELS')
++        if env_min_pixels:
++            kwargs['min_pixels'] = int(env_min_pixels)
++        if env_max_pixels:
++            kwargs['max_pixels'] = int(env_max_pixels)
++
++        self.visionzip_dominant_ratio = float(visionzip_dominant_ratio)
++        self.visionzip_contextual_ratio = float(visionzip_contextual_ratio)
++        self.visionzip_default_max_new_tokens = int(default_max_new_tokens)
++        self.adapter_path = adapter_path or os.environ.get('VISIONZIP_ADAPTER_PATH', '')
++
++        official_cls = _load_official_visionzip_class(self.visionzip_root)
++        import transformers
++
++        old_cls = getattr(transformers, 'Qwen2_5_VLForConditionalGeneration', None)
++        transformers.Qwen2_5_VLForConditionalGeneration = official_cls
++        kwargs.setdefault('attn_implementation', 'flash_attention_2')
++        kwargs.setdefault('max_new_tokens', self.visionzip_default_max_new_tokens)
++        try:
++            super().__init__(**kwargs)
++        finally:
++            if old_cls is None:
++                try:
++                    delattr(transformers, 'Qwen2_5_VLForConditionalGeneration')
++                except AttributeError:
++                    pass
++            else:
++                transformers.Qwen2_5_VLForConditionalGeneration = old_cls
++
++        self._apply_visionzip_runtime_config()
++        if self.adapter_path:
++            import peft.utils.save_and_load as peft_save_and_load
++            from peft import PeftModel
++
++            peft_save_and_load._maybe_shard_state_dict_for_tp = lambda *args, **kwargs: None
++            if not Path(self.adapter_path).exists():
++                raise FileNotFoundError(f'LoRA adapter path not found: {self.adapter_path}')
++            self.model = PeftModel.from_pretrained(self.model, self.adapter_path)
++            self.model.eval()
++            self._apply_visionzip_runtime_config()
++        self.generate_kwargs['use_cache'] = False
++        self.model.generation_config.use_cache = False
++
++    def _model_candidates(self):
++        seen = set()
++        stack = [self.model]
++        while stack:
++            obj = stack.pop(0)
++            if obj is None or id(obj) in seen:
++                continue
++            seen.add(id(obj))
++            yield obj
++            for name in ('base_model', 'model'):
++                child = getattr(obj, name, None)
++                if child is not None and id(child) not in seen:
++                    stack.append(child)
++
++    def _apply_visionzip_runtime_config(self) -> None:
++        for obj in self._model_candidates():
++            try:
++                obj.visionzip_dominant_ratio = self.visionzip_dominant_ratio
++                obj.visionzip_contextual_ratio = self.visionzip_contextual_ratio
++                if getattr(obj, 'generation_config', None) is not None:
++                    obj.generation_config.use_cache = False
++            except Exception:
++                pass
++
++    def _last_pruned_inputs(self):
++        for obj in self._model_candidates():
++            pruned = getattr(obj, '_last_visionzip_pruned_inputs', None)
++            if pruned is not None:
++                return pruned
++        return None
++
++    @staticmethod
++    def _dataset_max_new_tokens(dataset: str | None, default: int) -> int:
++        name = (dataset or '').lower()
++        if 'mme' in name or 'pope' in name:
++            return 16
++        if 'mmstar' in name:
++            return int(os.environ.get('VISIONZIP_MMSTAR_MAX_NEW_TOKENS', default))
++        return int(default)
++
++    def _decode_generated(self, generated: list[torch.Tensor]) -> str:
++        if not generated:
++            return ''
++        gen_ids = torch.cat(generated, dim=1)
++        return self.processor.tokenizer.batch_decode(
++            gen_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
++        )[0]
++
++    def _post_process_response(self, response: str) -> str:
++        if not self.post_process:
++            return response
++        resp = response.split('\boxed{')[-1]
++        counter, end = 1, None
++        for i, ch in enumerate(resp):
++            if ch == '{':
++                counter += 1
++            elif ch == '}':
++                counter -= 1
++            if counter == 0:
++                end = i
++                break
++            if i == len(resp) - 1:
++                end = len(resp)
++        return resp[:end] if end is not None else response
++
++    def generate_inner(self, message, dataset=None):
++        try:
++            from qwen_vl_utils import process_vision_info
++        except Exception as err:
++            raise RuntimeError("qwen_vl_utils not found, please install it via 'pip install qwen-vl-utils'") from err
++
++        messages = []
++        if self.system_prompt is not None:
++            messages.append({'role': 'system', 'content': self.system_prompt})
++        messages.append({'role': 'user', 'content': self._prepare_content(message, dataset=dataset)})
++        if self.verbose:
++            print(f'\033[31m{messages}\033[0m')
++
++        text = self.processor.apply_chat_template([messages], tokenize=False, add_generation_prompt=True)
++        images, videos = process_vision_info([messages])
++        inputs = self.processor(text=text, images=images, videos=videos, padding=True, return_tensors='pt')
++        inputs = inputs.to('cuda')
++
++        max_new_tokens = self._dataset_max_new_tokens(dataset, self.visionzip_default_max_new_tokens)
++        eos_token_id = self.processor.tokenizer.eos_token_id
++        embed_tokens = self.model.get_input_embeddings()
++
++        with torch.no_grad():
++            outputs = self.model(**inputs, use_cache=False, return_dict=True)
++            pruned = self._last_pruned_inputs()
++            if pruned is None:
++                raise RuntimeError('Official VisionZip forward did not expose pruned prompt tensors.')
++            input_ids = pruned['input_ids'].clone()
++            inputs_embeds = pruned['inputs_embeds'].clone()
++            attention_mask = pruned['attention_mask'].clone()
++            position_ids = pruned['position_ids'].clone()
++            generated: list[torch.Tensor] = []
++
++            for step in range(int(max_new_tokens)):
++                next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
++                generated.append(next_token)
++                if eos_token_id is not None and int(next_token.item()) == int(eos_token_id):
++                    break
++                input_ids = torch.cat([input_ids, next_token.to(device=input_ids.device, dtype=input_ids.dtype)], dim=1)
++                next_embed = embed_tokens(next_token.to(device=inputs_embeds.device)).to(dtype=inputs_embeds.dtype)
++                inputs_embeds = torch.cat([inputs_embeds, next_embed], dim=1)
++                one = torch.ones((attention_mask.shape[0], 1), device=attention_mask.device, dtype=attention_mask.dtype)
++                attention_mask = torch.cat([attention_mask, one], dim=1)
++                position_ids = torch.cat([position_ids, position_ids[:, :, -1:] + 1], dim=2)
++                if step == int(max_new_tokens) - 1:
++                    break
++                outputs = self.model(
++                    input_ids=input_ids,
++                    inputs_embeds=inputs_embeds,
++                    attention_mask=attention_mask,
++                    position_ids=position_ids,
++                    use_cache=False,
++                    return_dict=True,
++                )
++
++        response = self._decode_generated(generated).strip()
++        response = self._post_process_response(response)
++        if self.verbose:
++            print(f'\033[32m{response}\033[0m')
++        return response

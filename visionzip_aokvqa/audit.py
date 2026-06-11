@@ -19,7 +19,6 @@ from opsd.visionzip_aokvqa.losses import compute_generalized_jsd
 from opsd.visionzip_aokvqa.prompting import build_opsd_teacher_prompt, parse_final_answer
 from opsd.visionzip_aokvqa.qwen_wrapper import (
     apply_lora,
-    build_visionzip_pruned_inputs,
     encode_prompt,
     encode_prompt_and_response,
     encode_prompt_text,
@@ -31,8 +30,14 @@ from opsd.visionzip_aokvqa.qwen_wrapper import (
     primary_device,
     teacher_adapter_disabled,
 )
-from opsd.visionzip_aokvqa.train import build_epic_target, generate_full_teacher, get_nested, load_yaml, sequence_inputs_from_prompt
-from opsd.visionzip_aokvqa.visionzip import grpo_group_advantages
+from opsd.visionzip_aokvqa.train import (
+    build_epic_target,
+    generate_full_teacher,
+    get_nested,
+    grpo_group_advantages,
+    load_yaml,
+    sequence_inputs_from_prompt,
+)
 
 
 OUTPUT_ROOT = Path("outputs/visionzip_aokvqa_reasoning")
@@ -147,7 +152,7 @@ def visionzip_pruning_audit(model: Any, processor: Any, cfg: dict[str, Any], rep
             prompt_inputs = encode_prompt(processor, sample, get_nested(cfg, "dataset.image_root", ""), device)
             lines.extend([f"## Sample {sample.sample_id}", ""])
             for ratio in ratios:
-                pruned = build_visionzip_pruned_inputs(
+                _outputs, pruned = forward_pruned(
                     model,
                     prompt_inputs,
                     ratio,
@@ -156,7 +161,9 @@ def visionzip_pruning_audit(model: Any, processor: Any, cfg: dict[str, Any], rep
                 )
                 before = int(pruned["metadata"]["num_full_visual_tokens"])
                 after = int(pruned["metadata"]["num_kept_visual_tokens"])
-                expected = max(1, min(before, round(before * ratio)))
+                expected = int(pruned["metadata"]["visionzip_dominant_tokens"]) + int(
+                    pruned["metadata"]["visionzip_contextual_tokens"]
+                )
                 actual_ratio = after / before if before else 0.0
                 count_ok = after == expected
                 ok = ok and count_ok

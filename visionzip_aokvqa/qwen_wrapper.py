@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 import sys
+import types
 import warnings
 from contextlib import contextmanager, nullcontext
 from importlib.util import find_spec
@@ -13,10 +14,7 @@ import torch
 import torch.nn.functional as F
 
 from opsd.pruning_distill.qwen25_pruned_forward import (
-    _get_visual_module,
     _unwrap_qwen_model,
-    build_pruned_inputs_embeds,
-    compute_full_position_ids,
     extract_next_token_logits,
     maybe_disable_adapter,
     validate_single_image_qwen_inputs,
@@ -24,11 +22,13 @@ from opsd.pruning_distill.qwen25_pruned_forward import (
 
 from .aokvqa import FormattedAOKVQASample, resolve_image
 from .prompting import format_chat_messages, format_chat_with_assistant
-from .visionzip import VisionZipOutput, VisionZipPruner
 
 
 ROOT = Path(__file__).resolve().parents[2]
 QWEN25_BOOTSTRAP = Path("/scratch/enmingzz/temp/qwen25_bootstrap")
+OFFICIAL_VISIONZIP_QWEN25 = Path(os.environ.get("VISIONZIP_QWEN25VL_ROOT", "/root/autodl-tmp/opsd_eval/VisionZip/Qwen2_5_VL"))
+VISIONZIP_NO_PRUNE_DOMINANT = 0.999999
+VISIONZIP_NO_PRUNE_CONTEXTUAL = 0.000001
 
 
 def bootstrap_qwen25() -> None:
@@ -46,10 +46,19 @@ def import_qwen25_modules():
     bootstrap_qwen25()
     from transformers import AutoProcessor
 
-    try:
-        from transformers import Qwen2_5_VLForConditionalGeneration
-    except Exception as exc:
-        raise RuntimeError("Qwen2.5-VL support is unavailable in transformers.") from exc
+    if OFFICIAL_VISIONZIP_QWEN25.exists():
+        path = str(OFFICIAL_VISIONZIP_QWEN25)
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        try:
+            from qwen2_5vl_visionzip import Qwen2_5_VLForConditionalGeneration
+        except Exception as exc:
+            raise RuntimeError(f"Official VisionZip Qwen2.5-VL import failed from {path}.") from exc
+    else:
+        raise RuntimeError(
+            "Official VisionZip Qwen2.5-VL source is required for training. "
+            f"Missing directory: {OFFICIAL_VISIONZIP_QWEN25}"
+        )
     return Qwen2_5_VLForConditionalGeneration, AutoProcessor
 
 
@@ -72,6 +81,30 @@ def str_to_torch_dtype(name: str, bf16: bool = True) -> torch.dtype:
     if lowered in {"float16", "fp16"}:
         return torch.float16
     return torch.float32
+
+
+def ensure_peft_tensor_parallel_compat() -> None:
+    """Provide no-op tensor-parallel hooks for PEFT with older Transformers."""
+    module_name = "transformers.integrations.tensor_parallel"
+    if module_name in sys.modules or find_spec(module_name) is not None:
+        return
+
+    module = types.ModuleType(module_name)
+
+    class ColwiseParallel:
+        pass
+
+    class RowwiseParallel:
+        pass
+
+    class EmbeddingParallel:
+        pass
+
+    module.ALL_PARALLEL_STYLES = {}
+    module.ColwiseParallel = ColwiseParallel
+    module.RowwiseParallel = RowwiseParallel
+    module.EmbeddingParallel = EmbeddingParallel
+    sys.modules[module_name] = module
 
 
 def load_qwen_model_and_processor(
@@ -101,6 +134,11 @@ def load_qwen_model_and_processor(
     processor = processor_cls.from_pretrained(model_name_or_path, **processor_kwargs)
     if getattr(processor.tokenizer, "pad_token_id", None) is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
+    set_visionzip_ratios(
+        model,
+        dominant_ratio=VISIONZIP_NO_PRUNE_DOMINANT,
+        contextual_ratio=VISIONZIP_NO_PRUNE_CONTEXTUAL,
+    )
     return model, processor
 
 
@@ -113,6 +151,7 @@ def apply_lora(
     adapter_path: str = "",
 ) -> Any:
     try:
+        ensure_peft_tensor_parallel_compat()
         from peft import LoraConfig, PeftModel, get_peft_model
     except Exception as exc:
         raise RuntimeError("PEFT is required for this experiment's trainable student adapters.") from exc
@@ -152,7 +191,6 @@ def model_input_subset(inputs: dict[str, Any]) -> dict[str, Any]:
         "pixel_values_videos",
         "video_grid_thw",
         "second_per_grid_ts",
-        "mm_token_type_ids",
     }
     return {key: value for key, value in inputs.items() if key in keep and value is not None}
 
@@ -310,185 +348,119 @@ def manual_generate_pruned(
     return gen_ids, decode_token_ids(processor, gen_ids)
 
 
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def _apply_rotary_pos_emb_vision(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    orig_q_dtype = q.dtype
-    orig_k_dtype = k.dtype
-    q = q.float()
-    k = k.float()
-    cos = cos.unsqueeze(-2).float()
-    sin = sin.unsqueeze(-2).float()
-    q_embed = (q * cos) + (_rotate_half(q) * sin)
-    k_embed = (k * cos) + (_rotate_half(k) * sin)
-    return q_embed.to(orig_q_dtype), k_embed.to(orig_k_dtype)
-
-
-def _last_attention_metric(attn: Any, hidden_states: torch.Tensor, position_embeddings: tuple[torch.Tensor, torch.Tensor]):
-    seq_length = int(hidden_states.shape[0])
-    q, k, _ = attn.qkv(hidden_states).reshape(seq_length, 3, attn.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
-    q, k = _apply_rotary_pos_emb_vision(q, k, *position_embeddings)
-    qh = q.permute(1, 0, 2).float()
-    kh = k.permute(1, 0, 2).float()
-    scaling = float(getattr(attn, "scaling", 1.0 / math.sqrt(max(1, qh.shape[-1]))))
-    logits = torch.matmul(qh, kh.transpose(-1, -2)) * scaling
-    attn_probs = F.softmax(logits, dim=-1)
-    return attn_probs, kh
-
-
-def _standard_visual_with_metrics(visual: Any, pixel_values: torch.Tensor, grid_thw: torch.Tensor):
-    """Run recent transformers Qwen visual code while extracting VisionZip metrics."""
-
-    hidden_states = visual.patch_embed(pixel_values)
-    rotary_pos_emb = visual.rot_pos_emb(grid_thw)
-    window_index, cu_window_seqlens = visual.get_window_index(grid_thw)
-    cu_window_seqlens = torch.tensor(cu_window_seqlens, device=hidden_states.device, dtype=torch.int32)
-    cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
-
-    seq_len, _ = hidden_states.size()
-    spatial_merge_unit = int(visual.spatial_merge_unit)
-    hidden_states = hidden_states.reshape(seq_len // spatial_merge_unit, spatial_merge_unit, -1)
-    hidden_states = hidden_states[window_index, :, :].reshape(seq_len, -1)
-    rotary_pos_emb = rotary_pos_emb.reshape(seq_len // spatial_merge_unit, spatial_merge_unit, -1)
-    rotary_pos_emb = rotary_pos_emb[window_index, :, :].reshape(seq_len, -1)
-    emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-    position_embeddings = (emb.cos(), emb.sin())
-
-    cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(dim=0, dtype=torch.int32)
-    cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-
-    attn_probs = None
-    attn_key = None
-    blocks = list(visual.blocks)
-    for layer_num, blk in enumerate(blocks):
-        if layer_num in set(getattr(visual, "fullatt_block_indexes", [])):
-            cu_seqlens_now = cu_seqlens
-        else:
-            cu_seqlens_now = cu_window_seqlens
-        if layer_num == len(blocks) - 1:
-            attn_probs, attn_key = _last_attention_metric(blk.attn, blk.norm1(hidden_states), position_embeddings)
-        hidden_states = blk(hidden_states, cu_seqlens=cu_seqlens_now, position_embeddings=position_embeddings)
-
-    merged_hidden_states = visual.merger(hidden_states)
-    reverse_indices = torch.argsort(window_index)
-    merged_hidden_states = merged_hidden_states[reverse_indices, :]
-    if attn_probs is None or attn_key is None:
-        raise RuntimeError("Could not extract VisionZip last-layer visual attention metrics.")
-
-    with torch.no_grad():
-        attn_mean = attn_probs.mean(dim=0).sum(dim=0)
-        if attn_mean.numel() % spatial_merge_unit != 0:
-            raise RuntimeError("VisionZip attention metric is incompatible with Qwen spatial merge unit.")
-        attn_mean = attn_mean.view(attn_mean.shape[0] // spatial_merge_unit, spatial_merge_unit).mean(dim=-1)
-        attn_mean = attn_mean[reverse_indices]
-        attn_key = attn_key.view(attn_key.shape[0], attn_key.shape[1] // spatial_merge_unit, spatial_merge_unit, attn_key.shape[-1])
-        attn_key = attn_key.mean(dim=2)
-        attn_key = attn_key[:, reverse_indices, :].mean(dim=0).unsqueeze(0)
-    return merged_hidden_states, attn_mean, attn_key
-
-
-def get_qwen25_visionzip_visual_outputs(
-    model: Any,
-    inputs: dict[str, Any],
-    allow_embedding_fallback: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, dict[str, Any]]:
-    validate_single_image_qwen_inputs(inputs, model=model)
-    qwen = _unwrap_qwen_model(model)
-    visual = _get_visual_module(qwen)
-    try:
-        visual_device = next(visual.parameters()).device
-    except StopIteration:
-        visual_device = primary_device(qwen)
-    pixel_values = inputs["pixel_values"].to(device=visual_device)
-    image_grid_thw = inputs["image_grid_thw"].to(device=visual_device)
-    visual_dtype = getattr(visual, "dtype", None)
-    if visual_dtype is not None:
-        pixel_values = pixel_values.to(dtype=visual_dtype)
-
-    with torch.no_grad():
-        try:
-            out = visual(pixel_values, grid_thw=image_grid_thw)
-        except TypeError:
-            out = visual(pixel_values, image_grid_thw=image_grid_thw)
-        if isinstance(out, (tuple, list)) and len(out) >= 3:
-            image_embeds, attn_scores, attn_key = out[0], out[1], out[2]
-            source = "visionzip_qwen_visual"
-        else:
+def _visionzip_model_targets(model: Any) -> list[Any]:
+    targets: list[Any] = []
+    queue = [model]
+    seen: set[int] = set()
+    while queue:
+        item = queue.pop(0)
+        if item is None or id(item) in seen:
+            continue
+        seen.add(id(item))
+        if hasattr(item, "visionzip_dominant_ratio") or hasattr(item, "visual"):
+            targets.append(item)
+        if hasattr(item, "get_base_model"):
             try:
-                image_embeds, attn_scores, attn_key = _standard_visual_with_metrics(visual, pixel_values, image_grid_thw)
-                source = "standard_qwen_manual_metric"
-            except Exception:
-                if not allow_embedding_fallback:
-                    raise
-                from opsd.pruning_distill.qwen25_pruned_forward import get_qwen25_visual_embeds
-
-                image_embeds = get_qwen25_visual_embeds(model, inputs)
-                attn_scores = None
-                attn_key = None
-                source = "embedding_fallback"
-
-    if image_embeds.ndim == 3 and int(image_embeds.shape[0]) == 1:
-        image_embeds = image_embeds[0]
-    image_token_id = int(qwen.config.image_token_id)
-    n_image_tokens = int((inputs["input_ids"] == image_token_id).sum().item())
-    if int(image_embeds.shape[0]) != n_image_tokens:
-        raise ValueError(f"Image features and placeholders do not match: {image_embeds.shape[0]} vs {n_image_tokens}.")
-    return image_embeds, attn_scores, attn_key, {"visionzip_metric_source": source}
+                queue.append(item.get_base_model())
+            except TypeError:
+                pass
+        for attr in ("module", "base_model", "model"):
+            queue.append(getattr(item, attr, None))
+    qwen = _unwrap_qwen_model(model)
+    if id(qwen) not in {id(x) for x in targets}:
+        targets.append(qwen)
+    return targets
 
 
-def build_visionzip_pruned_inputs(
+def set_visionzip_ratios(model: Any, dominant_ratio: float, contextual_ratio: float) -> None:
+    for target in _visionzip_model_targets(model):
+        setattr(target, "visionzip_dominant_ratio", float(dominant_ratio))
+        setattr(target, "visionzip_contextual_ratio", float(contextual_ratio))
+
+
+@contextmanager
+def temporary_visionzip_ratios(model: Any, retention_ratio: float):
+    retention = min(max(float(retention_ratio), 0.0), 1.0)
+    contextual = min(0.05, retention)
+    dominant = max(0.0, retention - contextual)
+    targets = _visionzip_model_targets(model)
+    previous = [
+        (
+            target,
+            getattr(target, "visionzip_dominant_ratio", None),
+            getattr(target, "visionzip_contextual_ratio", None),
+        )
+        for target in targets
+    ]
+    set_visionzip_ratios(model, dominant, contextual)
+    try:
+        yield dominant, contextual
+    finally:
+        for target, dominant_prev, contextual_prev in previous:
+            if dominant_prev is None:
+                try:
+                    delattr(target, "visionzip_dominant_ratio")
+                except AttributeError:
+                    pass
+            else:
+                setattr(target, "visionzip_dominant_ratio", dominant_prev)
+            if contextual_prev is None:
+                try:
+                    delattr(target, "visionzip_contextual_ratio")
+                except AttributeError:
+                    pass
+            else:
+                setattr(target, "visionzip_contextual_ratio", contextual_prev)
+
+
+def official_visionzip_metadata(
     model: Any,
     inputs: dict[str, torch.Tensor],
-    retention_ratio: float,
-    prompt_len: int | None = None,
-    mode: str = "drop_tokens",
-    allow_embedding_fallback: bool = False,
+    prompt_len: int | None,
+    dominant_ratio: float,
+    contextual_ratio: float,
 ) -> dict[str, Any]:
-    image_embeds, attn_scores, attn_key, metric_meta = get_qwen25_visionzip_visual_outputs(
-        model,
-        inputs,
-        allow_embedding_fallback=allow_embedding_fallback,
-    )
-    pruner = VisionZipPruner(allow_embedding_fallback=allow_embedding_fallback)
-    vz = pruner.select_and_merge(
-        image_embeds,
-        inputs.get("image_grid_thw"),
-        retention_ratio,
-        attn_scores=attn_scores,
-        attn_key=attn_key,
-        metadata=metric_meta,
-    )
-    position_ids = compute_full_position_ids(
-        model,
-        inputs["input_ids"],
-        inputs.get("image_grid_thw"),
-        inputs.get("video_grid_thw"),
-        inputs.get("attention_mask"),
-        inputs.get("second_per_grid_ts"),
-        inputs.get("mm_token_type_ids"),
-    )
-    pruned = build_pruned_inputs_embeds(
-        model,
-        inputs["input_ids"],
-        inputs["attention_mask"],
-        position_ids,
-        vz.image_embeds,
-        vz.keep_indices,
-        mode=mode,
-        prompt_len=prompt_len,
-        full_mm_token_type_ids=inputs.get("mm_token_type_ids"),
-    )
-    pruned["metadata"].update(vz.metadata)
-    return pruned
+    qwen = _unwrap_qwen_model(model)
+    last = getattr(qwen, "_last_visionzip_pruned_inputs", None)
+    if not isinstance(last, dict) or "input_ids" not in last:
+        raise RuntimeError("Official VisionZip forward did not expose _last_visionzip_pruned_inputs.")
+    image_token_id = int(qwen.config.image_token_id)
+    full_input_ids = inputs["input_ids"]
+    pruned_input_ids = last["input_ids"].to(device=full_input_ids.device)
+    num_full = int((full_input_ids == image_token_id).sum().item())
+    num_kept = int((pruned_input_ids == image_token_id).sum().item())
+    dominant_num = min(num_full, max(0, int(float(dominant_ratio) * num_full)))
+    contextual_num = max(0, int(float(contextual_ratio) * num_full))
+    if contextual_ratio > 0 and dominant_num < num_full:
+        contextual_num = max(contextual_num, 1)
+    contextual_num = min(contextual_num, max(0, num_full - dominant_num))
+    if num_kept != dominant_num + contextual_num:
+        raise RuntimeError(
+            "Official VisionZip token count mismatch: "
+            f"kept={num_kept}, dominant+contextual={dominant_num + contextual_num}."
+        )
+    student_prompt_len = None
+    if prompt_len is not None:
+        full_prompt_image_tokens = int((full_input_ids[:, :prompt_len] == image_token_id).sum().item())
+        student_prompt_len = int(prompt_len) - full_prompt_image_tokens + num_kept
+    return {
+        "student_prompt_len": student_prompt_len,
+        "num_full_visual_tokens": num_full,
+        "num_kept_visual_tokens": num_kept,
+        "visionzip_exact_metrics": True,
+        "visionzip_metric_source": "official_qwen2_5vl_visionzip",
+        "visionzip_target_tokens": num_kept,
+        "visionzip_dominant_tokens": dominant_num,
+        "visionzip_contextual_tokens": contextual_num,
+        "visionzip_merged_tokens": max(0, num_full - dominant_num - contextual_num),
+        "visionzip_contextual_fraction": float(contextual_ratio),
+        "visionzip_dominant_ratio": float(dominant_ratio),
+        "visionzip_contextual_ratio": float(contextual_ratio),
+    }
+
+
+def official_model_kwargs(inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return model_input_subset(inputs)
 
 
 def forward_pruned(
@@ -500,26 +472,17 @@ def forward_pruned(
     allow_embedding_fallback: bool = False,
     **forward_kwargs: Any,
 ):
-    pruned = build_visionzip_pruned_inputs(
-        model,
-        inputs,
-        retention_ratio,
-        prompt_len=prompt_len,
-        mode=mode,
-        allow_embedding_fallback=allow_embedding_fallback,
-    )
-    kwargs = {
-        "input_ids": pruned["input_ids"],
-        "inputs_embeds": pruned["inputs_embeds"],
-        "attention_mask": pruned["attention_mask"],
-        "position_ids": pruned["position_ids"],
-        "use_cache": False,
-    }
-    if "mm_token_type_ids" in pruned:
-        kwargs["mm_token_type_ids"] = pruned["mm_token_type_ids"]
+    del mode
+    if allow_embedding_fallback:
+        raise ValueError("Embedding fallback is disabled: training must use official VisionZip metrics.")
+    validate_single_image_qwen_inputs(inputs, model=model)
+    kwargs = official_model_kwargs(inputs)
+    kwargs["use_cache"] = False
     kwargs.update(forward_kwargs)
-    outputs = model(**kwargs)
-    return outputs, pruned
+    with temporary_visionzip_ratios(model, retention_ratio) as (dominant_ratio, contextual_ratio):
+        outputs = model(**kwargs)
+        metadata = official_visionzip_metadata(model, inputs, prompt_len, dominant_ratio, contextual_ratio)
+    return outputs, {"metadata": metadata}
 
 
 def generate_pruned(
@@ -535,34 +498,14 @@ def generate_pruned(
     allow_embedding_fallback: bool = False,
     manual_decode: bool = False,
 ) -> tuple[torch.Tensor, str, dict[str, Any]]:
-    pruned = build_visionzip_pruned_inputs(
-        model,
-        prompt_inputs,
-        retention_ratio,
-        prompt_len=int(prompt_inputs["input_ids"].shape[1]),
-        mode="drop_tokens",
-        allow_embedding_fallback=allow_embedding_fallback,
-    )
+    del manual_decode
+    if allow_embedding_fallback:
+        raise ValueError("Embedding fallback is disabled: generation must use official VisionZip metrics.")
+    validate_single_image_qwen_inputs(prompt_inputs, model=model)
     eos_token_id = getattr(processor.tokenizer, "eos_token_id", None)
     pad_token_id = getattr(processor.tokenizer, "pad_token_id", None) or eos_token_id
-    if manual_decode:
-        gen_ids, text = manual_generate_pruned(
-            model,
-            processor,
-            pruned,
-            max_new_tokens=max_new_tokens,
-            do_sample=do_sample,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            eos_token_id=eos_token_id,
-        )
-        return gen_ids, text, pruned["metadata"]
     kwargs = {
-        "input_ids": pruned["input_ids"],
-        "inputs_embeds": pruned["inputs_embeds"],
-        "attention_mask": pruned["attention_mask"],
-        "position_ids": pruned["position_ids"],
+        **official_model_kwargs(prompt_inputs),
         "max_new_tokens": int(max_new_tokens),
         "do_sample": bool(do_sample),
         "use_cache": True,
@@ -574,13 +517,13 @@ def generate_pruned(
         kwargs["top_p"] = float(top_p)
         if top_k is not None and int(top_k) > 0:
             kwargs["top_k"] = int(top_k)
-    if "mm_token_type_ids" in pruned:
-        kwargs["mm_token_type_ids"] = pruned["mm_token_type_ids"]
     generate_model = getattr(model, "module", model)
-    output_ids = generate_model.generate(**kwargs)
-    prompt_len = int(pruned["input_ids"].shape[1])
+    prompt_len = int(prompt_inputs["input_ids"].shape[1])
+    with temporary_visionzip_ratios(model, retention_ratio) as (dominant_ratio, contextual_ratio):
+        output_ids = generate_model.generate(**kwargs)
+        metadata = official_visionzip_metadata(model, prompt_inputs, prompt_len, dominant_ratio, contextual_ratio)
     text = decode_new_tokens(processor, output_ids, prompt_len)
-    return output_ids[:, prompt_len:], text, pruned["metadata"]
+    return output_ids[:, prompt_len:], text, metadata
 
 
 @contextmanager

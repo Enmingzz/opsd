@@ -42,7 +42,6 @@ from opsd.visionzip_aokvqa.qwen_wrapper import (
     primary_device,
     teacher_adapter_disabled,
 )
-from opsd.visionzip_aokvqa.visionzip import grpo_group_advantages
 
 
 OUTPUT_ROOT = Path("outputs/visionzip_aokvqa_reasoning")
@@ -86,6 +85,13 @@ def set_nested(cfg: dict[str, Any], dotted: str, value: Any) -> None:
     for key in parts[:-1]:
         cur = cur.setdefault(key, {})
     cur[parts[-1]] = value
+
+
+def grpo_group_advantages(rewards: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    rewards = rewards.float().flatten()
+    if rewards.numel() == 0:
+        raise ValueError("GRPO rewards must be non-empty.")
+    return (rewards - rewards.mean()) / rewards.std(unbiased=False).clamp_min(float(eps))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -189,8 +195,23 @@ def save_resolved_config(cfg: dict[str, Any], output_dir: Path) -> None:
         yaml.safe_dump(cfg, f, sort_keys=False)
 
 
-def sample_retention_ratio(cfg: dict[str, Any], rng: random.Random) -> float:
+def sample_retention_ratio(
+    cfg: dict[str, Any],
+    rng: random.Random,
+    progress_step: int | None = None,
+    total_steps: int | None = None,
+) -> float:
     ratios = [float(x) for x in get_nested(cfg, "pruning.train_retention_ratios", [0.1, 0.2, 0.3, 0.4])]
+    schedule = str(get_nested(cfg, "pruning.retention_ratio_schedule", "random") or "random").strip().lower()
+    if schedule in {"progressive", "curriculum"}:
+        if progress_step is None or total_steps is None or total_steps <= 0:
+            raise ValueError("progressive retention ratio scheduling requires progress_step and total_steps.")
+        ordered = sorted(ratios, reverse=True)
+        progress = min(max(float(progress_step) / float(total_steps), 0.0), 0.999999)
+        stage = min(len(ordered) - 1, int(progress * len(ordered)))
+        return float(ordered[stage])
+    if schedule not in {"random", "weighted_random", "uniform_random"}:
+        raise ValueError(f"Unsupported pruning.retention_ratio_schedule={schedule!r}.")
     weights_raw = get_nested(cfg, "pruning.train_retention_ratio_weights", None)
     if weights_raw is None:
         return float(rng.choice(ratios))
@@ -276,7 +297,7 @@ def resolve_ema_update_settings(cfg: dict[str, Any]) -> dict[str, Any]:
             "alpha": alpha,
             "lazy_init": bool(get_nested(cfg, "opsd.ema_lazy_init", False)),
         }
-    decay = float(get_nested(cfg, "opsd.ema_decay_default", 0.999))
+    decay = float(get_nested(cfg, "opsd.ema_decay_default", 0.9999))
     if decay <= 0.0 or decay >= 1.0:
         raise ValueError(f"opsd.ema_decay_default must be in (0, 1), got {decay}.")
     return {
@@ -612,6 +633,7 @@ def opsd_nogt_step(
         top_p=float(get_nested(cfg, "generation.top_p", 0.9)),
         top_k=generation_top_k(cfg),
         allow_embedding_fallback=bool(get_nested(cfg, "pruning.allow_embedding_fallback", False)),
+        manual_decode=bool(get_nested(cfg, "generation.manual_pruned_generate", True)),
     )
     if gen_ids.numel() == 0:
         raise RuntimeError("OPSD student generated zero tokens.")
@@ -716,6 +738,7 @@ def opsd_step(
         top_p=float(get_nested(cfg, "generation.top_p", 0.9)),
         top_k=generation_top_k(cfg),
         allow_embedding_fallback=bool(get_nested(cfg, "pruning.allow_embedding_fallback", False)),
+        manual_decode=bool(get_nested(cfg, "generation.manual_pruned_generate", True)),
     )
     if gen_ids.numel() == 0:
         raise RuntimeError("OPSD student generated zero tokens.")
@@ -892,6 +915,7 @@ def grpo_step(
             top_p=float(get_nested(cfg, "generation.top_p", 0.9)),
             top_k=generation_top_k(cfg),
             allow_embedding_fallback=bool(get_nested(cfg, "pruning.allow_embedding_fallback", False)),
+            manual_decode=bool(get_nested(cfg, "generation.manual_pruned_generate", True)),
         )
         if gen_ids.numel() == 0:
             continue
@@ -933,6 +957,21 @@ def numeric_metadata(meta: dict[str, Any]) -> dict[str, Any]:
                 out[key] = float(value.detach().cpu().item())
         elif isinstance(value, (int, float, str, bool)) or value is None:
             out[key] = value
+    return out
+
+
+def aggregate_microbatch_metrics(metrics: list[dict[str, Any]]) -> dict[str, Any]:
+    if not metrics:
+        return {}
+    out: dict[str, Any] = {}
+    for key in sorted({key for item in metrics for key in item}):
+        values = [item[key] for item in metrics if key in item]
+        if values and all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in values):
+            out[key] = sum(float(value) for value in values) / len(values)
+        elif values and all(value == values[0] for value in values):
+            out[key] = values[0]
+        else:
+            out[key] = values
     return out
 
 
@@ -1059,46 +1098,71 @@ def train(cfg: dict[str, Any]) -> Path:
     )
     save_every = int(get_nested(cfg, "training.save_every", 500))
     grad_accum = int(get_nested(cfg, "training.gradient_accumulation_steps", 1))
-    local_steps = remaining_steps // world_size if distributed else remaining_steps
+    micro_batch_size = int(get_nested(cfg, "training.micro_batch_size", 1) or 1)
+    if micro_batch_size < 1:
+        raise ValueError(f"training.micro_batch_size must be >= 1; got {micro_batch_size}.")
+    global_step_unit = world_size * micro_batch_size if distributed else micro_batch_size
+    if remaining_steps % global_step_unit != 0:
+        raise ValueError(
+            "DDP requires remaining steps divisible by world_size * training.micro_batch_size; "
+            f"got remaining={remaining_steps}, world_size={world_size}, micro_batch_size={micro_batch_size}."
+        )
+    local_steps = remaining_steps // global_step_unit
     step = 0
     accum = 0
     start = time.time()
     try:
         while step < local_steps:
-            global_index = start_step + step * world_size + rank if distributed else start_step + step
-            sample = dataset[global_index % len(dataset)]
-            ratio = sample_retention_ratio(cfg, rng)
+            sample: FormattedAOKVQASample | None = None
+            ratio: float | None = None
             try:
-                if method == "sft":
-                    loss, metrics = sft_like_step(model, processor, sample, cfg, ratio, sample.target)
-                elif method == "epic":
-                    loss, metrics = epic_tcd_step(model, processor, sample, cfg, ratio)
-                elif method == "grpo":
-                    loss, metrics = grpo_step(model, processor, sample, cfg, ratio)
-                elif method in {"opsd", "opsd_fixed_teacher"}:
-                    loss, metrics = opsd_step(
-                        model,
-                        processor,
-                        sample,
-                        cfg,
-                        ratio,
-                        teacher_model=teacher_model,
-                        ema_shadow=ema_shadow,
-                    )
-                elif method == "opsd_nogt":
-                    loss, metrics = opsd_nogt_step(
-                        model,
-                        processor,
-                        sample,
-                        cfg,
-                        ratio,
-                        teacher_model=teacher_model,
-                        ema_shadow=ema_shadow,
-                    )
-                elif method == "offpolicy":
-                    loss, metrics = offpolicy_step(model, processor, sample, cfg, ratio)
-                else:
-                    raise AssertionError(method)
+                batch_losses: list[torch.Tensor] = []
+                batch_metrics: list[dict[str, Any]] = []
+                batch_samples: list[FormattedAOKVQASample] = []
+                batch_ratios: list[float] = []
+                for micro_idx in range(micro_batch_size):
+                    if distributed:
+                        global_index = start_step + (step * micro_batch_size + micro_idx) * world_size + rank
+                    else:
+                        global_index = start_step + step * micro_batch_size + micro_idx
+                    sample = dataset[global_index % len(dataset)]
+                    ratio = sample_retention_ratio(cfg, rng, progress_step=global_index, total_steps=max_steps)
+                    if method == "sft":
+                        sample_loss, sample_metrics = sft_like_step(model, processor, sample, cfg, ratio, sample.target)
+                    elif method == "epic":
+                        sample_loss, sample_metrics = epic_tcd_step(model, processor, sample, cfg, ratio)
+                    elif method == "grpo":
+                        sample_loss, sample_metrics = grpo_step(model, processor, sample, cfg, ratio)
+                    elif method in {"opsd", "opsd_fixed_teacher"}:
+                        sample_loss, sample_metrics = opsd_step(
+                            model,
+                            processor,
+                            sample,
+                            cfg,
+                            ratio,
+                            teacher_model=teacher_model,
+                            ema_shadow=ema_shadow,
+                        )
+                    elif method == "opsd_nogt":
+                        sample_loss, sample_metrics = opsd_nogt_step(
+                            model,
+                            processor,
+                            sample,
+                            cfg,
+                            ratio,
+                            teacher_model=teacher_model,
+                            ema_shadow=ema_shadow,
+                        )
+                    elif method == "offpolicy":
+                        sample_loss, sample_metrics = offpolicy_step(model, processor, sample, cfg, ratio)
+                    else:
+                        raise AssertionError(method)
+                    batch_losses.append(sample_loss)
+                    batch_metrics.append(sample_metrics)
+                    batch_samples.append(sample)
+                    batch_ratios.append(float(ratio))
+                loss = torch.stack(batch_losses).mean()
+                metrics = aggregate_microbatch_metrics(batch_metrics)
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"Non-finite loss: {loss}")
                 sync_context = model.no_sync() if distributed and hasattr(model, "no_sync") and (accum + 1) < grad_accum else nullcontext()
@@ -1143,16 +1207,21 @@ def train(cfg: dict[str, Any]) -> Path:
                     optimizer.zero_grad(set_to_none=True)
                     accum = 0
                 step += 1
-                global_step = min(max_steps, start_step + step * world_size) if distributed else start_step + step
+                global_step = min(max_steps, start_step + step * global_step_unit)
                 row = {
                     "step": global_step,
                     "local_step": step,
                     "rank": rank,
                     "world_size": world_size,
                     "method": method,
-                    "sample_id": sample.sample_id,
-                    "retention_ratio": ratio,
+                    "micro_batch_size": micro_batch_size,
+                    "sample_id": batch_samples[0].sample_id,
+                    "sample_ids": [item.sample_id for item in batch_samples],
+                    "retention_ratio": batch_ratios[0],
+                    "retention_ratios": batch_ratios,
+                    "retention_ratio_schedule": str(get_nested(cfg, "pruning.retention_ratio_schedule", "random") or "random"),
                     "loss": float(loss.detach().cpu()),
+                    "micro_batch_losses": [float(item.detach().cpu()) for item in batch_losses],
                     "elapsed_seconds": time.time() - start,
                     **metrics,
                     **ema_update_metrics,
@@ -1168,7 +1237,7 @@ def train(cfg: dict[str, Any]) -> Path:
                     "local_step": step + 1,
                     "rank": rank,
                     "method": method,
-                    "sample_id": sample.sample_id,
+                    "sample_id": sample.sample_id if sample is not None else "",
                     "retention_ratio": ratio,
                     "error": repr(exc),
                 }

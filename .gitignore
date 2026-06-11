@@ -10,8 +10,11 @@ __pycache__/
 .env
 .venv/
 venv/
+.tmp/
 .idea/
 .vscode/
+*.bak
+*.bak_*
 
 # Experiment outputs and large artifacts
 outputs/
