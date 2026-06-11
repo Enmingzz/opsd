@@ -19,6 +19,10 @@ WAIT_FOR_FINALS="${WAIT_FOR_FINALS:-1}"
 WAIT_SECONDS="${WAIT_SECONDS:-60}"
 WAIT_TRIES="${WAIT_TRIES:-720}"
 
+export OPSD_BASE_ROOT="${OPSD_BASE_ROOT:-${BASE_ROOT}}"
+export OPSD_FIRST4_RUN_ID="${OPSD_FIRST4_RUN_ID:-${RUN_ID}}"
+export OPSD_FIRST4_CKPT_ROOT="${OPSD_FIRST4_CKPT_ROOT:-${CKPT_ROOT}}"
+
 required_finals=(
   "${CKPT_ROOT}/01_sft_official_gbs8/final"
   "${CKPT_ROOT}/02_epic_tcd_full_teacher_official_gbs8/final"

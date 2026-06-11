@@ -1,16 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /root/autodl-tmp/opsd_eval/opsd
+BASE_ROOT="${BASE_ROOT:-/root/autodl-tmp/opsd_eval}"
+OPSD_ROOT="${OPSD_ROOT:-${BASE_ROOT}/opsd}"
+VLMEVALKIT_ROOT="${VLMEVALKIT_ROOT:-${BASE_ROOT}/VLMEvalKit}"
+OUT_ROOT="${OUT_ROOT:-${BASE_ROOT}/outputs/visionzip_aokvqa_reasoning}"
+CONDA_BIN="${CONDA_BIN:-/root/miniconda3/bin}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 
-export PATH=/root/miniconda3/bin:${PATH}
-export HF_HOME=/root/autodl-tmp/hf_cache
-export TRANSFORMERS_CACHE=/root/autodl-tmp/hf_cache
-export HF_ENDPOINT=https://hf-mirror.com
-export HF_HUB_DISABLE_XET=1
+cd "${OPSD_ROOT}"
+
+if [[ -d "${CONDA_BIN}" ]]; then
+  export PATH="${CONDA_BIN}:${PATH}"
+fi
+export HF_HOME="${HF_HOME:-${BASE_ROOT}/hf_cache}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}}"
+export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
 export HF_HUB_DISABLE_PROGRESS_BARS=1
 export PYTHONNOUSERSITE=1
-export PYTHONPATH=/root/autodl-tmp/opsd_eval:/root/autodl-tmp/opsd_eval/VLMEvalKit:${PYTHONPATH:-}
+export PYTHONPATH="${BASE_ROOT}:${VLMEVALKIT_ROOT}:${PYTHONPATH:-}"
+export VISIONZIP_QWEN25VL_ROOT="${VISIONZIP_QWEN25VL_ROOT:-${BASE_ROOT}/VisionZip/Qwen2_5_VL}"
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
@@ -19,12 +29,11 @@ export OPSD_DDP_STAGGER_LOAD_SECONDS=${OPSD_DDP_STAGGER_LOAD_SECONDS:-15}
 
 RUN_GROUP=${RUN_GROUP:-aokvqa_ordered_$(date +%Y%m%d_%H%M%S)}
 MASTER_PORT_BASE=${MASTER_PORT_BASE:-29611}
-BASE_ROOT=/root/autodl-tmp/opsd_eval/outputs/visionzip_aokvqa_reasoning
-BASE_OUT=${BASE_ROOT}/checkpoints/${RUN_GROUP}
-LOGDIR=${BASE_ROOT}/logs/train/${RUN_GROUP}
+BASE_OUT=${OUT_ROOT}/checkpoints/${RUN_GROUP}
+LOGDIR=${OUT_ROOT}/logs/train/${RUN_GROUP}
 
 mkdir -p "${BASE_OUT}" "${LOGDIR}"
-printf '%s\n' "${RUN_GROUP}" > "${BASE_ROOT}/latest_aokvqa_ordered_train_run.txt"
+printf '%s\n' "${RUN_GROUP}" > "${OUT_ROOT}/latest_aokvqa_ordered_train_run.txt"
 
 run_stage() {
   local stage_id="$1"
@@ -36,7 +45,7 @@ run_stage() {
 
   echo "[$(date --iso-8601=seconds)] start ${stage_id}_${name}" | tee -a "${LOGDIR}/sequence.log"
   torchrun \
-    --nproc-per-node=4 \
+    --nproc-per-node="${NPROC_PER_NODE}" \
     --master-port="${port}" \
     visionzip_aokvqa/train.py \
     --config "${config}" \

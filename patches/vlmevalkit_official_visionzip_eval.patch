@@ -379,8 +379,17 @@ index 4487710..d11a36c 100644
 +# OPSD official-first4 AOKVQA adapters. Appended as an override so both the clear
 +# names and the older convenience aliases use the same official VisionZip eval path.
 +# Official split: 5%=0% dominant+5% contextual, 10%=5%+5%, 20%=15%+5%, 30%=25%+5%.
-+_OPSD_FIRST4_ROOT = '/root/autodl-tmp/opsd_eval/outputs/visionzip_aokvqa_reasoning/checkpoints/aokvqa_first4_officialvz_20260610_154040'
-+_OPSD_OFFICIAL_VISIONZIP_ROOT = '/root/autodl-tmp/opsd_eval/VisionZip/Qwen2_5_VL'
++import os as _opsd_os
++_OPSD_BASE_ROOT = _opsd_os.environ.get('OPSD_BASE_ROOT', '/root/autodl-tmp/opsd_eval')
++_OPSD_FIRST4_RUN_ID = _opsd_os.environ.get('OPSD_FIRST4_RUN_ID', 'aokvqa_first4_officialvz_20260610_154040')
++_OPSD_FIRST4_ROOT = _opsd_os.environ.get(
++    'OPSD_FIRST4_CKPT_ROOT',
++    f'{_OPSD_BASE_ROOT}/outputs/visionzip_aokvqa_reasoning/checkpoints/{_OPSD_FIRST4_RUN_ID}',
++)
++_OPSD_OFFICIAL_VISIONZIP_ROOT = _opsd_os.environ.get(
++    'VISIONZIP_QWEN25VL_ROOT',
++    f'{_OPSD_BASE_ROOT}/VisionZip/Qwen2_5_VL',
++)
 +_OPSD_FIRST4_ADAPTERS = {
 +    'sft': f'{_OPSD_FIRST4_ROOT}/01_sft_official_gbs8/final',
 +    'epic': f'{_OPSD_FIRST4_ROOT}/02_epic_tcd_full_teacher_official_gbs8/final',

@@ -1,137 +1,247 @@
-# OPSD VisionZip Experiments
+# OPSD VisionZip Experiment Runbook
 
-This repository contains the Qwen2.5-VL A-OKVQA training and evaluation workflow for OPSD experiments with the official VisionZip token pruning implementation.
+This repository contains the OPSD A-OKVQA training and VLMEvalKit evaluation workflow for Qwen2.5-VL-7B with the official VisionZip Qwen2.5-VL pruning implementation.
 
-The current experiment stack is:
+The intended use is to clone this repo on any GPU cluster, clone the two external upstream repos, apply the patches in `patches/`, and run the experiment launchers with cluster-specific paths and GPU settings.
+
+## What This Runs
 
 - Base model: `Qwen/Qwen2.5-VL-7B-Instruct`
-- Pruning backend: official VisionZip Qwen2.5-VL runtime
-- Training dataset: `HuggingFaceM4/A-OKVQA`
+- Training data: `HuggingFaceM4/A-OKVQA`
+- Pruning backend: official VisionZip Qwen2.5-VL implementation
+- Training methods: SFT, EPIC TCD, EMA OPSD no GT, Freeze SFT Teacher OPSD no GT
 - Evaluation: VLMEvalKit on MME, POPE, and MMStar
 - Attention backend: `flash_attention_2`
-- Adapter training: LoRA
-- Training ratios: 10%, 20%, 30%, and 40%, sampled uniformly unless a config says otherwise
+- Adapter type: LoRA
+- Training ratios: 10%, 20%, 30%, and 40%, sampled uniformly in the main configs
+- Evaluation ratios: 5%, 10%, 20%, and 30%
 
-Large artifacts such as datasets, checkpoints, logs, and raw evaluation outputs are intentionally ignored. The repo keeps source code, configs, launcher scripts, external patches, and compact result summaries.
+Large artifacts are intentionally ignored by git: model weights, datasets, checkpoints, logs, raw VLMEvalKit outputs, and caches.
 
-## Repository Layout
+## GPU Requirements
 
-| Path | Purpose |
-|---|---|
-| `visionzip_aokvqa/` | A-OKVQA training code, official VisionZip model loading, SFT, EPIC, and OPSD losses |
-| `pruning_distill/` | Shared pruned forward and distillation utilities |
-| `configs/visionzip_aokvqa/` | A-OKVQA experiment configs |
-| `scripts/` | AutoDL training and VLMEvalKit evaluation launchers |
-| `patches/` | Patches for the external official VisionZip and VLMEvalKit checkouts |
-| `reports/` | Small CSV/Markdown summaries of aligned evaluation results |
+The default scripts assume one multi-GPU node.
 
-## External Code Alignment
+| Task | Minimum that should work | Recommended for current configs | Notes |
+|---|---:|---:|---|
+| First4 training, `gbs8` configs | 4 GPUs with 48GB each | 4 GPUs with 80GB or 96GB each | Current first4 configs use per-GPU micro batch 2, global batch 8. |
+| Larger `mb8` configs | 4 GPUs with 80GB each | 4 GPUs with 96GB each | Per-GPU micro batch 8, global batch 32. Reduce `micro_batch_size` if OOM. |
+| Larger `mb16` configs | 4 GPUs with 96GB each | 4 GPUs with 96GB each | Per-GPU micro batch 16, global batch 64. These are memory aggressive. |
+| VLMEvalKit eval, fast mode | 4 GPUs with 48GB each | 4 GPUs with 80GB or 96GB each | Default is 12 workers across 4 GPUs, so 3 eval workers per GPU. |
+| VLMEvalKit eval, safer mode | 1 to 4 GPUs with 24GB+ each | 4 GPUs with 48GB+ each | Set `NPROC_PER_NODE` equal to GPU count for one worker per GPU. |
 
-Training and evaluation require the official VisionZip implementation, not the older local fallback. The local training wrapper imports the official Qwen2.5-VL VisionZip source through `VISIONZIP_QWEN25VL_ROOT`.
+Other practical requirements:
 
-The aligned external checkouts used for the current runs were:
+- CUDA-compatible PyTorch with `flash-attn`
+- 150GB+ disk for model/cache/checkpoints, more if keeping raw eval outputs
+- 64GB+ system RAM
+- Stable network access to Hugging Face, or a local mirror/cache
 
-| Project | Upstream | Commit |
-|---|---|---|
-| VisionZip | `https://github.com/JIA-Lab-research/VisionZip.git` | `8f86b55c6f000eb033e6912538af2dd7dcb30502` |
-| VLMEvalKit | `https://github.com/open-compass/VLMEvalKit.git` | `58fdeb6b980bda22096d912d70d1c858dedc84fd` |
-
-Apply the stored patches to those external repos:
-
-```bash
-cd /root/autodl-tmp/opsd_eval/VisionZip
-git apply /root/autodl-tmp/opsd_eval/opsd/patches/visionzip_qwen25vl_official_runtime.patch
-
-cd /root/autodl-tmp/opsd_eval/VLMEvalKit
-git apply /root/autodl-tmp/opsd_eval/opsd/patches/vlmevalkit_official_visionzip_eval.patch
-```
-
-The VLMEvalKit patch adds the Qwen2.5-VL official VisionZip model aliases used by the launcher scripts, including no-prune baseline, VisionZip ratios, and trained LoRA adapter variants.
-
-## AutoDL Environment
-
-The scripts assume this directory layout on AutoDL:
+Effective optimizer batch size is:
 
 ```text
-/root/autodl-tmp/opsd_eval/
-  opsd/
-  VisionZip/
-  VLMEvalKit/
+world_size * micro_batch_size * gradient_accumulation_steps
 ```
 
-Recommended environment variables:
+For the main first4 run, this is `4 * 2 * 1 = 8`.
+
+## Cluster Layout
+
+Pick a shared experiment root on your cluster:
 
 ```bash
-export BASE_ROOT=/root/autodl-tmp/opsd_eval
+export BASE_ROOT=/path/to/opsd_exp
+export OPSD_ROOT=${BASE_ROOT}/opsd
+export VISIONZIP_ROOT=${BASE_ROOT}/VisionZip
+export VLMEVALKIT_ROOT=${BASE_ROOT}/VLMEvalKit
+export OUT_ROOT=${BASE_ROOT}/outputs/visionzip_aokvqa_reasoning
+```
+
+Clone the repos:
+
+```bash
+mkdir -p "${BASE_ROOT}"
+git clone https://github.com/Enmingzz/opsd.git "${OPSD_ROOT}"
+git clone https://github.com/JIA-Lab-research/VisionZip.git "${VISIONZIP_ROOT}"
+git clone https://github.com/open-compass/VLMEvalKit.git "${VLMEVALKIT_ROOT}"
+```
+
+The currently aligned upstream commits are:
+
+| Project | Commit |
+|---|---|
+| VisionZip | `8f86b55c6f000eb033e6912538af2dd7dcb30502` |
+| VLMEvalKit | `58fdeb6b980bda22096d912d70d1c858dedc84fd` |
+
+Apply the official-runtime patches:
+
+```bash
+cd "${VISIONZIP_ROOT}"
+git checkout 8f86b55c6f000eb033e6912538af2dd7dcb30502
+git apply "${OPSD_ROOT}/patches/visionzip_qwen25vl_official_runtime.patch"
+
+cd "${VLMEVALKIT_ROOT}"
+git checkout 58fdeb6b980bda22096d912d70d1c858dedc84fd
+git apply "${OPSD_ROOT}/patches/vlmevalkit_official_visionzip_eval.patch"
+```
+
+## Environment
+
+Activate your cluster Python environment first. It should contain PyTorch, Transformers with Qwen2.5-VL support, `qwen-vl-utils`, `peft`, `accelerate`, `datasets`, `Pillow`, `PyYAML`, `flash-attn`, and VLMEvalKit dependencies.
+
+Set the runtime variables:
+
+```bash
+export BASE_ROOT=/path/to/opsd_exp
 export OPSD_ROOT=${BASE_ROOT}/opsd
 export VLMEVALKIT_ROOT=${BASE_ROOT}/VLMEvalKit
 export VISIONZIP_QWEN25VL_ROOT=${BASE_ROOT}/VisionZip/Qwen2_5_VL
-export PYTHONPATH=${VLMEVALKIT_ROOT}:${OPSD_ROOT}:${PYTHONPATH:-}
-export HF_HOME=/root/autodl-tmp/hf_cache
+export OUT_ROOT=${BASE_ROOT}/outputs/visionzip_aokvqa_reasoning
+export PYTHONPATH=${BASE_ROOT}:${VLMEVALKIT_ROOT}:${PYTHONPATH:-}
+export HF_HOME=${BASE_ROOT}/hf_cache
 export TRANSFORMERS_CACHE=${HF_HOME}
-export HF_ENDPOINT=https://hf-mirror.com
 export HF_HUB_DISABLE_XET=1
+export TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 ```
 
-Install the normal Qwen2.5-VL training stack in the active environment, including PyTorch, Transformers with Qwen2.5-VL support, `qwen-vl-utils`, `peft`, `accelerate`, `flash-attn`, `datasets`, `Pillow`, `PyYAML`, and VLMEvalKit dependencies.
-
-## Training
-
-Run the four primary official-VisionZip training jobs in sequence:
+For clusters in China, also set:
 
 ```bash
-cd /root/autodl-tmp/opsd_eval/opsd
+export HF_ENDPOINT=https://hf-mirror.com
+```
+
+## Run The Main Training Experiment
+
+The main run trains the four methods used in the current MME/POPE/MMStar comparison:
+
+1. SFT
+2. EPIC TCD
+3. EMA OPSD no GT
+4. Freeze SFT Teacher OPSD no GT
+
+Run:
+
+```bash
+cd "${OPSD_ROOT}"
+
+RUN_GROUP=aokvqa_first4_officialvz_$(date +%Y%m%d_%H%M%S) \
+BASE_ROOT="${BASE_ROOT}" \
+OPSD_ROOT="${OPSD_ROOT}" \
+VLMEVALKIT_ROOT="${VLMEVALKIT_ROOT}" \
+OUT_ROOT="${OUT_ROOT}" \
+NPROC_PER_NODE=4 \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
 bash scripts/run_aokvqa_first4_officialvz_autodl.sh
 ```
 
-The script runs:
+The script name is historical; it is now path-configurable and can run on any cluster.
 
-| Stage | Method | Config |
-|---:|---|---|
-| 1 | SFT | `configs/visionzip_aokvqa/aokvqa_sft_gbs8.yaml` |
-| 2 | EPIC TCD | `configs/visionzip_aokvqa/aokvqa_epic_tcd_gbs8.yaml` |
-| 3 | EMA OPSD no GT | `configs/visionzip_aokvqa/aokvqa_opsd_nogt_ema_gbs8.yaml` |
-| 4 | Freeze SFT Teacher OPSD no GT | generated from `configs/visionzip_aokvqa/aokvqa_opsd_sft_teacher_freeze_nogt_gbs8.yaml` |
+Outputs are written to:
 
-Current training defaults:
-
-- `torchrun --nproc-per-node=4`
-- per-GPU micro batch size: 2
-- global batch size: 8
-- LoRA rank: 16
-- generation max new tokens: 512
-- EMA decay for EMA teacher configs: 0.9999
-- teacher input: full visual tokens
-- student input: official VisionZip pruned visual tokens
-
-Additional requested experiment configs are also present under `configs/visionzip_aokvqa/`, including progressive-ratio variants and ground-truth variants.
-
-## Evaluation
-
-The main VLMEvalKit launcher uses 12 workers across 4 GPUs by default, so each GPU hosts 3 evaluation workers:
-
-```bash
-cd /root/autodl-tmp/opsd_eval/opsd
-bash scripts/run_vlmevalkit_autodl_12worker.sh
+```text
+${OUT_ROOT}/checkpoints/${RUN_GROUP}/
+${OUT_ROOT}/logs/train/${RUN_GROUP}/
 ```
 
-To evaluate the first four trained methods on MME, MMStar, and POPE:
+The first4 configs are:
+
+| Stage | Method | Config | Per-GPU batch | Global batch on 4 GPUs |
+|---:|---|---|---:|---:|
+| 1 | SFT | `configs/visionzip_aokvqa/aokvqa_sft_gbs8.yaml` | 2 | 8 |
+| 2 | EPIC TCD | `configs/visionzip_aokvqa/aokvqa_epic_tcd_gbs8.yaml` | 2 | 8 |
+| 3 | EMA OPSD no GT | `configs/visionzip_aokvqa/aokvqa_opsd_nogt_ema_gbs8.yaml` | 2 | 8 |
+| 4 | Freeze SFT Teacher OPSD no GT | `configs/visionzip_aokvqa/aokvqa_opsd_sft_teacher_freeze_nogt_gbs8.yaml` | 2 | 8 |
+
+To use fewer GPUs, change `CUDA_VISIBLE_DEVICES`, `NPROC_PER_NODE`, and make sure each config's `training.max_steps` is divisible by:
+
+```text
+NPROC_PER_NODE * training.micro_batch_size
+```
+
+To use bigger GPUs more aggressively, edit `training.micro_batch_size` in the YAML config. The training CLI currently exposes `gradient_accumulation_steps` as an override, but not `micro_batch_size`.
+
+## Run Additional Training Queues
+
+The repo also contains launchers for older ordered runs and the six requested variants:
 
 ```bash
-cd /root/autodl-tmp/opsd_eval/opsd
-RUN_ID=aokvqa_first4_officialvz_20260610_154040 \
+cd "${OPSD_ROOT}"
+
+BASE_ROOT="${BASE_ROOT}" OUT_ROOT="${OUT_ROOT}" NPROC_PER_NODE=4 \
+bash scripts/run_aokvqa_ordered_train_autodl.sh
+
+BASE_ROOT="${BASE_ROOT}" OUT_ROOT="${OUT_ROOT}" NPROC_PER_NODE=4 \
+bash scripts/run_aokvqa_requested_6train_autodl.sh
+```
+
+Before running configs that use an SFT teacher, check `opsd.teacher_adapter_path` in the corresponding YAML. If it points to an old checkpoint root, update it to your cluster's SFT checkpoint path.
+
+## Run Evaluation
+
+First make sure the VLMEvalKit patch has been applied. Then evaluate the trained first4 run:
+
+```bash
+cd "${OPSD_ROOT}"
+
+RUN_ID=<your RUN_GROUP from training> \
+BASE_ROOT="${BASE_ROOT}" \
+OPSD_ROOT="${OPSD_ROOT}" \
+VLMEVALKIT_ROOT="${VLMEVALKIT_ROOT}" \
+OUT_ROOT="${OUT_ROOT}" \
+VISIONZIP_QWEN25VL_ROOT="${VISIONZIP_QWEN25VL_ROOT}" \
 DATASETS="MME MMStar POPE" \
 RATIOS="r030 r020 r010 r005" \
 NPROC_PER_NODE=12 \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
 bash scripts/eval_first4_officialvz_vlmevalkit_autodl.sh
 ```
 
-The no-prune Qwen2.5-VL baseline and official VisionZip aliases are provided by the VLMEvalKit patch. Keep `flash_attention_2` enabled for aligned comparisons.
+`NPROC_PER_NODE=12` means 12 VLMEvalKit workers total. With 4 GPUs, that is 3 workers per GPU. If evaluation is unstable or memory is tight, use:
 
-## Current Aligned Results
+```bash
+NPROC_PER_NODE=4
+```
 
-Baseline scores used as 100%:
+The eval launcher exports these variables for patched VLMEvalKit aliases:
+
+```bash
+OPSD_BASE_ROOT=${BASE_ROOT}
+OPSD_FIRST4_RUN_ID=${RUN_ID}
+OPSD_FIRST4_CKPT_ROOT=${OUT_ROOT}/checkpoints/${RUN_ID}
+VISIONZIP_QWEN25VL_ROOT=${BASE_ROOT}/VisionZip/Qwen2_5_VL
+```
+
+Evaluation outputs go to:
+
+```text
+${OUT_ROOT}/eval_vlmevalkit/
+${OUT_ROOT}/logs/full/
+${OUT_ROOT}/reports/
+```
+
+## Useful Model Aliases
+
+The VLMEvalKit patch adds aliases for aligned runs:
+
+| Alias pattern | Meaning |
+|---|---|
+| `opsd_qwen25vl_official_7b_flashattn2_mnt32` | Qwen2.5-VL no-prune baseline |
+| `opsd_qwen25vl_visionzip_flashattn2_r030` | Official VisionZip baseline at 30% |
+| `opsd_qwen25vl_visionzip_flashattn2_r020` | Official VisionZip baseline at 20% |
+| `opsd_qwen25vl_visionzip_flashattn2_r010` | Official VisionZip baseline at 10% |
+| `opsd_qwen25vl_visionzip_flashattn2_r005` | Official VisionZip baseline at 5% |
+| `opsd_first4_officialvz_sft_r030` | SFT adapter, official VisionZip, 30% |
+| `opsd_first4_officialvz_epic_r030` | EPIC adapter, official VisionZip, 30% |
+| `opsd_first4_officialvz_ema_nogt_r030` | EMA OPSD no GT adapter, official VisionZip, 30% |
+| `opsd_first4_officialvz_freeze_sftteacher_nogt_r030` | Freeze SFT Teacher OPSD no GT adapter, official VisionZip, 30% |
+
+For MMStar-specific aligned aliases, use the corresponding `_mmstar_` names added by the patch.
+
+## Reference Results
+
+The current aligned baseline scores used as 100% are:
 
 | Model | MME | POPE | MMStar |
 |---|---:|---:|---:|
@@ -146,20 +256,17 @@ Best average percentage by ratio across MME, POPE, and MMStar:
 | 10% | SFT | 97.49 |
 | 5% | Freeze SFT Teacher OPSD no GT | 91.74 |
 
-Average across evaluated ratios:
+Full summary:
 
-| Method | Avg % |
-|---|---:|
-| VisionZip official | 91.14 |
-| SFT | 96.97 |
-| EPIC | 96.95 |
-| EMA OPSD no GT | 95.74 |
-| Freeze SFT Teacher OPSD no GT | 97.31 |
+```text
+reports/first4_officialvz_mme_pope_mmstar_relative_summary_latest.md
+```
 
-See `reports/first4_officialvz_mme_pope_mmstar_relative_summary_latest.md` for the full combined table.
+## Troubleshooting
 
-## Notes
-
-- Do not commit checkpoints, raw datasets, model weights, or full VLMEvalKit work directories.
-- Keep training and evaluation on the same official VisionZip runtime for comparable numbers.
-- The old local `visionzip_aokvqa/visionzip.py` fallback has been removed so experiments fail fast if the official VisionZip checkout is missing.
+- If training cannot import VisionZip, check `VISIONZIP_QWEN25VL_ROOT`.
+- If VLMEvalKit cannot find model aliases, re-apply `patches/vlmevalkit_official_visionzip_eval.patch`.
+- If `flash_attention_2` fails, verify CUDA, PyTorch, and `flash-attn` versions. Falling back to SDPA changes the comparison setup.
+- If evaluation OOMs, lower `NPROC_PER_NODE`.
+- If training OOMs, lower `training.micro_batch_size` in the YAML.
+- If a teacher checkpoint is missing, verify `RUN_GROUP`, `RUN_ID`, and any `opsd.teacher_adapter_path` values.

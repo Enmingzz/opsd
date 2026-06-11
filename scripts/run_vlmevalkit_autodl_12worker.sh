@@ -8,6 +8,7 @@ BASE_ROOT="${BASE_ROOT:-/root/autodl-tmp/opsd_eval}"
 VLMEVALKIT_ROOT="${VLMEVALKIT_ROOT:-${BASE_ROOT}/VLMEvalKit}"
 OPSD_ROOT="${OPSD_ROOT:-${BASE_ROOT}/opsd}"
 OUT_ROOT="${OUT_ROOT:-${BASE_ROOT}/outputs/visionzip_aokvqa_reasoning}"
+CONDA_BIN="${CONDA_BIN:-/root/miniconda3/bin}"
 
 MODELS="${MODELS:-opsd_qwen25vl_official_7b_flashattn2_mnt32}"
 DATASETS="${DATASETS:-POPE}"
@@ -22,18 +23,21 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 JUDGE="${JUDGE:-exact_matching}"
 REUSE_FLAG="${REUSE_FLAG:---reuse}"
 
-export PATH=/root/miniconda3/bin:${PATH}
-export HF_HOME="${HF_HOME:-/root/autodl-tmp/hf_cache}"
+if [[ -d "${CONDA_BIN}" ]]; then
+  export PATH="${CONDA_BIN}:${PATH}"
+fi
+export HF_HOME="${HF_HOME:-${BASE_ROOT}/hf_cache}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}}"
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
 export HF_HUB_DISABLE_PROGRESS_BARS="${HF_HUB_DISABLE_PROGRESS_BARS:-1}"
-export LMUData="${LMUData:-/root/autodl-tmp/vlmeval_data}"
+export LMUData="${LMUData:-${BASE_ROOT}/vlmeval_data}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-1}"
-export PYTHONPATH="${VLMEVALKIT_ROOT}:${OPSD_ROOT}:${PYTHONPATH:-}"
+export PYTHONPATH="${VLMEVALKIT_ROOT}:${BASE_ROOT}:${PYTHONPATH:-}"
 export VISIONZIP_QWEN25VL_ROOT="${VISIONZIP_QWEN25VL_ROOT:-${BASE_ROOT}/VisionZip/Qwen2_5_VL}"
+export OPSD_BASE_ROOT="${OPSD_BASE_ROOT:-${BASE_ROOT}}"
 export CUDA_VISIBLE_DEVICES
 unset MMEVAL_ROOT || true
 
