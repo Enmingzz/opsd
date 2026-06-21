@@ -1,272 +1,387 @@
-# OPSD VisionZip Experiment Runbook
+# OPSD VisionZip A-OKVQA Runbook
 
-This repository contains the OPSD A-OKVQA training and VLMEvalKit evaluation workflow for Qwen2.5-VL-7B with the official VisionZip Qwen2.5-VL pruning implementation.
+This repository contains the A-OKVQA training and VLMEvalKit evaluation code used for the Qwen2.5-VL + VisionZip OPSD experiments.
 
-The intended use is to clone this repo on any GPU cluster, clone the two external upstream repos, apply the patches in `patches/`, and run the experiment launchers with cluster-specific paths and GPU settings.
+The current public checkpoint bundle contains three PEFT LoRA adapters:
 
-## What This Runs
+| Method | Hugging Face subfolder |
+|---|---|
+| SFT | `sft/` |
+| EPIC | `epic/` |
+| OPSD-512 | `opsd512/` |
 
-- Base model: `Qwen/Qwen2.5-VL-7B-Instruct`
-- Training data: `HuggingFaceM4/A-OKVQA`
-- Pruning backend: official VisionZip Qwen2.5-VL implementation
-- Training methods: SFT, EPIC TCD, EMA OPSD no GT, Freeze SFT Teacher OPSD no GT
-- Evaluation: VLMEvalKit on MME, POPE, and MMStar
-- Attention backend: `flash_attention_2`
-- Adapter type: LoRA
-- Training ratios: 10%, 20%, 30%, and 40%, sampled uniformly in the main configs
-- Evaluation ratios: 5%, 10%, 20%, and 30%
-
-Large artifacts are intentionally ignored by git: model weights, datasets, checkpoints, logs, raw VLMEvalKit outputs, and caches.
-
-## GPU Requirements
-
-The default scripts assume one multi-GPU node.
-
-| Task | Minimum that should work | Recommended for current configs | Notes |
-|---|---:|---:|---|
-| First4 training, `gbs8` configs | 4 GPUs with 48GB each | 4 GPUs with 80GB or 96GB each | Current first4 configs use per-GPU micro batch 2, global batch 8. |
-| Larger `mb8` configs | 4 GPUs with 80GB each | 4 GPUs with 96GB each | Per-GPU micro batch 8, global batch 32. Reduce `micro_batch_size` if OOM. |
-| Larger `mb16` configs | 4 GPUs with 96GB each | 4 GPUs with 96GB each | Per-GPU micro batch 16, global batch 64. These are memory aggressive. |
-| VLMEvalKit eval, fast mode | 4 GPUs with 48GB each | 4 GPUs with 80GB or 96GB each | Default is 12 workers across 4 GPUs, so 3 eval workers per GPU. |
-| VLMEvalKit eval, safer mode | 1 to 4 GPUs with 24GB+ each | 4 GPUs with 48GB+ each | Set `NPROC_PER_NODE` equal to GPU count for one worker per GPU. |
-
-Other practical requirements:
-
-- CUDA-compatible PyTorch with `flash-attn`
-- 150GB+ disk for model/cache/checkpoints, more if keeping raw eval outputs
-- 64GB+ system RAM
-- Stable network access to Hugging Face, or a local mirror/cache
-
-Effective optimizer batch size is:
+Checkpoint repo:
 
 ```text
-world_size * micro_batch_size * gradient_accumulation_steps
+enmingzhangzz/opsd-aokvqa-qwen25vl-lora-cleanenv-20260621
 ```
 
-For the main first4 run, this is `4 * 2 * 1 = 8`.
+Base model:
 
-## Cluster Layout
-
-Pick a shared experiment root on your cluster:
-
-```bash
-export BASE_ROOT=/path/to/opsd_exp
-export OPSD_ROOT=${BASE_ROOT}/opsd
-export VISIONZIP_ROOT=${BASE_ROOT}/VisionZip
-export VLMEVALKIT_ROOT=${BASE_ROOT}/VLMEvalKit
-export OUT_ROOT=${BASE_ROOT}/outputs/visionzip_aokvqa_reasoning
+```text
+Qwen/Qwen2.5-VL-7B-Instruct
 ```
 
-Clone the repos:
+The adapters are LoRA weights only. They do not include the base Qwen2.5-VL model.
 
-```bash
-mkdir -p "${BASE_ROOT}"
-git clone https://github.com/Enmingzz/opsd.git "${OPSD_ROOT}"
-git clone https://github.com/JIA-Lab-research/VisionZip.git "${VISIONZIP_ROOT}"
-git clone https://github.com/open-compass/VLMEvalKit.git "${VLMEVALKIT_ROOT}"
-```
+## Current Experiment Settings
 
-The currently aligned upstream commits are:
+Training:
 
-| Project | Commit |
+| Item | Value |
 |---|---|
-| VisionZip | `8f86b55c6f000eb033e6912538af2dd7dcb30502` |
-| VLMEvalKit | `58fdeb6b980bda22096d912d70d1c858dedc84fd` |
+| Base model | `Qwen/Qwen2.5-VL-7B-Instruct` |
+| Dataset | `HuggingFaceM4/A-OKVQA` |
+| Adapter | LoRA |
+| Main GPU setup | `4 * L40S` |
+| Effective batch size | `32` |
+| OPSD EMA decay | `0.9999` |
+| OPSD ground truth use | No GT in OPSD loss |
+| OPSD-512 rollout cap | `512` generated tokens |
+| Reasoning target format | `<think>...</think><answer>...</answer>` |
 
-Apply the official-runtime patches:
+Evaluation:
+
+| Item | Value |
+|---|---|
+| Eval codebase | Armen VLMEvalKit commit `51682a6b` plus local patch |
+| Benchmarks | MME, POPE, MMStar |
+| Image pixels | `min_pixels = 1280 * 28 * 28`, `max_pixels = 4096 * 28 * 28` |
+| Decoding | Greedy, `temperature = 0.0` |
+| Max new tokens | VLMEvalKit/Qwen default `2048` |
+| Attention | `flash_attention_2` |
+| KV cache | Enabled in the current clean eval launcher |
+
+VisionZip ratio mapping:
+
+| Retention tag | Intended retained visual tokens | Launcher `visionzip_ratio` |
+|---|---:|---:|
+| `r005` | 5% | `1.00` |
+| `r010` | 10% | `0.95` |
+| `r020` | 20% | `0.85` |
+| `r030` | 30% | `0.75` |
+
+Do not pass `0.05`, `0.10`, `0.20`, or `0.30` directly to the current launcher. In this code path, `visionzip_ratio` is the pruning-side argument used by the patched Qwen2.5-VL VisionZip implementation, and the mapping above is the corrected mapping used for the reported results.
+
+## Download The Adapters
+
+Log in to Hugging Face if the repo is private:
 
 ```bash
-cd "${VISIONZIP_ROOT}"
-git checkout 8f86b55c6f000eb033e6912538af2dd7dcb30502
-git apply "${OPSD_ROOT}/patches/visionzip_qwen25vl_official_runtime.patch"
-
-cd "${VLMEVALKIT_ROOT}"
-git checkout 58fdeb6b980bda22096d912d70d1c858dedc84fd
-git apply "${OPSD_ROOT}/patches/vlmevalkit_official_visionzip_eval.patch"
+hf auth login
 ```
 
-## Environment
-
-Activate your cluster Python environment first. It should contain PyTorch, Transformers with Qwen2.5-VL support, `qwen-vl-utils`, `peft`, `accelerate`, `datasets`, `Pillow`, `PyYAML`, `flash-attn`, and VLMEvalKit dependencies.
-
-Set the runtime variables:
+Download all adapters:
 
 ```bash
-export BASE_ROOT=/path/to/opsd_exp
-export OPSD_ROOT=${BASE_ROOT}/opsd
-export VLMEVALKIT_ROOT=${BASE_ROOT}/VLMEvalKit
-export VISIONZIP_QWEN25VL_ROOT=${BASE_ROOT}/VisionZip/Qwen2_5_VL
-export OUT_ROOT=${BASE_ROOT}/outputs/visionzip_aokvqa_reasoning
-export PYTHONPATH=${BASE_ROOT}:${VLMEVALKIT_ROOT}:${PYTHONPATH:-}
-export HF_HOME=${BASE_ROOT}/hf_cache
-export TRANSFORMERS_CACHE=${HF_HOME}
-export HF_HUB_DISABLE_XET=1
-export TOKENIZERS_PARALLELISM=false
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+hf download enmingzhangzz/opsd-aokvqa-qwen25vl-lora-cleanenv-20260621 \
+  --local-dir ./opsd_aokvqa_loras
+```
+
+The downloaded layout should be:
+
+```text
+opsd_aokvqa_loras/
+  sft/
+    adapter_config.json
+    adapter_model.safetensors
+  epic/
+    adapter_config.json
+    adapter_model.safetensors
+  opsd512/
+    adapter_config.json
+    adapter_model.safetensors
+    ema_shadow.pt
+```
+
+For inference/evaluation, only `adapter_config.json` and `adapter_model.safetensors` are required. `ema_shadow.pt` is kept for training-state provenance.
+
+## Load An Adapter With PEFT
+
+```python
+from peft import PeftModel
+from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+
+base_model = "Qwen/Qwen2.5-VL-7B-Instruct"
+adapter_repo = "enmingzhangzz/opsd-aokvqa-qwen25vl-lora-cleanenv-20260621"
+
+model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    base_model,
+    torch_dtype="auto",
+    device_map="auto",
+    attn_implementation="flash_attention_2",
+)
+
+# Choose one: subfolder="sft", "epic", or "opsd512"
+model = PeftModel.from_pretrained(model, adapter_repo, subfolder="opsd512")
+model.eval()
+
+processor = AutoProcessor.from_pretrained(base_model)
+```
+
+For local adapters:
+
+```python
+model = PeftModel.from_pretrained(model, "./opsd_aokvqa_loras/opsd512")
+```
+
+## Set Up The Clean VLMEvalKit
+
+The reported clean results used Armen's VLMEvalKit at commit `51682a6b` with a small local patch for:
+
+- PEFT adapter loading through `adapter_path`
+- VisionZip enable/ratio arguments
+- `max_pixels = 4096 * 28 * 28`
+- strict failure mode during distributed eval
+- cached pruned-input debugging state
+
+Clone the eval kit:
+
+```bash
+mkdir -p third_party
+git clone https://github.com/armenjeddi/VLMEvalKit.git third_party/VLMEvalKit_armen51682
+cd third_party/VLMEvalKit_armen51682
+git checkout 51682a6baab948d3dbb4b867a3eab178504ac3f5
+git apply ../../patches/vlmevalkit_armen51682_cleanenv_qwen25vl_lora_visionzip.patch
+```
+
+The patch file is:
+
+```text
+patches/vlmevalkit_armen51682_cleanenv_qwen25vl_lora_visionzip.patch
+```
+
+On the Vector cluster, the already-aligned working copy is:
+
+```text
+/project/6101803/enmingzz/ckpt_eval_trainenv/VLMEvalKit_armen51682
+```
+
+The current canonical local launcher is:
+
+```text
+/project/6101803/enmingzz/ckpt_eval_trainenv/eval_one.sh
+```
+
+The GitHub repo also contains older job wrappers under `scripts/` and `slurm_jobs/`. For exact cleanenv reproduction on the current cluster, prefer the `ckpt_eval_trainenv/eval_one.sh` launcher above or port its environment setup into your own cluster.
+
+## Run A Single Evaluation Locally
+
+Example: OPSD-512, reasoning mode, 20% retention, MME + POPE:
+
+```bash
+export CKPT_EVAL_ROOT=/project/6101803/enmingzz/ckpt_eval_trainenv
+export VLM_ROOT=${CKPT_EVAL_ROOT}/VLMEvalKit_armen51682
+export ADAPTER_TAG=opsd512
+export RATIO_TAG=r020
+export adapter_path=/path/to/opsd_aokvqa_loras/opsd512
+export visionzip_ratio=0.85
+export enable_thinking=True
+export enable_visionzip=True
+export temperature=0.0
+export EVAL_DATASETS="MME POPE"
+export EVAL_NPROC_PER_NODE=4
 export CUDA_VISIBLE_DEVICES=0,1,2,3
+
+bash /project/6101803/enmingzz/ckpt_eval_trainenv/eval_one.sh
 ```
 
-For clusters in China, also set:
+Direct mode is the same except:
 
 ```bash
-export HF_ENDPOINT=https://hf-mirror.com
+export enable_thinking=False
 ```
 
-## Run The Main Training Experiment
-
-The main run trains the four methods used in the current MME/POPE/MMStar comparison:
-
-1. SFT
-2. EPIC TCD
-3. EMA OPSD no GT
-4. Freeze SFT Teacher OPSD no GT
-
-Run:
+No-prune baseline:
 
 ```bash
-cd "${OPSD_ROOT}"
-
-RUN_GROUP=aokvqa_first4_officialvz_$(date +%Y%m%d_%H%M%S) \
-BASE_ROOT="${BASE_ROOT}" \
-OPSD_ROOT="${OPSD_ROOT}" \
-VLMEVALKIT_ROOT="${VLMEVALKIT_ROOT}" \
-OUT_ROOT="${OUT_ROOT}" \
-NPROC_PER_NODE=4 \
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-bash scripts/run_aokvqa_first4_officialvz_autodl.sh
+export ADAPTER_TAG=baseline
+export RATIO_TAG=noprune
+export adapter_path=none
+export enable_visionzip=False
+export visionzip_ratio=0.0
 ```
 
-The script name is historical; it is now path-configurable and can run on any cluster.
+VisionZip baseline without adapter:
 
-Outputs are written to:
+```bash
+export ADAPTER_TAG=baseline
+export RATIO_TAG=r020
+export adapter_path=none
+export enable_visionzip=True
+export visionzip_ratio=0.85
+```
+
+## Common Evaluation Commands
+
+Adapter paths after `hf download`:
+
+```bash
+SFT_ADAPTER=./opsd_aokvqa_loras/sft
+EPIC_ADAPTER=./opsd_aokvqa_loras/epic
+OPSD512_ADAPTER=./opsd_aokvqa_loras/opsd512
+```
+
+Ratio helper:
+
+```bash
+case "${RATIO_TAG}" in
+  r005) visionzip_ratio=1.00 ;;
+  r010) visionzip_ratio=0.95 ;;
+  r020) visionzip_ratio=0.85 ;;
+  r030) visionzip_ratio=0.75 ;;
+  *) echo "Unknown ratio ${RATIO_TAG}" >&2; exit 1 ;;
+esac
+export visionzip_ratio
+```
+
+Run SFT r030 reasoning on all three benchmarks:
+
+```bash
+export ADAPTER_TAG=sft
+export RATIO_TAG=r030
+export adapter_path="${SFT_ADAPTER}"
+export visionzip_ratio=0.75
+export enable_thinking=True
+export EVAL_DATASETS="MME MMStar POPE"
+bash /project/6101803/enmingzz/ckpt_eval_trainenv/eval_one.sh
+```
+
+Run EPIC r030:
+
+```bash
+export ADAPTER_TAG=epic
+export RATIO_TAG=r030
+export adapter_path="${EPIC_ADAPTER}"
+export visionzip_ratio=0.75
+export enable_thinking=True
+export EVAL_DATASETS="MME MMStar POPE"
+bash /project/6101803/enmingzz/ckpt_eval_trainenv/eval_one.sh
+```
+
+Run OPSD-512 r030:
+
+```bash
+export ADAPTER_TAG=opsd512
+export RATIO_TAG=r030
+export adapter_path="${OPSD512_ADAPTER}"
+export visionzip_ratio=0.75
+export enable_thinking=True
+export EVAL_DATASETS="MME MMStar POPE"
+bash /project/6101803/enmingzz/ckpt_eval_trainenv/eval_one.sh
+```
+
+## Output Locations
+
+Current cluster defaults:
 
 ```text
-${OUT_ROOT}/checkpoints/${RUN_GROUP}/
-${OUT_ROOT}/logs/train/${RUN_GROUP}/
+/scratch/enmingzz/outputs/visionzip_aokvqa_reasoning/eval_vlmevalkit_trainenv/
+/scratch/enmingzz/outputs/visionzip_aokvqa_reasoning/logs/full/
 ```
 
-The first4 configs are:
-
-| Stage | Method | Config | Per-GPU batch | Global batch on 4 GPUs |
-|---:|---|---|---:|---:|
-| 1 | SFT | `configs/visionzip_aokvqa/aokvqa_sft_gbs8.yaml` | 2 | 8 |
-| 2 | EPIC TCD | `configs/visionzip_aokvqa/aokvqa_epic_tcd_gbs8.yaml` | 2 | 8 |
-| 3 | EMA OPSD no GT | `configs/visionzip_aokvqa/aokvqa_opsd_nogt_ema_gbs8.yaml` | 2 | 8 |
-| 4 | Freeze SFT Teacher OPSD no GT | `configs/visionzip_aokvqa/aokvqa_opsd_sft_teacher_freeze_nogt_gbs8.yaml` | 2 | 8 |
-
-To use fewer GPUs, change `CUDA_VISIBLE_DEVICES`, `NPROC_PER_NODE`, and make sure each config's `training.max_steps` is divisible by:
+Each eval run creates a directory like:
 
 ```text
-NPROC_PER_NODE * training.micro_batch_size
+${OUT_ROOT}/eval_vlmevalkit_trainenv/${RUN_GROUP}/${ADAPTER_TAG}_${RATIO_TAG}/Qwen/TYYYYMMDD_G51682a6b/
 ```
 
-To use bigger GPUs more aggressively, edit `training.micro_batch_size` in the YAML config. The training CLI currently exposes `gradient_accumulation_steps` as an override, but not `micro_batch_size`.
-
-## Run Additional Training Queues
-
-The repo also contains launchers for older ordered runs and the six requested variants:
-
-```bash
-cd "${OPSD_ROOT}"
-
-BASE_ROOT="${BASE_ROOT}" OUT_ROOT="${OUT_ROOT}" NPROC_PER_NODE=4 \
-bash scripts/run_aokvqa_ordered_train_autodl.sh
-
-BASE_ROOT="${BASE_ROOT}" OUT_ROOT="${OUT_ROOT}" NPROC_PER_NODE=4 \
-bash scripts/run_aokvqa_requested_6train_autodl.sh
-```
-
-Before running configs that use an SFT teacher, check `opsd.teacher_adapter_path` in the corresponding YAML. If it points to an old checkpoint root, update it to your cluster's SFT checkpoint path.
-
-## Run Evaluation
-
-First make sure the VLMEvalKit patch has been applied. Then evaluate the trained first4 run:
-
-```bash
-cd "${OPSD_ROOT}"
-
-RUN_ID=<your RUN_GROUP from training> \
-BASE_ROOT="${BASE_ROOT}" \
-OPSD_ROOT="${OPSD_ROOT}" \
-VLMEVALKIT_ROOT="${VLMEVALKIT_ROOT}" \
-OUT_ROOT="${OUT_ROOT}" \
-VISIONZIP_QWEN25VL_ROOT="${VISIONZIP_QWEN25VL_ROOT}" \
-DATASETS="MME MMStar POPE" \
-RATIOS="r030 r020 r010 r005" \
-NPROC_PER_NODE=12 \
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-bash scripts/eval_first4_officialvz_vlmevalkit_autodl.sh
-```
-
-`NPROC_PER_NODE=12` means 12 VLMEvalKit workers total. With 4 GPUs, that is 3 workers per GPU. If evaluation is unstable or memory is tight, use:
-
-```bash
-NPROC_PER_NODE=4
-```
-
-The eval launcher exports these variables for patched VLMEvalKit aliases:
-
-```bash
-OPSD_BASE_ROOT=${BASE_ROOT}
-OPSD_FIRST4_RUN_ID=${RUN_ID}
-OPSD_FIRST4_CKPT_ROOT=${OUT_ROOT}/checkpoints/${RUN_ID}
-VISIONZIP_QWEN25VL_ROOT=${BASE_ROOT}/VisionZip/Qwen2_5_VL
-```
-
-Evaluation outputs go to:
+Important score files:
 
 ```text
-${OUT_ROOT}/eval_vlmevalkit/
-${OUT_ROOT}/logs/full/
-${OUT_ROOT}/reports/
+Qwen_MME_score.csv
+Qwen_MMStar_acc.csv
+Qwen_POPE_score.csv
 ```
 
-## Useful Model Aliases
+For MME, the total score is:
 
-The VLMEvalKit patch adds aliases for aligned runs:
+```text
+perception + reasoning
+```
 
-| Alias pattern | Meaning |
+For POPE, VLMEvalKit's `Overall` column is F1, not accuracy. The same CSV also reports `acc`, `precision`, and `recall`.
+
+## Current Reference Scores
+
+Reasoning mode, `r030`, cleanenv:
+
+| Method | MME | POPE F1 | POPE Acc | Precision | Recall |
+|---|---:|---:|---:|---:|---:|
+| Baseline | 2189.280 | 80.592 | 83.400 | 96.998 | 68.933 |
+| SFT | 2247.017 | 82.406 | 80.144 | 73.979 | 93.000 |
+| EPIC | 2120.064 | 79.308 | 76.533 | 72.133 | 88.067 |
+| OPSD-512 | 2250.260 | 82.187 | 84.433 | 96.326 | 71.667 |
+
+Direct mode, `r005/r010/r020`, cleanenv:
+
+| Retention | Method | MME | MMStar | POPE |
+|---|---|---:|---:|---:|
+| 5% | Baseline | 1830.391 | 43.800 | 74.058 |
+| 5% | SFT | 2055.261 | 49.333 | 81.040 |
+| 5% | EPIC | 2092.244 | 50.533 | 81.554 |
+| 5% | OPSD-512 | 2090.979 | 48.733 | 78.941 |
+| 10% | Baseline | 2097.136 | 51.400 | 81.020 |
+| 10% | SFT | 2233.061 | 55.933 | 85.429 |
+| 10% | EPIC | 2235.535 | 57.533 | 85.493 |
+| 10% | OPSD-512 | 2216.427 | 55.933 | 84.015 |
+| 20% | Baseline | 2242.759 | 56.333 | 84.145 |
+| 20% | SFT | 2303.393 | 58.733 | 86.943 |
+| 20% | EPIC | 2299.381 | 59.067 | 86.911 |
+| 20% | OPSD-512 | 2285.487 | 57.733 | 85.084 |
+
+## Train The Main Methods
+
+The main 4-L40S submitter is:
+
+```bash
+scripts/submit_aokvqa_reasoning_ebs32_4l40s.sh
+```
+
+Dry run:
+
+```bash
+DRY_RUN=1 bash scripts/submit_aokvqa_reasoning_ebs32_4l40s.sh
+```
+
+Submit with defaults:
+
+```bash
+bash scripts/submit_aokvqa_reasoning_ebs32_4l40s.sh
+```
+
+Useful overrides:
+
+```bash
+ACCOUNT=aip-btaati \
+PARTITION=gpubase_l40s_b3 \
+TIME_LIMIT=16:00:00 \
+CPUS_PER_TASK=32 \
+bash scripts/submit_aokvqa_reasoning_ebs32_4l40s.sh
+```
+
+Stages submitted by this launcher:
+
+| Stage | Config |
 |---|---|
-| `opsd_qwen25vl_official_7b_flashattn2_mnt32` | Qwen2.5-VL no-prune baseline |
-| `opsd_qwen25vl_visionzip_flashattn2_r030` | Official VisionZip baseline at 30% |
-| `opsd_qwen25vl_visionzip_flashattn2_r020` | Official VisionZip baseline at 20% |
-| `opsd_qwen25vl_visionzip_flashattn2_r010` | Official VisionZip baseline at 10% |
-| `opsd_qwen25vl_visionzip_flashattn2_r005` | Official VisionZip baseline at 5% |
-| `opsd_first4_officialvz_sft_r030` | SFT adapter, official VisionZip, 30% |
-| `opsd_first4_officialvz_epic_r030` | EPIC adapter, official VisionZip, 30% |
-| `opsd_first4_officialvz_ema_nogt_r030` | EMA OPSD no GT adapter, official VisionZip, 30% |
-| `opsd_first4_officialvz_freeze_sftteacher_nogt_r030` | Freeze SFT Teacher OPSD no GT adapter, official VisionZip, 30% |
+| SFT | `configs/visionzip_aokvqa/aokvqa_sft_reasoning_ebs32_4l40s.yaml` |
+| Pure OPSD no GT | `configs/visionzip_aokvqa/aokvqa_opsd_nogt_ema_reasoning_ebs32_4l40s.yaml` |
+| Freeze SFT-teacher OPSD no GT | `configs/visionzip_aokvqa/aokvqa_opsd_nogt_freeze_sft_teacher_reasoning_ebs32_4l40s.yaml` |
+| SFT EMA-teacher OPSD no GT | `configs/visionzip_aokvqa/aokvqa_opsd_nogt_sft_ema_teacher_reasoning_ebs32_4l40s.yaml` |
+| EPIC | `configs/visionzip_aokvqa/aokvqa_epic_tcd_reasoning_ebs32_4l40s.yaml` |
 
-For MMStar-specific aligned aliases, use the corresponding `_mmstar_` names added by the patch.
-
-## Reference Results
-
-The current aligned baseline scores used as 100% are:
-
-| Model | MME | POPE | MMStar |
-|---|---:|---:|---:|
-| Qwen2.5-VL no-prune | 2300.55 | 86.29 | 61.47 |
-
-Best average percentage by ratio across MME, POPE, and MMStar:
-
-| Ratio | Best method | Avg % |
-|---:|---|---:|
-| 30% | Freeze SFT Teacher OPSD no GT | 100.60 |
-| 20% | EPIC | 99.48 |
-| 10% | SFT | 97.49 |
-| 5% | Freeze SFT Teacher OPSD no GT | 91.74 |
-
-Full summary:
+Outputs:
 
 ```text
-reports/first4_officialvz_mme_pope_mmstar_relative_summary_latest.md
+/scratch/enmingzz/outputs/visionzip_aokvqa_reasoning/checkpoints/${RUN_GROUP}/
+/scratch/enmingzz/outputs/visionzip_aokvqa_reasoning/logs/train/${RUN_GROUP}/
 ```
 
-## Troubleshooting
+## Notes And Common Pitfalls
 
-- If training cannot import VisionZip, check `VISIONZIP_QWEN25VL_ROOT`.
-- If VLMEvalKit cannot find model aliases, re-apply `patches/vlmevalkit_official_visionzip_eval.patch`.
-- If `flash_attention_2` fails, verify CUDA, PyTorch, and `flash-attn` versions. Falling back to SDPA changes the comparison setup.
-- If evaluation OOMs, lower `NPROC_PER_NODE`.
-- If training OOMs, lower `training.micro_batch_size` in the YAML.
-- If a teacher checkpoint is missing, verify `RUN_GROUP`, `RUN_ID`, and any `opsd.teacher_adapter_path` values.
+- The HF adapters are LoRA checkpoints. Always load them on top of `Qwen/Qwen2.5-VL-7B-Instruct`.
+- `opsd512/ema_shadow.pt` is not needed for inference.
+- For POPE, `Overall` is F1. Use the `acc` column if you want accuracy.
+- The corrected VisionZip mapping is `r005 -> 1.00`, `r010 -> 0.95`, `r020 -> 0.85`, `r030 -> 0.75`.
+- The cleanenv eval uses `max_pixels = 4096 * 28 * 28`. Older local scripts may still mention `16384 * 28 * 28`; do not mix those results.
+- The current exact cleanenv launcher lives outside the repo at `/project/6101803/enmingzz/ckpt_eval_trainenv/eval_one.sh`. The reproducibility-critical code changes are captured in `patches/vlmevalkit_armen51682_cleanenv_qwen25vl_lora_visionzip.patch`.

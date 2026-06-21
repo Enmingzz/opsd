@@ -1,0 +1,117 @@
+diff --git a/run.py b/run.py
+index 12cffd04..42709527 100644
+--- a/run.py
++++ b/run.py
+@@ -510,6 +510,8 @@ def main():
+             except Exception as e:
+                 logger.exception(f'Model {model_name} x Dataset {dataset_name} combination failed: {e}, '
+                                  'skipping this combination.')
++                if os.environ.get('VLMEVAL_STRICT_ERRORS', '0').lower() in ('1', 'true', 'yes', 'y'):
++                    raise
+                 continue
+ 
+     if WORLD_SIZE > 1:
+diff --git a/transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py b/transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py
+index a856471d..46d5b111 100644
+--- a/transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py
++++ b/transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py
+@@ -1598,6 +1598,12 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
+             attention_mask = attention_mask[:, img_mask]
+             inputs_embeds[:,contexual_input_idx] =  contextual_tokens
+             inputs_embeds = inputs_embeds[:, img_mask]
++            self._last_visionzip_pruned_inputs = {
++                "input_ids": input_ids[:, img_mask].detach() if input_ids is not None else None,
++                "inputs_embeds": inputs_embeds.detach(),
++                "attention_mask": attention_mask.detach() if attention_mask is not None else None,
++                "position_ids": position_ids.detach() if position_ids is not None else None,
++            }
+             del contextual_tokens, hidden_states_filtered, hidden_to_merge,aggregated_hidden
+ 
+         
+@@ -2157,4 +2163,4 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
+         return input_ids, model_kwargs
+ 
+ 
+-__all__ = ["Qwen2_5_VLForConditionalGeneration", "Qwen2_5_VLModel", "Qwen2_5_VLPreTrainedModel", "Qwen2_5_VLTextModel"]
+\ No newline at end of file
++__all__ = ["Qwen2_5_VLForConditionalGeneration", "Qwen2_5_VLModel", "Qwen2_5_VLPreTrainedModel", "Qwen2_5_VLTextModel"]
+diff --git a/vlmeval/config.py b/vlmeval/config.py
+index c38d1c33..db8f34fa 100644
+--- a/vlmeval/config.py
++++ b/vlmeval/config.py
+@@ -1519,13 +1519,18 @@ qwen2vl_series = {
+     "Qwen": partial(
+         Qwen2VLChat,
+         model_path=os.environ.get("model_path", "Qwen/Qwen2.5-VL-7B-Instruct"),
++        adapter_path=os.environ.get("adapter_path", ""),
+         min_pixels=1280 * 28 * 28,
+-        max_pixels=16384 * 28 * 28,
++        max_pixels=4096 * 28 * 28,
+         use_custom_prompt=False,
+         enable_thinking=get_bool_env("enable_thinking", True),
+ 
+         num_return_sequences=int(os.environ.get("num_return_sequences", 1)),
+         temperature=float(os.environ.get("temperature", 0.7)),
++        use_kv_cache=get_bool_env("use_kv_cache", True),
++
++        enable_visionzip=get_bool_env("enable_visionzip", False),
++        visionzip_ratio=float(os.environ.get("visionzip_ratio", 0.0)),
+ 
+         enable_kdvz=get_bool_env("enable_kdvz", False),
+         kdvz_ratio=float(os.environ.get("kdvz_ratio", 0.0)),
+@@ -1548,6 +1553,10 @@ qwen2vl_series = {
+         enable_thinking=get_bool_env("enable_thinking", True),
+ 
+         temperature=float(os.environ.get("temperature", 0.7)),
++        use_kv_cache=get_bool_env("use_kv_cache", True),
++
++        enable_visionzip=get_bool_env("enable_visionzip", False),
++        visionzip_ratio=float(os.environ.get("visionzip_ratio", 0.0)),
+ 
+         enable_kdvz=get_bool_env("enable_kdvz", False),
+         kdvz_ratio=float(os.environ.get("kdvz_ratio", 0.0)),
+diff --git a/vlmeval/vlm/qwen2_vl/model.py b/vlmeval/vlm/qwen2_vl/model.py
+index 75e76f07..77a6ae7c 100644
+--- a/vlmeval/vlm/qwen2_vl/model.py
++++ b/vlmeval/vlm/qwen2_vl/model.py
+@@ -192,6 +192,9 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
+         repetition_penalty=1.0,
+         use_kv_cache: bool = True,
+ 
++        enable_visionzip=False,
++        visionzip_ratio=0.0,
++
+         enable_kdvz=False,
+         kdvz_ratio=0.0,
+ 
+@@ -245,6 +248,9 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
+             use_cache=use_kv_cache,
+ 
+             enable_policy=enable_policy,
++
++            enable_visionzip=enable_visionzip,
++            visionzip_ratio=visionzip_ratio,
+             
+             enable_kdvz=enable_kdvz,
+             kdvz_ratio=kdvz_ratio,
+@@ -259,6 +265,7 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
+         self.system_prompt = system_prompt
+         self.verbose = verbose
+         self.post_process = post_process
++        self.adapter_path = kwargs.get('adapter_path', '') or ''
+         self.fps = kwargs.pop('fps', 2)
+         self.nframe = kwargs.pop('nframe', 128)
+         if self.fps is None and self.nframe is None:
+@@ -347,6 +354,12 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
+                     model_path, dtype='bfloat16', device_map="auto", attn_implementation='flash_attention_2'
+                 )
+                 self.model.eval()
++            if self.adapter_path:
++                from peft import PeftModel
++
++                print('Loading PEFT adapter:', self.adapter_path)
++                self.model = PeftModel.from_pretrained(self.model, self.adapter_path)
++                self.model.eval()
+ 
+         from pprint import pprint
+         print("Generate kwargs:")
