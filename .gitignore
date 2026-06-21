@@ -24,6 +24,7 @@ wandb/
 logs/
 cache/
 .cache/
+training_logs_cleanenv_current/
 
 # Model and dataset artifacts
 *.pt
@@ -41,6 +42,12 @@ slurm-*.out
 slurm-*.err
 *.out
 *.err
+
+# Local third-party checkouts
+third_party/
+
+# Local smoke/debug configs
+configs/visionzip_aokvqa/_tmp_*.yaml
 
 # OS files
 .DS_Store

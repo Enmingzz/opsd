@@ -17,6 +17,10 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
+DISALLOWED_QWEN25_BOOTSTRAP = Path("/scratch/enmingzz/temp/qwen25_bootstrap")
+sys.path = [
+    path for path in sys.path if not path or not path.startswith(str(DISALLOWED_QWEN25_BOOTSTRAP))
+]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -40,7 +44,11 @@ from opsd.pruning_distill.qwen25_pruned_forward import (
 )
 
 
-QWEN25_BOOTSTRAP = Path("/scratch/enmingzz/temp/qwen25_bootstrap")
+ARMEN_TRANSFORMERS_SRC = ROOT / "opsd" / "third_party" / "VLMEvalKit_armen51682" / "transformers" / "src"
+HF_HUB034_ROOT = Path(os.environ.get("HF_HUB034_ROOT", "/scratch/enmingzz/cache/uv/archive-v0/DGthIN4hMUv1qyt2"))
+TOKENIZERS_QWEN25_ROOT = Path(
+    os.environ.get("TOKENIZERS_QWEN25_ROOT", "/scratch/enmingzz/temp/pydeps_armen_clean_tokenizers_only")
+)
 
 
 @dataclass
@@ -241,15 +249,29 @@ def build_arg_parser(defaults: dict[str, Any] | None = None) -> argparse.Argumen
 
 
 def bootstrap_qwen25() -> None:
-    if find_spec("transformers.models.qwen2_5_vl") is None and QWEN25_BOOTSTRAP.exists():
-        for package_name in ["transformers", "huggingface_hub", "tokenizers", "safetensors", "qwen_vl_utils"]:
-            for name in list(sys.modules):
-                if name == package_name or name.startswith(f"{package_name}."):
-                    sys.modules.pop(name, None)
-        local_transformers = str(ROOT / "vlm" / "official_thinking_in_space" / "transformers" / "src")
-        sys.path = [path for path in sys.path if path != local_transformers]
-        if str(QWEN25_BOOTSTRAP) not in sys.path:
-            sys.path.insert(0, str(QWEN25_BOOTSTRAP))
+    if find_spec("transformers.models.qwen2_5_vl") is not None:
+        return
+    path_roots = [
+        str(ARMEN_TRANSFORMERS_SRC) if ARMEN_TRANSFORMERS_SRC.exists() else "",
+        str(HF_HUB034_ROOT) if HF_HUB034_ROOT.exists() else "",
+        str(TOKENIZERS_QWEN25_ROOT) if TOKENIZERS_QWEN25_ROOT.exists() else "",
+    ]
+    path_roots = [path for path in path_roots if path]
+    if not path_roots:
+        return
+    for package_name in ["transformers", "huggingface_hub", "tokenizers"]:
+        for name in list(sys.modules):
+            if name == package_name or name.startswith(f"{package_name}."):
+                sys.modules.pop(name, None)
+    local_transformers = str(ROOT / "vlm" / "official_thinking_in_space" / "transformers" / "src")
+    disallowed_bootstrap = str(DISALLOWED_QWEN25_BOOTSTRAP)
+    sys.path = [
+        path
+        for path in sys.path
+        if path != local_transformers and path not in path_roots and not path.startswith(disallowed_bootstrap)
+    ]
+    for path in reversed(path_roots):
+        sys.path.insert(0, path)
 
 
 def import_qwen25_modules():

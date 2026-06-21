@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import random
+import sys
 from pathlib import Path
 from typing import Any, Iterable
+
+_DISALLOWED_QWEN25_BOOTSTRAP = "/scratch/enmingzz/temp/qwen25_bootstrap"
+sys.path = [path for path in sys.path if not path or not path.startswith(_DISALLOWED_QWEN25_BOOTSTRAP)]
 
 from PIL import Image
 
@@ -95,7 +99,11 @@ def _extract_image(record: dict[str, Any]) -> Any:
     return image
 
 
-def normalize_aokvqa_sample(record: Any, index: int = 0) -> FormattedAOKVQASample:
+def normalize_aokvqa_sample(
+    record: Any,
+    index: int = 0,
+    prompt_mode: str | bool | None = None,
+) -> FormattedAOKVQASample:
     raw = _as_dict(record)
     question = _extract_question(raw)
     options = _extract_options(raw)
@@ -103,8 +111,8 @@ def normalize_aokvqa_sample(record: Any, index: int = 0) -> FormattedAOKVQASampl
     correct_letter = option_index_to_letter(correct_index)
     reasoning = _extract_reasoning(raw)
     sample_id = str(_first_present(raw, ("sample_id", "question_id", "id"), index))
-    prompt = build_reasoning_prompt(question, options)
-    target = build_target(reasoning, correct_letter)
+    prompt = build_reasoning_prompt(question, options, prompt_mode=prompt_mode)
+    target = build_target(reasoning, correct_letter, prompt_mode=prompt_mode)
     return FormattedAOKVQASample(
         sample_id=sample_id,
         image=_extract_image(raw),
@@ -124,6 +132,7 @@ def load_aokvqa_dataset(
     splits: list[str] | None = None,
     limit: int = 0,
     seed: int = 42,
+    prompt_mode: str | bool | None = None,
 ) -> list[FormattedAOKVQASample]:
     try:
         from datasets import load_dataset
@@ -135,7 +144,7 @@ def load_aokvqa_dataset(
     for split in splits:
         ds = load_dataset(dataset_name, split=split)
         for idx, record in enumerate(ds):
-            normalized.append(normalize_aokvqa_sample(record, index=len(normalized)))
+            normalized.append(normalize_aokvqa_sample(record, index=len(normalized), prompt_mode=prompt_mode))
     rng = random.Random(int(seed))
     rng.shuffle(normalized)
     if limit and limit > 0:

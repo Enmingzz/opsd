@@ -29,7 +29,7 @@ from opsd.visionzip_aokvqa.qwen_wrapper import (
     model_input_subset,
     primary_device,
 )
-from opsd.visionzip_aokvqa.train import get_nested, load_yaml, opsd_step
+from opsd.visionzip_aokvqa.train import get_nested, load_yaml, opsd_step, prompt_mode_from_config
 
 
 OUTPUT_ROOT = Path("outputs/visionzip_aokvqa_reasoning")
@@ -108,6 +108,7 @@ def selected_validation_samples(cfg: dict[str, Any], ids_path: Path) -> list[For
         splits=["validation"],
         limit=0,
         seed=int(get_nested(cfg, "training.seed", 42)),
+        prompt_mode=prompt_mode_from_config(cfg),
     )
     by_id = {sample.sample_id: sample for sample in all_samples}
     missing = [sample_id for sample_id in wanted if sample_id not in by_id]
@@ -123,6 +124,7 @@ def select_ids(args: argparse.Namespace) -> None:
         splits=["validation"],
         limit=int(args.num_samples),
         seed=int(args.seed),
+        prompt_mode=prompt_mode_from_config(cfg),
     )
     sample_ids = [sample.sample_id for sample in samples]
     if len(set(sample_ids)) != len(sample_ids):

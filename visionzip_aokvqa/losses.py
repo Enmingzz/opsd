@@ -4,49 +4,48 @@ import torch
 import torch.nn.functional as F
 
 
+def _flatten_token_logits(logits: torch.Tensor) -> torch.Tensor:
+    if logits.ndim == 2:
+        return logits
+    if logits.ndim == 3:
+        return logits.reshape(-1, logits.shape[-1])
+    raise ValueError("Logits must be [T, vocab] or [B, T, vocab].")
+
+
 def compute_forward_kl(
     teacher_logits: torch.Tensor,
     student_logits: torch.Tensor,
     temperature: float = 1.0,
+    chunk_size: int = 32,
 ) -> torch.Tensor:
-    if teacher_logits.ndim != 2 or student_logits.ndim != 2:
-        raise ValueError("KL logits must be [T, vocab].")
     if teacher_logits.shape != student_logits.shape:
         raise ValueError(f"Teacher/student logits must align by token index: {teacher_logits.shape} vs {student_logits.shape}")
+    teacher_logits = _flatten_token_logits(teacher_logits)
+    student_logits = _flatten_token_logits(student_logits)
+    if int(teacher_logits.shape[0]) <= 0:
+        raise ValueError("KL requires at least one token position.")
     temperature = float(temperature)
-    teacher_probs = F.softmax(teacher_logits.float() / temperature, dim=-1)
-    student_log_probs = F.log_softmax(student_logits.float() / temperature, dim=-1)
-    return F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (temperature**2)
+    chunk_size = max(1, int(chunk_size))
+    losses = []
+    counts = []
+    for start in range(0, int(teacher_logits.shape[0]), chunk_size):
+        end = min(start + chunk_size, int(teacher_logits.shape[0]))
+        teacher_probs = F.softmax(teacher_logits[start:end].float() / temperature, dim=-1)
+        student_log_probs = F.log_softmax(student_logits[start:end].float() / temperature, dim=-1)
+        losses.append(F.kl_div(student_log_probs, teacher_probs, reduction="sum") * (temperature**2))
+        counts.append(end - start)
+    return torch.stack(losses).sum() / float(sum(counts))
 
 
-def compute_generalized_jsd(
+def _generalized_jsd_chunk(
     teacher_logits: torch.Tensor,
     student_logits: torch.Tensor,
-    beta: float = 0.0,
-    temperature: float = 1.0,
-    top_k: int | None = None,
-    token_clip: float | None = None,
-    clip_mode: str = "token",
+    beta: float,
+    temperature: float,
+    top_k: int | None,
+    token_clip: float | None,
+    clip_mode: str,
 ) -> torch.Tensor:
-    """Official OPSD-style generalized JSD over generated token positions.
-
-    With beta=0 this is forward KL from teacher to student, matching the main
-    OPSD setting.  With beta=1 it becomes reverse KL.  Intermediate beta values
-    use the generalized Jensen-Shannon mixture from the official trainer.
-    """
-
-    if teacher_logits.shape != student_logits.shape:
-        raise ValueError(f"Teacher/student logits must align: {teacher_logits.shape} vs {student_logits.shape}")
-    if teacher_logits.ndim not in {2, 3}:
-        raise ValueError("Generalized JSD logits must be [T, vocab] or [B, T, vocab].")
-    if int(teacher_logits.shape[-2]) <= 0:
-        raise ValueError("Generalized JSD requires at least one token position.")
-
-    temperature = float(temperature)
-    beta = float(beta)
-    if beta < 0.0 or beta > 1.0:
-        raise ValueError(f"OPSD beta must be in [0, 1], got {beta}.")
-
     teacher_logits = teacher_logits.float() / temperature
     student_logits = student_logits.float() / temperature
 
@@ -89,6 +88,57 @@ def compute_generalized_jsd(
     elif normalized_clip_mode not in {"token", "token_sum"}:
         raise ValueError(f"Unsupported JSD clip_mode={clip_mode!r}. Use 'token' or 'official'.")
     return token_loss.mean()
+
+
+def compute_generalized_jsd(
+    teacher_logits: torch.Tensor,
+    student_logits: torch.Tensor,
+    beta: float = 0.0,
+    temperature: float = 1.0,
+    top_k: int | None = None,
+    token_clip: float | None = None,
+    clip_mode: str = "token",
+    chunk_size: int = 32,
+) -> torch.Tensor:
+    """Official OPSD-style generalized JSD over generated token positions.
+
+    With beta=0 this is forward KL from teacher to student, matching the main
+    OPSD setting.  With beta=1 it becomes reverse KL.  Intermediate beta values
+    use the generalized Jensen-Shannon mixture from the official trainer.
+    """
+
+    if teacher_logits.shape != student_logits.shape:
+        raise ValueError(f"Teacher/student logits must align: {teacher_logits.shape} vs {student_logits.shape}")
+    if teacher_logits.ndim not in {2, 3}:
+        raise ValueError("Generalized JSD logits must be [T, vocab] or [B, T, vocab].")
+    if int(teacher_logits.shape[-2]) <= 0:
+        raise ValueError("Generalized JSD requires at least one token position.")
+
+    temperature = float(temperature)
+    beta = float(beta)
+    if beta < 0.0 or beta > 1.0:
+        raise ValueError(f"OPSD beta must be in [0, 1], got {beta}.")
+
+    teacher_logits = _flatten_token_logits(teacher_logits)
+    student_logits = _flatten_token_logits(student_logits)
+    chunk_size = max(1, int(chunk_size))
+    losses = []
+    counts = []
+    for start in range(0, int(teacher_logits.shape[0]), chunk_size):
+        end = min(start + chunk_size, int(teacher_logits.shape[0]))
+        losses.append(
+            _generalized_jsd_chunk(
+                teacher_logits[start:end],
+                student_logits[start:end],
+                beta=beta,
+                temperature=temperature,
+                top_k=top_k,
+                token_clip=token_clip,
+                clip_mode=clip_mode,
+            )
+        )
+        counts.append(end - start)
+    return torch.stack([loss * count for loss, count in zip(losses, counts)]).sum() / float(sum(counts))
 
 
 def compute_token_ce(logits: torch.Tensor, target_ids: torch.Tensor) -> torch.Tensor:

@@ -3,8 +3,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
+
+DISALLOWED_QWEN25_BOOTSTRAP = "/scratch/enmingzz/temp/qwen25_bootstrap"
+sys.path = [path for path in sys.path if not path or not path.startswith(DISALLOWED_QWEN25_BOOTSTRAP)]
 
 from PIL import Image
 

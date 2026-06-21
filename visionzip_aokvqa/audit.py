@@ -36,6 +36,7 @@ from opsd.visionzip_aokvqa.train import (
     get_nested,
     grpo_group_advantages,
     load_yaml,
+    prompt_mode_from_config,
     sequence_inputs_from_prompt,
 )
 
@@ -61,6 +62,7 @@ def sample_records(cfg: dict[str, Any], count: int, seed: int) -> list[Formatted
         splits=list(get_nested(cfg, "dataset.use_splits", ["train", "validation"])),
         limit=0,
         seed=seed,
+        prompt_mode=prompt_mode_from_config(cfg),
     )
     rng = random.Random(seed)
     return rng.sample(data, min(count, len(data)))
@@ -333,7 +335,12 @@ def opsd_audit(model: Any, processor: Any, cfg: dict[str, Any], reports_dir: Pat
     )
     student_seq_inputs = sequence_inputs_from_prompt(prompt_inputs, gen_ids)
     prompt_len = int(prompt_inputs["input_ids"].shape[1])
-    teacher_prompt = build_opsd_teacher_prompt(sample.question, sample.options, sample.target)
+    teacher_prompt = build_opsd_teacher_prompt(
+        sample.question,
+        sample.options,
+        sample.target,
+        prompt_mode=prompt_mode_from_config(cfg),
+    )
     teacher_prompt_inputs = encode_prompt_text(
         processor,
         sample,

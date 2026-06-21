@@ -13,7 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from opsd.visionzip_aokvqa.aokvqa import load_aokvqa_dataset, normalize_aokvqa_sample
-from opsd.visionzip_aokvqa.prompting import parse_final_answer
+from opsd.visionzip_aokvqa.prompting import normalize_prompt_mode, parse_final_answer
 from opsd.visionzip_aokvqa.qwen_wrapper import (
     apply_lora,
     encode_prompt,
@@ -43,6 +43,27 @@ def get_nested(cfg: dict[str, Any], dotted: str, default: Any = None) -> Any:
     return cur
 
 
+def set_nested(cfg: dict[str, Any], dotted: str, value: Any) -> None:
+    cur = cfg
+    parts = dotted.split(".")
+    for key in parts[:-1]:
+        cur = cur.setdefault(key, {})
+    cur[parts[-1]] = value
+
+
+def _truthy_config_value(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def prompt_mode_from_config(cfg: dict[str, Any]) -> str:
+    return normalize_prompt_mode(
+        get_nested(cfg, "prompt.mode", None),
+        enable_thinking=_truthy_config_value(get_nested(cfg, "prompt.enable_thinking", False)),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
     p.add_argument("--config", required=True)
@@ -56,6 +77,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--allow_embedding_fallback", action="store_true")
     p.add_argument("--full_token", action="store_true")
     p.add_argument("--base_no_lora", action="store_true")
+    p.add_argument("--prompt_mode", default=None)
+    p.add_argument("--enable_thinking", action="store_true")
+    p.add_argument("--max_new_tokens", type=int, default=None)
     return p
 
 
@@ -69,9 +93,10 @@ def read_jsonl(path: str | Path) -> list[dict[str, Any]]:
 
 
 def load_eval_samples(cfg: dict[str, Any], args: argparse.Namespace):
+    prompt_mode = prompt_mode_from_config(cfg)
     if args.eval_jsonl:
         records = read_jsonl(args.eval_jsonl)
-        samples = [normalize_aokvqa_sample(record, idx) for idx, record in enumerate(records)]
+        samples = [normalize_aokvqa_sample(record, idx, prompt_mode=prompt_mode) for idx, record in enumerate(records)]
         if args.limit:
             samples = samples[: args.limit]
         return samples
@@ -87,12 +112,19 @@ def load_eval_samples(cfg: dict[str, Any], args: argparse.Namespace):
         splits=list(get_nested(cfg, "evaluation.aokvqa_splits", ["validation"])),
         limit=limit,
         seed=int(get_nested(cfg, "training.seed", 42)),
+        prompt_mode=prompt_mode,
     )
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     cfg = load_yaml(args.config)
+    if args.prompt_mode:
+        set_nested(cfg, "prompt.mode", args.prompt_mode)
+    if args.enable_thinking:
+        set_nested(cfg, "prompt.enable_thinking", True)
+    if args.max_new_tokens is not None:
+        set_nested(cfg, "generation.max_new_tokens", int(args.max_new_tokens))
     output_jsonl = Path(
         args.output_jsonl
         or OUTPUT_ROOT

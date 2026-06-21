@@ -16,6 +16,8 @@ from statistics import mean
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
+DISALLOWED_QWEN25_BOOTSTRAP = "/scratch/enmingzz/temp/qwen25_bootstrap"
+sys.path = [path for path in sys.path if not path or not path.startswith(DISALLOWED_QWEN25_BOOTSTRAP)]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -118,7 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--bf16", type=str, default="true")
     ev.add_argument("--attn_implementation", default="flash_attention_2")
     ev.add_argument("--min_pixels", type=int, default=0)
-    ev.add_argument("--max_pixels", type=int, default=1280 * 28 * 28)
+    ev.add_argument("--max_pixels", type=int, default=16384 * 28 * 28)
     ev.add_argument("--allow_embedding_fallback", action="store_true")
     ev.add_argument("--resume", action="store_true")
 
@@ -919,7 +921,7 @@ def write_summary(path: Path, summaries: list[dict[str, Any]]) -> None:
         "- Models evaluated: full-token base and VisionZip-pruned base only.",
         "- Base model: `Qwen/Qwen2.5-VL-7B-Instruct`.",
         "- Generation: greedy; `max_new_tokens` is set by the eval command.",
-        "- Image preprocessing: Qwen processor with `max_pixels=1280*28*28` unless overridden; full-token and VisionZip base use the same cap.",
+        "- Image preprocessing: Qwen processor with `max_pixels=16384*28*28` unless overridden; full-token and VisionZip base use the same cap.",
         "- VisionZip ratios: `0.1`, `0.2`, `0.3`, `0.4`.",
         "- OPSD/SFT/GRPO/EPIC training was not run or modified.",
         "",

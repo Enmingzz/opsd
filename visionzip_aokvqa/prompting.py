@@ -6,6 +6,12 @@ from typing import Any
 
 
 OPTION_LETTERS = ("A", "B", "C", "D")
+STANDARD_PROMPT_MODES = {"", "standard", "default", "direct", "direct_mode", "none", "false", "0"}
+THINKING_PROMPT_MODES = {"thinking", "think", "reasoning", "reasoning_mode", "reasoning_tags", "enable_thinking", "true", "1"}
+THINKING_INSTRUCTION = (
+    "First output the thinking process in <think> </think> tags and then output the final answer "
+    "in <answer> </answer> tags."
+)
 
 
 PROMPT_TEMPLATE = """<image>
@@ -28,8 +34,30 @@ Reasoning: ...
 Final answer: ..."""
 
 
+THINKING_PROMPT_TEMPLATE = """<image>
+
+You are given an image and a multiple-choice visual reasoning question.
+
+Question:
+{question}
+
+Options:
+A. {option_0}
+B. {option_1}
+C. {option_2}
+D. {option_3}
+
+{thinking_instruction}"""
+
+
 TARGET_TEMPLATE = """Reasoning: {brief_reasoning}
 Final answer: {correct_option_letter}"""
+
+
+THINKING_TARGET_TEMPLATE = """<think>
+{brief_reasoning}
+</think>
+<answer>{correct_option_letter}</answer>"""
 
 
 OPSD_TEACHER_PROMPT_TEMPLATE = """<image>
@@ -59,6 +87,29 @@ Reasoning: ...
 Final answer: ..."""
 
 
+OPSD_TEACHER_THINKING_PROMPT_TEMPLATE = """<image>
+
+You are given an image and a multiple-choice visual reasoning question.
+
+Question:
+{question}
+
+Options:
+A. {option_0}
+B. {option_1}
+C. {option_2}
+D. {option_3}
+
+Here is a reference solution to this problem:
+=== Reference Solution Begin ===
+{reference_solution}
+=== Reference Solution End ===
+
+After reading the reference solution above, make sure you truly understand the reasoning behind each step - do not copy or paraphrase it. Now, using your own words and independent reasoning, derive the same final answer to the problem above. Think step by step, explore different approaches, and do not be afraid to backtrack or reconsider if something does not work out.
+
+{thinking_instruction}"""
+
+
 @dataclass
 class FormattedAOKVQASample:
     sample_id: str
@@ -84,30 +135,72 @@ def strip_image_tokens(text: str) -> str:
     return re.sub(r"<\s*image\s*>", "", str(text), flags=re.IGNORECASE).strip()
 
 
-def build_reasoning_prompt(question: str, options: list[str]) -> str:
+def normalize_prompt_mode(prompt_mode: str | bool | None = None, enable_thinking: bool | None = None) -> str:
+    if enable_thinking:
+        return "thinking"
+    if isinstance(prompt_mode, bool):
+        return "thinking" if prompt_mode else "standard"
+    value = str(prompt_mode or "").strip().lower().replace("-", "_")
+    if value in STANDARD_PROMPT_MODES:
+        return "standard"
+    if value in THINKING_PROMPT_MODES:
+        return "thinking"
+    raise ValueError(
+        f"Unsupported prompt_mode={prompt_mode!r}. "
+        "Use direct/standard for direct mode or thinking/reasoning for <think>/<answer> mode."
+    )
+
+
+def is_thinking_prompt_mode(prompt_mode: str | bool | None = None, enable_thinking: bool | None = None) -> bool:
+    return normalize_prompt_mode(prompt_mode, enable_thinking=enable_thinking) == "thinking"
+
+
+def build_reasoning_prompt(
+    question: str,
+    options: list[str],
+    prompt_mode: str | bool | None = None,
+    enable_thinking: bool | None = None,
+) -> str:
     if len(options) != 4:
         raise ValueError(f"A-OKVQA prompt requires exactly four options, got {len(options)}.")
     clean_options = [str(option).strip() for option in options]
-    return PROMPT_TEMPLATE.format(
+    mode = normalize_prompt_mode(prompt_mode, enable_thinking=enable_thinking)
+    template = THINKING_PROMPT_TEMPLATE if mode == "thinking" else PROMPT_TEMPLATE
+    return template.format(
         question=strip_image_tokens(question),
         option_0=clean_options[0],
         option_1=clean_options[1],
         option_2=clean_options[2],
         option_3=clean_options[3],
+        thinking_instruction=THINKING_INSTRUCTION,
     )
 
 
-def build_target(reasoning: str | None, correct_option_letter: str) -> str:
+def build_target(
+    reasoning: str | None,
+    correct_option_letter: str,
+    prompt_mode: str | bool | None = None,
+    enable_thinking: bool | None = None,
+) -> str:
     brief_reasoning = str(reasoning or "").strip()
     if not brief_reasoning:
         brief_reasoning = "The correct option is supported by the image and question."
-    return TARGET_TEMPLATE.format(
+    correct = str(correct_option_letter).strip().upper()
+    mode = normalize_prompt_mode(prompt_mode, enable_thinking=enable_thinking)
+    template = THINKING_TARGET_TEMPLATE if mode == "thinking" else TARGET_TEMPLATE
+    return template.format(
         brief_reasoning=brief_reasoning,
-        correct_option_letter=str(correct_option_letter).strip().upper(),
+        correct_option_letter=correct,
     )
 
 
-def build_opsd_teacher_prompt(question: str, options: list[str], reference_solution: str) -> str:
+def build_opsd_teacher_prompt(
+    question: str,
+    options: list[str],
+    reference_solution: str,
+    prompt_mode: str | bool | None = None,
+    enable_thinking: bool | None = None,
+) -> str:
     """Build the privileged teacher prompt used by the official OPSD setup."""
 
     if len(options) != 4:
@@ -116,16 +209,21 @@ def build_opsd_teacher_prompt(question: str, options: list[str], reference_solut
     reference = str(reference_solution or "").strip()
     if not reference:
         reference = "Reasoning: The correct option is supported by the image and question."
-    return OPSD_TEACHER_PROMPT_TEMPLATE.format(
+    mode = normalize_prompt_mode(prompt_mode, enable_thinking=enable_thinking)
+    template = OPSD_TEACHER_THINKING_PROMPT_TEMPLATE if mode == "thinking" else OPSD_TEACHER_PROMPT_TEMPLATE
+    return template.format(
         question=strip_image_tokens(question),
         option_0=clean_options[0],
         option_1=clean_options[1],
         option_2=clean_options[2],
         option_3=clean_options[3],
         reference_solution=reference,
+        thinking_instruction=THINKING_INSTRUCTION,
     )
 
 
+ANSWER_TAG_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.IGNORECASE | re.DOTALL)
+OPEN_ANSWER_TAG_PATTERN = re.compile(r"<answer>\s*([^<\n\r]+)", re.IGNORECASE)
 FINAL_ANSWER_PATTERNS = (
     re.compile(r"final\s+answer\s*[:\-]\s*([ABCD])\b", re.IGNORECASE),
     re.compile(r"the\s+final\s+answer\s+is\s+([ABCD])\b", re.IGNORECASE),
@@ -133,10 +231,31 @@ FINAL_ANSWER_PATTERNS = (
 )
 
 
+def _extract_option_letter(value: str) -> str | None:
+    for pattern in FINAL_ANSWER_PATTERNS:
+        match = pattern.search(value)
+        if match:
+            return match.group(1).upper()
+    match = re.search(r"\b([ABCD])\b", value, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+    return None
+
+
 def parse_final_answer(text: str) -> str | None:
     """Extract A/B/C/D from the requested final-answer format and close variants."""
 
     value = str(text or "")
+    answer_tag = ANSWER_TAG_PATTERN.search(value)
+    if answer_tag:
+        parsed = _extract_option_letter(answer_tag.group(1))
+        if parsed:
+            return parsed
+    open_answer_tag = OPEN_ANSWER_TAG_PATTERN.search(value)
+    if open_answer_tag:
+        parsed = _extract_option_letter(open_answer_tag.group(1))
+        if parsed:
+            return parsed
     for pattern in FINAL_ANSWER_PATTERNS:
         match = pattern.search(value)
         if match:

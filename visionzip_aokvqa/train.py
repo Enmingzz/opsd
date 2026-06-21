@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
+DISALLOWED_QWEN25_BOOTSTRAP = "/scratch/enmingzz/temp/qwen25_bootstrap"
+sys.path = [path for path in sys.path if not path or not path.startswith(DISALLOWED_QWEN25_BOOTSTRAP)]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -28,7 +30,7 @@ from opsd.visionzip_aokvqa.losses import (
     compute_token_ce,
     grpo_policy_loss,
 )
-from opsd.visionzip_aokvqa.prompting import build_opsd_teacher_prompt, parse_final_answer
+from opsd.visionzip_aokvqa.prompting import build_opsd_teacher_prompt, normalize_prompt_mode, parse_final_answer
 from opsd.visionzip_aokvqa.qwen_wrapper import (
     apply_lora,
     encode_prompt,
@@ -49,6 +51,9 @@ METHODS = ("sft", "grpo", "epic", "opsd", "opsd_fixed_teacher", "opsd_nogt", "of
 OPSD_DYNAMIC_TEACHER_ALIASES = {"", "dynamic", "dynamic_shared_current", "shared_current", "latest"}
 OPSD_FIXED_TEACHER_ALIASES = {"fixed_base", "fixed_teacher", "legacy_fixed_base", "base"}
 OPSD_EMA_TEACHER_ALIASES = {"ema", "ema_teacher", "ema_shared", "ema_reference"}
+OPSD_EXTERNAL_TEACHER_ALIASES = {"external", "external_adapter", "teacher_adapter", "sft_teacher"}
+DEFAULT_TEACHER_ADAPTER_NAME = "teacher"
+STUDENT_TEXT_LOG_KEY = "_student_text_log"
 
 
 def load_yaml(path: str | Path) -> dict[str, Any]:
@@ -107,6 +112,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--adapter_path", default="")
     p.add_argument("--selected_ids_path", default="")
     p.add_argument("--gradient_accumulation_steps", type=int, default=None)
+    p.add_argument("--prompt_mode", default=None)
+    p.add_argument("--enable_thinking", action="store_true")
+    p.add_argument("--max_new_tokens", type=int, default=None)
+    p.add_argument("--attn_implementation", default=None)
     return p
 
 
@@ -136,6 +145,14 @@ def resolve_config(args: argparse.Namespace) -> dict[str, Any]:
         set_nested(cfg, "dataset.selected_ids_path", args.selected_ids_path)
     if args.gradient_accumulation_steps is not None:
         set_nested(cfg, "training.gradient_accumulation_steps", args.gradient_accumulation_steps)
+    if args.prompt_mode:
+        set_nested(cfg, "prompt.mode", args.prompt_mode)
+    if args.enable_thinking:
+        set_nested(cfg, "prompt.enable_thinking", True)
+    if args.max_new_tokens is not None:
+        set_nested(cfg, "generation.max_new_tokens", int(args.max_new_tokens))
+    if args.attn_implementation:
+        set_nested(cfg, "training.attn_implementation", args.attn_implementation)
     return cfg
 
 
@@ -156,7 +173,6 @@ def setup_distributed() -> tuple[bool, int, int, int]:
 
 def cleanup_distributed(distributed: bool) -> None:
     if distributed and dist.is_initialized():
-        dist.barrier()
         dist.destroy_process_group()
 
 
@@ -166,6 +182,63 @@ def is_main_process(rank: int) -> bool:
 
 def unwrap_model(model: Any) -> Any:
     return getattr(model, "module", model)
+
+
+def active_lora_adapter_name(model: Any) -> str:
+    peft_model = unwrap_model(model)
+    active = getattr(peft_model, "active_adapter", None)
+    if isinstance(active, str) and active:
+        return active
+    active_adapters = getattr(peft_model, "active_adapters", None)
+    if callable(active_adapters):
+        adapters = active_adapters()
+        if isinstance(adapters, (list, tuple)) and adapters:
+            return str(adapters[0])
+        if isinstance(adapters, str) and adapters:
+            return adapters
+    peft_config = getattr(peft_model, "peft_config", {})
+    if isinstance(peft_config, dict) and "default" in peft_config:
+        return "default"
+    return ""
+
+
+def set_lora_adapter_requires_grad(model: Any, adapter_name: str, requires_grad: bool) -> int:
+    marker = f".{adapter_name}."
+    count = 0
+    for name, param in unwrap_model(model).named_parameters():
+        if marker in name:
+            param.requires_grad_(requires_grad)
+            count += 1
+    return count
+
+
+def load_shared_teacher_lora_adapter(model: Any, adapter_path: str | Path, adapter_name: str) -> None:
+    peft_model = unwrap_model(model)
+    if not hasattr(peft_model, "load_adapter") or not hasattr(peft_model, "set_adapter"):
+        raise RuntimeError("A shared LoRA teacher requires a PEFT model with load_adapter() and set_adapter().")
+    previous_adapter = active_lora_adapter_name(peft_model)
+    peft_model.load_adapter(str(adapter_path), adapter_name=adapter_name, is_trainable=False)
+    if previous_adapter:
+        peft_model.set_adapter(previous_adapter)
+    frozen_count = set_lora_adapter_requires_grad(peft_model, adapter_name, False)
+    if frozen_count == 0:
+        raise RuntimeError(f"Loaded teacher adapter {adapter_name!r}, but found no matching LoRA parameters.")
+
+
+@contextmanager
+def active_lora_adapter(model: Any, adapter_name: str):
+    peft_model = unwrap_model(model)
+    if not adapter_name:
+        raise ValueError("adapter_name must be non-empty.")
+    if not hasattr(peft_model, "set_adapter"):
+        raise RuntimeError("Model does not support set_adapter(); cannot switch to shared teacher LoRA adapter.")
+    previous_adapter = active_lora_adapter_name(peft_model)
+    peft_model.set_adapter(adapter_name)
+    try:
+        yield model
+    finally:
+        if previous_adapter:
+            peft_model.set_adapter(previous_adapter)
 
 
 def apply_selected_ids(dataset: list[FormattedAOKVQASample], ids_path: str | Path | None) -> list[FormattedAOKVQASample]:
@@ -181,10 +254,66 @@ def apply_selected_ids(dataset: list[FormattedAOKVQASample], ids_path: str | Pat
     return [by_id[sample_id] for sample_id in wanted]
 
 
+def _truthy_config_value(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def prompt_mode_from_config(cfg: dict[str, Any]) -> str:
+    return normalize_prompt_mode(
+        get_nested(cfg, "prompt.mode", None),
+        enable_thinking=_truthy_config_value(get_nested(cfg, "prompt.enable_thinking", False)),
+    )
+
+
+def image_pixel_bounds_from_config(cfg: dict[str, Any]) -> tuple[int | None, int | None]:
+    min_pixels = get_nested(cfg, "dataset.min_pixels", get_nested(cfg, "training.min_pixels", None))
+    max_pixels = get_nested(cfg, "dataset.max_pixels", get_nested(cfg, "training.max_pixels", None))
+    return (
+        int(min_pixels) if min_pixels is not None else None,
+        int(max_pixels) if max_pixels is not None else None,
+    )
+
+
 def write_jsonl(path: Path, row: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def build_student_text_log(
+    sample: FormattedAOKVQASample,
+    retention_ratio: float,
+    generated_text: str,
+    generated_tokens: int,
+    teacher_source: str = "",
+    teacher_strategy: str = "",
+) -> dict[str, Any]:
+    parsed = parse_final_answer(generated_text)
+    return {
+        "sample_id": sample.sample_id,
+        "question": sample.question,
+        "options": sample.options,
+        "correct_letter": sample.correct_letter,
+        "parsed_answer": parsed,
+        "parseable": parsed is not None,
+        "student_correct": parsed == sample.correct_letter,
+        "retention_ratio": float(retention_ratio),
+        "generated_tokens": int(generated_tokens),
+        "teacher_source": teacher_source,
+        "opsd_teacher_strategy": teacher_strategy,
+        "student_text": generated_text,
+    }
+
+
+def is_retryable_training_error(exc: Exception) -> bool:
+    message = str(exc)
+    retryable_markers = (
+        "Image features and image tokens do not match",
+        "Image features and image placeholders do not match",
+    )
+    return any(marker in message for marker in retryable_markers)
 
 
 def save_resolved_config(cfg: dict[str, Any], output_dir: Path) -> None:
@@ -226,13 +355,22 @@ def sample_retention_ratio(
     return float(rng.choices(ratios, weights=weights, k=1)[0])
 
 
-def resolve_opsd_teacher_strategy(cfg: dict[str, Any], teacher_model: Any | None) -> str:
+def resolve_opsd_teacher_strategy(
+    cfg: dict[str, Any],
+    teacher_model: Any | None,
+    teacher_adapter_name: str = "",
+) -> str:
     raw = str(get_nested(cfg, "opsd.teacher_strategy", "") or "").strip().lower()
     use_ema = bool(get_nested(cfg, "opsd.use_ema_teacher", False))
     if teacher_model is not None and (use_ema or raw in OPSD_EMA_TEACHER_ALIASES):
         return "ema"
     if teacher_model is not None:
         return "external"
+    if teacher_adapter_name:
+        if use_ema or raw in OPSD_EMA_TEACHER_ALIASES:
+            return "ema"
+        if not raw or raw in OPSD_EXTERNAL_TEACHER_ALIASES:
+            return "external_adapter"
     fixed_teacher = bool(get_nested(cfg, "opsd.fixed_teacher", False))
     if fixed_teacher and not raw:
         return "fixed_base"
@@ -244,10 +382,12 @@ def resolve_opsd_teacher_strategy(cfg: dict[str, Any], teacher_model: Any | None
         return "dynamic_shared_current"
     if raw in OPSD_FIXED_TEACHER_ALIASES:
         return "fixed_base"
+    if raw in OPSD_EXTERNAL_TEACHER_ALIASES:
+        raise ValueError("opsd.teacher_strategy='external' requires opsd.teacher_adapter_path.")
     raise ValueError(
         "Unsupported opsd.teacher_strategy="
         f"{raw!r}. Use dynamic_shared_current for the online shared path, ema for the official EMA reference path, "
-        "or fixed_base for the legacy ablation."
+        "external with opsd.teacher_adapter_path for a shared teacher LoRA, or fixed_base for the legacy ablation."
     )
 
 
@@ -317,6 +457,36 @@ def update_ema_teacher(source_model: Any, target_model: Any, names: list[str], d
     with torch.no_grad():
         for name in names:
             target_params[name].data.mul_(decay).add_(source_params[name].detach().data, alpha=1.0 - decay)
+
+
+def _remap_adapter_parameter_name(name: str, source_adapter: str, target_adapter: str) -> str:
+    marker = f".{source_adapter}."
+    if marker not in name:
+        raise ValueError(f"Parameter {name!r} does not belong to adapter {source_adapter!r}.")
+    return name.replace(marker, f".{target_adapter}.", 1)
+
+
+def update_ema_adapter(
+    model: Any,
+    names: list[str],
+    source_adapter: str,
+    target_adapter: str,
+    decay: float,
+) -> None:
+    params = dict(unwrap_model(model).named_parameters())
+    decay = float(decay)
+    if decay < 0.0 or decay >= 1.0:
+        raise ValueError(f"EMA decay must be in [0, 1), got {decay}.")
+    missing: list[str] = []
+    with torch.no_grad():
+        for source_name in names:
+            target_name = _remap_adapter_parameter_name(source_name, source_adapter, target_adapter)
+            if target_name not in params:
+                missing.append(target_name)
+                continue
+            params[target_name].data.mul_(decay).add_(params[source_name].detach().data, alpha=1.0 - decay)
+    if missing:
+        raise KeyError(f"EMA teacher adapter is missing parameters: {missing[:10]}")
 
 
 def create_ema_shadow(model: Any, names: list[str]) -> dict[str, torch.Tensor]:
@@ -401,24 +571,39 @@ def generation_top_k(cfg: dict[str, Any]) -> int | None:
     return top_k if top_k > 0 else None
 
 
+def generation_do_sample(cfg: dict[str, Any]) -> bool:
+    return float(get_nested(cfg, "generation.temperature", 0.7) or 0.0) > 0.0
+
+
+def generation_max_unparseable_tokens(cfg: dict[str, Any]) -> int | None:
+    value = int(get_nested(cfg, "generation.max_unparseable_new_tokens", 256) or 0)
+    return value if value > 0 else None
+
+
+def generation_stop_on_parse(cfg: dict[str, Any]) -> bool:
+    return _truthy_config_value(get_nested(cfg, "generation.stop_on_parse", True))
+
+
 def generate_full_teacher(model: Any, processor: Any, prompt_inputs: dict[str, torch.Tensor], cfg: dict[str, Any]) -> tuple[torch.Tensor, str]:
     eos_token_id = getattr(processor.tokenizer, "eos_token_id", None)
     pad_token_id = getattr(processor.tokenizer, "pad_token_id", None) or eos_token_id
     generate_model = unwrap_model(model)
     with torch.no_grad():
+        do_sample = generation_do_sample(cfg)
         kwargs = {
             **model_input_subset(prompt_inputs),
             "max_new_tokens": int(get_nested(cfg, "generation.max_new_tokens", 128)),
-            "do_sample": True,
-            "temperature": float(get_nested(cfg, "generation.temperature", 0.7)),
-            "top_p": float(get_nested(cfg, "generation.top_p", 0.9)),
+            "do_sample": do_sample,
             "use_cache": True,
             "eos_token_id": eos_token_id,
             "pad_token_id": pad_token_id,
         }
-        top_k = generation_top_k(cfg)
-        if top_k is not None:
-            kwargs["top_k"] = top_k
+        if do_sample:
+            kwargs["temperature"] = float(get_nested(cfg, "generation.temperature", 0.7))
+            kwargs["top_p"] = float(get_nested(cfg, "generation.top_p", 0.9))
+            top_k = generation_top_k(cfg)
+            if top_k is not None:
+                kwargs["top_k"] = top_k
         output_ids = generate_model.generate(**kwargs)
     prompt_len = int(prompt_inputs["input_ids"].shape[1])
     gen = output_ids[:, prompt_len:]
@@ -619,6 +804,7 @@ def opsd_nogt_step(
     retention_ratio: float,
     teacher_model: Any | None = None,
     ema_shadow: dict[str, torch.Tensor] | None = None,
+    teacher_adapter_name: str = "",
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     device = primary_device(model)
     prompt_inputs = encode_prompt(processor, sample, image_root=get_nested(cfg, "dataset.image_root", ""), device=device)
@@ -628,12 +814,14 @@ def opsd_nogt_step(
         prompt_inputs,
         retention_ratio,
         max_new_tokens=int(get_nested(cfg, "generation.max_new_tokens", 128)),
-        do_sample=True,
+        do_sample=generation_do_sample(cfg),
         temperature=float(get_nested(cfg, "generation.temperature", 0.7)),
         top_p=float(get_nested(cfg, "generation.top_p", 0.9)),
         top_k=generation_top_k(cfg),
         allow_embedding_fallback=bool(get_nested(cfg, "pruning.allow_embedding_fallback", False)),
         manual_decode=bool(get_nested(cfg, "generation.manual_pruned_generate", True)),
+        max_unparseable_tokens=generation_max_unparseable_tokens(cfg),
+        stop_on_parse=generation_stop_on_parse(cfg),
     )
     if gen_ids.numel() == 0:
         raise RuntimeError("OPSD student generated zero tokens.")
@@ -643,20 +831,31 @@ def opsd_nogt_step(
     raw_teacher_strategy = str(get_nested(cfg, "opsd.teacher_strategy", "") or "").strip()
     explicit_teacher_strategy = (
         teacher_model is not None
+        or bool(teacher_adapter_name)
         or ema_shadow is not None
         or raw_teacher_strategy
         or bool(get_nested(cfg, "opsd.use_ema_teacher", False))
     )
-    teacher_strategy = resolve_opsd_teacher_strategy(cfg, teacher_model) if explicit_teacher_strategy else "fixed_base"
+    teacher_strategy = (
+        resolve_opsd_teacher_strategy(cfg, teacher_model, teacher_adapter_name) if explicit_teacher_strategy else "fixed_base"
+    )
     if teacher_strategy == "external":
         with torch.no_grad():
             teacher_outputs = teacher_model(**model_input_subset(seq_inputs), use_cache=False)
         teacher_source = "external_no_gt_full_token"
+    elif teacher_strategy == "external_adapter":
+        with torch.no_grad(), active_lora_adapter(model, teacher_adapter_name), temporary_eval(model):
+            teacher_outputs = model(**model_input_subset(seq_inputs), use_cache=False)
+        teacher_source = "external_adapter_no_gt_full_token"
     elif teacher_strategy == "ema":
         if teacher_model is not None:
             with torch.no_grad():
                 teacher_outputs = teacher_model(**model_input_subset(seq_inputs), use_cache=False)
             teacher_source = "ema_no_gt_full_token"
+        elif teacher_adapter_name:
+            with torch.no_grad(), active_lora_adapter(model, teacher_adapter_name), temporary_eval(model):
+                teacher_outputs = model(**model_input_subset(seq_inputs), use_cache=False)
+            teacher_source = "ema_adapter_no_gt_full_token"
         elif ema_shadow is not None:
             with torch.no_grad(), swapped_ema_parameters(model, ema_shadow), temporary_eval(model):
                 teacher_outputs = model(**model_input_subset(seq_inputs), use_cache=False)
@@ -676,6 +875,9 @@ def opsd_nogt_step(
     else:
         raise AssertionError(teacher_strategy)
 
+    teacher_logits = extract_generated_logits(teacher_outputs.logits, prompt_len, int(gen_ids.numel())).detach()
+    del teacher_outputs
+
     student_outputs, pruned = forward_pruned(
         model,
         seq_inputs,
@@ -683,18 +885,26 @@ def opsd_nogt_step(
         prompt_len=prompt_len,
         allow_embedding_fallback=bool(get_nested(cfg, "pruning.allow_embedding_fallback", False)),
     )
-    teacher_logits = extract_generated_logits(teacher_outputs.logits, prompt_len, int(gen_ids.numel()))
     student_logits = extract_generated_logits(student_outputs.logits, int(pruned["metadata"]["student_prompt_len"]), int(gen_ids.numel()))
     kl = compute_forward_kl(teacher_logits, student_logits, temperature=float(get_nested(cfg, "opsd.temperature", 1.0)))
+    parsed = parse_final_answer(gen_text)
     return kl, {
         "loss_type": "opsd_nogt_forward_kl",
         "generated_tokens": int(gen_ids.numel()),
         "kl_loss": float(kl.detach().cpu()),
-        "parseable": parse_final_answer(gen_text) is not None,
-        "student_correct": parse_final_answer(gen_text) == sample.correct_letter,
+        "parseable": parsed is not None,
+        "student_correct": parsed == sample.correct_letter,
         "teacher_source": teacher_source,
         "opsd_teacher_strategy": teacher_strategy,
         "teacher_context": "student_prompt_no_ground_truth",
+        STUDENT_TEXT_LOG_KEY: build_student_text_log(
+            sample,
+            retention_ratio,
+            gen_text,
+            int(gen_ids.numel()),
+            teacher_source=teacher_source,
+            teacher_strategy=teacher_strategy,
+        ),
         "opsd_reference": (
             "no_gt_ema_teacher_ablation"
             if teacher_strategy == "ema"
@@ -702,6 +912,8 @@ def opsd_nogt_step(
             if teacher_strategy == "dynamic_shared_current"
             else "legacy_no_gt_ablation"
             if teacher_strategy == "fixed_base"
+            else "no_gt_external_adapter_teacher_ablation"
+            if teacher_strategy == "external_adapter"
             else "no_gt_external_teacher_ablation"
         ),
         **numeric_metadata(pruned["metadata"]),
@@ -716,6 +928,7 @@ def opsd_step(
     retention_ratio: float,
     teacher_model: Any | None = None,
     ema_shadow: dict[str, torch.Tensor] | None = None,
+    teacher_adapter_name: str = "",
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Official-style OPSD adapted to A-OKVQA/Qwen2.5-VL/VisionZip.
 
@@ -733,12 +946,14 @@ def opsd_step(
         student_prompt_inputs,
         retention_ratio,
         max_new_tokens=int(get_nested(cfg, "generation.max_new_tokens", 128)),
-        do_sample=True,
+        do_sample=generation_do_sample(cfg),
         temperature=float(get_nested(cfg, "generation.temperature", 0.7)),
         top_p=float(get_nested(cfg, "generation.top_p", 0.9)),
         top_k=generation_top_k(cfg),
         allow_embedding_fallback=bool(get_nested(cfg, "pruning.allow_embedding_fallback", False)),
         manual_decode=bool(get_nested(cfg, "generation.manual_pruned_generate", True)),
+        max_unparseable_tokens=generation_max_unparseable_tokens(cfg),
+        stop_on_parse=generation_stop_on_parse(cfg),
     )
     if gen_ids.numel() == 0:
         raise RuntimeError("OPSD student generated zero tokens.")
@@ -746,21 +961,34 @@ def opsd_step(
     student_seq_inputs = sequence_inputs_from_prompt(student_prompt_inputs, gen_ids)
     student_prompt_len = int(student_prompt_inputs["input_ids"].shape[1])
 
-    teacher_prompt = build_opsd_teacher_prompt(sample.question, sample.options, sample.target)
+    teacher_prompt = build_opsd_teacher_prompt(
+        sample.question,
+        sample.options,
+        sample.target,
+        prompt_mode=prompt_mode_from_config(cfg),
+    )
     teacher_prompt_inputs = encode_prompt_text(processor, sample, teacher_prompt, image_root=image_root, device=device)
     teacher_seq_inputs = sequence_inputs_from_prompt(teacher_prompt_inputs, gen_ids)
     teacher_prompt_len = int(teacher_prompt_inputs["input_ids"].shape[1])
 
-    teacher_strategy = resolve_opsd_teacher_strategy(cfg, teacher_model)
+    teacher_strategy = resolve_opsd_teacher_strategy(cfg, teacher_model, teacher_adapter_name)
     if teacher_strategy == "external":
         with torch.no_grad():
             teacher_outputs = teacher_model(**model_input_subset(teacher_seq_inputs), use_cache=False)
         teacher_source = "external_privileged_full_token"
+    elif teacher_strategy == "external_adapter":
+        with torch.no_grad(), active_lora_adapter(model, teacher_adapter_name), temporary_eval(model):
+            teacher_outputs = model(**model_input_subset(teacher_seq_inputs), use_cache=False)
+        teacher_source = "external_adapter_privileged_full_token"
     elif teacher_strategy == "ema":
         if teacher_model is not None:
             with torch.no_grad():
                 teacher_outputs = teacher_model(**model_input_subset(teacher_seq_inputs), use_cache=False)
             teacher_source = "ema_privileged_full_token"
+        elif teacher_adapter_name:
+            with torch.no_grad(), active_lora_adapter(model, teacher_adapter_name), temporary_eval(model):
+                teacher_outputs = model(**model_input_subset(teacher_seq_inputs), use_cache=False)
+            teacher_source = "ema_adapter_privileged_full_token"
         elif ema_shadow is not None:
             with torch.no_grad(), swapped_ema_parameters(model, ema_shadow), temporary_eval(model):
                 teacher_outputs = model(**model_input_subset(teacher_seq_inputs), use_cache=False)
@@ -910,12 +1138,14 @@ def grpo_step(
             prompt_inputs,
             retention_ratio,
             max_new_tokens=int(get_nested(cfg, "generation.max_new_tokens", 128)),
-            do_sample=True,
+            do_sample=generation_do_sample(cfg),
             temperature=float(get_nested(cfg, "generation.temperature", 0.7)),
             top_p=float(get_nested(cfg, "generation.top_p", 0.9)),
             top_k=generation_top_k(cfg),
             allow_embedding_fallback=bool(get_nested(cfg, "pruning.allow_embedding_fallback", False)),
             manual_decode=bool(get_nested(cfg, "generation.manual_pruned_generate", True)),
+            max_unparseable_tokens=generation_max_unparseable_tokens(cfg),
+            stop_on_parse=generation_stop_on_parse(cfg),
         )
         if gen_ids.numel() == 0:
             continue
@@ -978,6 +1208,7 @@ def aggregate_microbatch_metrics(metrics: list[dict[str, Any]]) -> dict[str, Any
 def train(cfg: dict[str, Any]) -> Path:
     distributed, rank, local_rank, world_size = setup_distributed()
     method = str(get_nested(cfg, "training.method", "sft")).lower()
+    prompt_mode = prompt_mode_from_config(cfg)
     if method not in METHODS:
         raise ValueError(f"Unknown method {method!r}.")
     if method == "opsd_fixed_teacher":
@@ -992,12 +1223,15 @@ def train(cfg: dict[str, Any]) -> Path:
         set_nested(cfg, "opsd.fixed_teacher", False)
     output_dir = Path(str(cfg.get("output_dir", OUTPUT_ROOT / "checkpoints" / method)))
     log_path = output_dir / "training_log.jsonl"
+    student_text_log_path = output_dir / "student_text_outputs.jsonl"
     max_steps = int(get_nested(cfg, "training.max_steps", 1000))
     start_step = int(get_nested(cfg, "training.start_step", 0) or 0)
     if start_step < 0 or start_step > max_steps:
         raise ValueError(f"training.start_step must be in [0, max_steps]; got {start_step} with max_steps={max_steps}.")
     if is_main_process(rank) and log_path.exists() and start_step == 0:
         log_path.unlink()
+    if is_main_process(rank) and student_text_log_path.exists() and start_step == 0:
+        student_text_log_path.unlink()
     if is_main_process(rank):
         save_resolved_config(cfg, output_dir)
     rng = random.Random(int(get_nested(cfg, "training.seed", 42)) + rank)
@@ -1007,6 +1241,7 @@ def train(cfg: dict[str, Any]) -> Path:
         splits=list(get_nested(cfg, "dataset.use_splits", ["train", "validation"])),
         limit=int(get_nested(cfg, "dataset.limit", 0) or 0),
         seed=int(get_nested(cfg, "training.seed", 42)),
+        prompt_mode=prompt_mode,
     )
     dataset = apply_selected_ids(dataset, get_nested(cfg, "dataset.selected_ids_path", ""))
     if not dataset:
@@ -1026,11 +1261,14 @@ def train(cfg: dict[str, Any]) -> Path:
         stagger = float(os.environ.get("OPSD_DDP_STAGGER_LOAD_SECONDS", "0"))
         if stagger > 0:
             time.sleep(float(local_rank) * stagger)
+    min_pixels, max_pixels = image_pixel_bounds_from_config(cfg)
     model, processor = load_qwen_model_and_processor(
         str(get_nested(cfg, "base_model", "Qwen/Qwen2.5-VL-7B-Instruct")),
         bf16=bool(get_nested(cfg, "training.bf16", True)),
         attn_implementation=str(get_nested(cfg, "training.attn_implementation", "flash_attention_2")),
         device_map=device_map,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
     )
     if bool(get_nested(cfg, "training.use_lora", True)):
         model = apply_lora(
@@ -1041,7 +1279,9 @@ def train(cfg: dict[str, Any]) -> Path:
             target_modules=list(get_nested(cfg, "training.target_modules", [])) or None,
             adapter_path=str(get_nested(cfg, "training.adapter_path", "")),
         )
+    student_adapter_name = active_lora_adapter_name(model)
     teacher_model = None
+    teacher_adapter_name = ""
     ema_shadow: dict[str, torch.Tensor] | None = None
     ema_parameter_names: list[str] = []
     teacher_adapter_path = str(get_nested(cfg, "opsd.teacher_adapter_path", "") or "").strip()
@@ -1052,16 +1292,14 @@ def train(cfg: dict[str, Any]) -> Path:
     if teacher_adapter_path:
         if not Path(teacher_adapter_path).exists():
             raise FileNotFoundError(f"OPSD teacher adapter path does not exist: {teacher_adapter_path}")
-        teacher_model, _teacher_processor = load_qwen_model_and_processor(
-            str(get_nested(cfg, "base_model", "Qwen/Qwen2.5-VL-7B-Instruct")),
-            bf16=bool(get_nested(cfg, "training.bf16", True)),
-            attn_implementation=str(get_nested(cfg, "training.attn_implementation", "flash_attention_2")),
-            device_map=device_map,
-        )
-        teacher_model = apply_lora(teacher_model, adapter_path=teacher_adapter_path)
-        for param in teacher_model.parameters():
-            param.requires_grad_(False)
-        teacher_model.eval()
+        teacher_adapter_name = str(get_nested(cfg, "opsd.teacher_adapter_name", DEFAULT_TEACHER_ADAPTER_NAME) or "")
+        if not teacher_adapter_name:
+            raise ValueError("opsd.teacher_adapter_name must be non-empty when opsd.teacher_adapter_path is set.")
+        if teacher_adapter_name == student_adapter_name:
+            raise ValueError(
+                f"opsd.teacher_adapter_name={teacher_adapter_name!r} conflicts with the student adapter name."
+            )
+        load_shared_teacher_lora_adapter(model, teacher_adapter_path, teacher_adapter_name)
     if ema_teacher_enabled:
         ema_parameter_names = trainable_parameter_names(model)
         adapter_path = str(get_nested(cfg, "training.adapter_path", "") or "").strip()
@@ -1080,7 +1318,14 @@ def train(cfg: dict[str, Any]) -> Path:
             f"trainable={sum(p.numel() for p in trainable)}\n"
             f"total={sum(p.numel() for p in model.parameters())}\n"
             f"distributed={distributed}\nworld_size={world_size}\n"
+            f"prompt_mode={prompt_mode}\n"
+            f"dataset_min_pixels={min_pixels}\n"
+            f"dataset_max_pixels={max_pixels}\n"
+            f"generation_max_new_tokens={get_nested(cfg, 'generation.max_new_tokens', 128)}\n"
+            f"generation_max_unparseable_new_tokens={get_nested(cfg, 'generation.max_unparseable_new_tokens', '')}\n"
             f"opsd_teacher_adapter_path={teacher_adapter_path}\n"
+            f"opsd_shared_teacher_adapter_name={teacher_adapter_name}\n"
+            f"opsd_student_adapter_name={student_adapter_name}\n"
             f"opsd_teacher_strategy={get_nested(cfg, 'opsd.teacher_strategy', '')}\n"
             f"opsd_use_ema_teacher={ema_teacher_enabled}\n"
             f"opsd_ema_mode={ema_settings.get('mode', '')}\n"
@@ -1102,6 +1347,9 @@ def train(cfg: dict[str, Any]) -> Path:
     if micro_batch_size < 1:
         raise ValueError(f"training.micro_batch_size must be >= 1; got {micro_batch_size}.")
     global_step_unit = world_size * micro_batch_size if distributed else micro_batch_size
+    max_sample_retries = int(get_nested(cfg, "training.max_sample_retries", 0) or 0)
+    if max_sample_retries < 0:
+        raise ValueError(f"training.max_sample_retries must be >= 0; got {max_sample_retries}.")
     if remaining_steps % global_step_unit != 0:
         raise ValueError(
             "DDP requires remaining steps divisible by world_size * training.micro_batch_size; "
@@ -1120,43 +1368,79 @@ def train(cfg: dict[str, Any]) -> Path:
                 batch_metrics: list[dict[str, Any]] = []
                 batch_samples: list[FormattedAOKVQASample] = []
                 batch_ratios: list[float] = []
+                batch_text_logs: list[dict[str, Any]] = []
                 for micro_idx in range(micro_batch_size):
                     if distributed:
-                        global_index = start_step + (step * micro_batch_size + micro_idx) * world_size + rank
+                        base_global_index = start_step + (step * micro_batch_size + micro_idx) * world_size + rank
                     else:
-                        global_index = start_step + step * micro_batch_size + micro_idx
-                    sample = dataset[global_index % len(dataset)]
-                    ratio = sample_retention_ratio(cfg, rng, progress_step=global_index, total_steps=max_steps)
-                    if method == "sft":
-                        sample_loss, sample_metrics = sft_like_step(model, processor, sample, cfg, ratio, sample.target)
-                    elif method == "epic":
-                        sample_loss, sample_metrics = epic_tcd_step(model, processor, sample, cfg, ratio)
-                    elif method == "grpo":
-                        sample_loss, sample_metrics = grpo_step(model, processor, sample, cfg, ratio)
-                    elif method in {"opsd", "opsd_fixed_teacher"}:
-                        sample_loss, sample_metrics = opsd_step(
-                            model,
-                            processor,
-                            sample,
-                            cfg,
-                            ratio,
-                            teacher_model=teacher_model,
-                            ema_shadow=ema_shadow,
-                        )
-                    elif method == "opsd_nogt":
-                        sample_loss, sample_metrics = opsd_nogt_step(
-                            model,
-                            processor,
-                            sample,
-                            cfg,
-                            ratio,
-                            teacher_model=teacher_model,
-                            ema_shadow=ema_shadow,
-                        )
-                    elif method == "offpolicy":
-                        sample_loss, sample_metrics = offpolicy_step(model, processor, sample, cfg, ratio)
-                    else:
-                        raise AssertionError(method)
+                        base_global_index = start_step + step * micro_batch_size + micro_idx
+                    for sample_attempt in range(max_sample_retries + 1):
+                        global_index = base_global_index + sample_attempt * global_step_unit
+                        sample = dataset[global_index % len(dataset)]
+                        ratio = sample_retention_ratio(cfg, rng, progress_step=global_index, total_steps=max_steps)
+                        try:
+                            if method == "sft":
+                                sample_loss, sample_metrics = sft_like_step(model, processor, sample, cfg, ratio, sample.target)
+                            elif method == "epic":
+                                sample_loss, sample_metrics = epic_tcd_step(model, processor, sample, cfg, ratio)
+                            elif method == "grpo":
+                                sample_loss, sample_metrics = grpo_step(model, processor, sample, cfg, ratio)
+                            elif method in {"opsd", "opsd_fixed_teacher"}:
+                                sample_loss, sample_metrics = opsd_step(
+                                    model,
+                                    processor,
+                                    sample,
+                                    cfg,
+                                    ratio,
+                                    teacher_model=teacher_model,
+                                    ema_shadow=ema_shadow,
+                                    teacher_adapter_name=teacher_adapter_name,
+                                )
+                            elif method == "opsd_nogt":
+                                sample_loss, sample_metrics = opsd_nogt_step(
+                                    model,
+                                    processor,
+                                    sample,
+                                    cfg,
+                                    ratio,
+                                    teacher_model=teacher_model,
+                                    ema_shadow=ema_shadow,
+                                    teacher_adapter_name=teacher_adapter_name,
+                                )
+                            elif method == "offpolicy":
+                                sample_loss, sample_metrics = offpolicy_step(model, processor, sample, cfg, ratio)
+                            else:
+                                raise AssertionError(method)
+                            sample_text_log = sample_metrics.pop(STUDENT_TEXT_LOG_KEY, None)
+                            if isinstance(sample_text_log, dict):
+                                batch_text_logs.append(
+                                    {
+                                        "global_index": global_index,
+                                        "micro_idx": micro_idx,
+                                        "retry_attempt": sample_attempt,
+                                        **sample_text_log,
+                                    }
+                                )
+                            break
+                        except Exception as exc:
+                            if sample_attempt >= max_sample_retries or not is_retryable_training_error(exc):
+                                raise
+                            write_jsonl(
+                                output_dir / f"rank{rank}_skipped_samples.jsonl",
+                                {
+                                    "step": start_step + (step + 1) * global_step_unit,
+                                    "local_step": step + 1,
+                                    "rank": rank,
+                                    "method": method,
+                                    "sample_id": sample.sample_id,
+                                    "global_index": global_index,
+                                    "retention_ratio": ratio,
+                                    "retry_attempt": sample_attempt + 1,
+                                    "error": repr(exc),
+                                },
+                            )
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
                     batch_losses.append(sample_loss)
                     batch_metrics.append(sample_metrics)
                     batch_samples.append(sample)
@@ -1172,7 +1456,21 @@ def train(cfg: dict[str, Any]) -> Path:
                 ema_update_metrics: dict[str, Any] = {}
                 if accum >= grad_accum:
                     optimizer.step()
-                    if ema_teacher_enabled and ema_shadow is not None:
+                    if ema_teacher_enabled and teacher_adapter_name:
+                        update_ema_adapter(
+                            model,
+                            ema_parameter_names,
+                            source_adapter=student_adapter_name,
+                            target_adapter=teacher_adapter_name,
+                            decay=float(ema_settings["decay"]),
+                        )
+                        ema_update_metrics = {
+                            "opsd_ema_update": "updated_teacher_adapter",
+                            "opsd_ema_mode": ema_settings["mode"],
+                            "opsd_ema_decay": float(ema_settings["decay"]),
+                            "opsd_ema_teacher_adapter": teacher_adapter_name,
+                        }
+                    elif ema_teacher_enabled and ema_shadow is not None:
                         update_ema_shadow(
                             model,
                             ema_shadow,
@@ -1214,6 +1512,10 @@ def train(cfg: dict[str, Any]) -> Path:
                     "rank": rank,
                     "world_size": world_size,
                     "method": method,
+                    "prompt_mode": prompt_mode,
+                    "generation_max_new_tokens": int(get_nested(cfg, "generation.max_new_tokens", 128)),
+                    "generation_max_unparseable_new_tokens": get_nested(cfg, "generation.max_unparseable_new_tokens", None),
+                    "generation_stop_on_parse": generation_stop_on_parse(cfg),
                     "micro_batch_size": micro_batch_size,
                     "sample_id": batch_samples[0].sample_id,
                     "sample_ids": [item.sample_id for item in batch_samples],
@@ -1228,6 +1530,24 @@ def train(cfg: dict[str, Any]) -> Path:
                 }
                 if is_main_process(rank):
                     write_jsonl(log_path, row)
+                    for text_row in batch_text_logs:
+                        write_jsonl(
+                            student_text_log_path,
+                            {
+                                "step": global_step,
+                                "local_step": step,
+                                "rank": rank,
+                                "world_size": world_size,
+                                "method": method,
+                                "prompt_mode": prompt_mode,
+                                "generation_max_new_tokens": int(get_nested(cfg, "generation.max_new_tokens", 128)),
+                                "generation_max_unparseable_new_tokens": get_nested(
+                                    cfg, "generation.max_unparseable_new_tokens", None
+                                ),
+                                "generation_stop_on_parse": generation_stop_on_parse(cfg),
+                                **text_row,
+                            },
+                        )
                     print(json.dumps(row, ensure_ascii=False), flush=True)
                     if save_every > 0 and global_step % save_every == 0:
                         save_checkpoint(model, output_dir / f"step_{global_step}", ema_shadow=ema_shadow)
@@ -1241,6 +1561,7 @@ def train(cfg: dict[str, Any]) -> Path:
                     "retention_ratio": ratio,
                     "error": repr(exc),
                 }
+                write_jsonl(output_dir / f"rank{rank}_errors.jsonl", row)
                 if is_main_process(rank):
                     write_jsonl(log_path, row)
                 raise
@@ -1255,7 +1576,10 @@ def save_checkpoint(model: Any, path: Path, ema_shadow: dict[str, torch.Tensor] 
     path.mkdir(parents=True, exist_ok=True)
     model = unwrap_model(model)
     if hasattr(model, "save_pretrained"):
-        model.save_pretrained(path)
+        if hasattr(model, "peft_config"):
+            model.save_pretrained(path, save_embedding_layers=False)
+        else:
+            model.save_pretrained(path)
     else:
         torch.save(model.state_dict(), path / "pytorch_model.bin")
     save_ema_shadow(path, ema_shadow)
