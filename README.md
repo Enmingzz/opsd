@@ -192,6 +192,16 @@ Direct mode is the same except:
 export enable_thinking=False
 ```
 
+MMStar Qwen-judge postprocessing is off by default. To enable it:
+
+```bash
+export MMSTAR_QWEN_JUDGE=1
+export MMSTAR_QWEN_JUDGE_MODEL_PATH=Qwen/Qwen2.5-7B-Instruct
+export MMSTAR_QWEN_JUDGE_SCOPE=misses
+```
+
+With `MMSTAR_QWEN_JUDGE_SCOPE=misses`, the normal VLMEvalKit parser runs first, and Qwen only re-judges MMStar samples that the parser marked wrong. The judged answer is extracted from `<answer>...</answer>` first. Set `MMSTAR_QWEN_JUDGE_SCOPE=all` only if you want Qwen to re-judge every MMStar prediction with an answer tag.
+
 No-prune baseline:
 
 ```bash
@@ -383,5 +393,6 @@ Outputs:
 - `opsd512/ema_shadow.pt` is not needed for inference.
 - For POPE, `Overall` is F1. Use the `acc` column if you want accuracy.
 - The corrected VisionZip mapping is `r005 -> 1.00`, `r010 -> 0.95`, `r020 -> 0.85`, `r030 -> 0.75`.
+- MMStar Qwen-judge postprocessing is controlled by `MMSTAR_QWEN_JUDGE`. It is intended to fix answer-tag parsing failures such as `<answer>B. ...</answer>` being misread by the exact parser.
 - The cleanenv eval uses `max_pixels = 4096 * 28 * 28`. Older local scripts may still mention `16384 * 28 * 28`; do not mix those results.
 - The current exact cleanenv launcher lives outside the repo at `/project/6101803/enmingzz/ckpt_eval_trainenv/eval_one.sh`. The reproducibility-critical code changes are captured in `patches/vlmevalkit_armen51682_cleanenv_qwen25vl_lora_visionzip.patch`.

@@ -70,6 +70,245 @@ index c38d1c33..db8f34fa 100644
  
          enable_kdvz=get_bool_env("enable_kdvz", False),
          kdvz_ratio=float(os.environ.get("kdvz_ratio", 0.0)),
+diff --git a/vlmeval/dataset/image_mcq.py b/vlmeval/dataset/image_mcq.py
+index 087483d6..1b74dcae 100644
+--- a/vlmeval/dataset/image_mcq.py
++++ b/vlmeval/dataset/image_mcq.py
+@@ -1,4 +1,5 @@
+ from datetime import date
++import os
+ import re
+ import warnings
+ 
+@@ -263,6 +264,8 @@ class ImageMCQDataset(ImageBaseDataset):
+         assert model in ['chatgpt-0125', 'exact_matching', 'gpt-4-0125']
+         name_str_map = {'chatgpt-0125': 'openai', 'gpt-4-0125': 'gpt4'}
+         name_str = name_str_map[model] if model in name_str_map else model
++        if dataset == 'MMStar' and os.environ.get('MMSTAR_QWEN_JUDGE', '0').lower() in ('1', 'true', 'yes', 'y'):
++            name_str = f'{name_str}_qwenjudge'
+ 
+         if model == 'exact_matching':
+             model = None
+diff --git a/vlmeval/dataset/utils/multiple_choice.py b/vlmeval/dataset/utils/multiple_choice.py
+index 55002d5a..895946a0 100644
+--- a/vlmeval/dataset/utils/multiple_choice.py
++++ b/vlmeval/dataset/utils/multiple_choice.py
+@@ -2,7 +2,9 @@ import pandas as pd
+ from ...utils import can_infer, track_progress_rich, can_infer_lego
+ from ...smp import *
+ import numpy as np
++import os
+ import re
++import threading
+ 
+ MMB_abbrs = {
+     'coarse_perception': 'CP',
+@@ -342,6 +344,178 @@ def build_choices(item):
+     return ret
+ 
+ 
++def _env_flag(name, default=False):
++    value = os.environ.get(name, None)
++    if value is None:
++        return default
++    return str(value).strip().lower() in ('1', 'true', 'yes', 'y', 'on')
++
++
++def _mmstar_qwen_judge_enabled(dataset_name):
++    return dataset_name == 'MMStar' and _env_flag('MMSTAR_QWEN_JUDGE', False)
++
++
++def _mmstar_qwen_judge_scope():
++    return os.environ.get('MMSTAR_QWEN_JUDGE_SCOPE', 'misses').strip().lower()
++
++
++def _extract_answer_tag_text(prediction):
++    text = str(prediction)
++    matches = re.findall(r'<answer\b[^>]*>(.*?)</answer>', text, flags=re.IGNORECASE | re.DOTALL)
++    if matches:
++        answer = matches[-1]
++    elif _env_flag('MMSTAR_QWEN_JUDGE_ALLOW_OPEN_ANSWER', True):
++        match = re.search(r'<answer\b[^>]*>(.*)$', text, flags=re.IGNORECASE | re.DOTALL)
++        answer = match.group(1) if match else ''
++    else:
++        answer = ''
++    answer = re.sub(r'<[^>]+>', ' ', answer)
++    answer = answer.replace('<|im_end|>', ' ').replace('<|endoftext|>', ' ')
++    answer = re.sub(r'\s+', ' ', answer).strip()
++    return answer
++
++
++def _format_options_for_judge(choices):
++    lines = []
++    for key, value in choices.items():
++        if not pd.isna(value):
++            lines.append(f'{key}. {value}')
++    return '\n'.join(lines)
++
++
++def _format_gt_for_judge(item, choices):
++    gt = str(item['GT']).strip().upper()
++    if gt in choices and not pd.isna(choices[gt]):
++        return f'{gt}. {choices[gt]}'
++    return gt
++
++
++def _build_mmstar_qwen_judge_prompt(item, extracted_answer, choices):
++    return (
++        'You are a strict judge for a multiple-choice visual question answering benchmark.\n'
++        'You cannot see the image. Judge only whether the model answer matches the ground-truth option text, '
++        'using the question, options, ground-truth answer, and model answer below.\n'
++        'If the model answer explicitly selects the ground-truth letter, mark CORRECT.\n'
++        'If the model answer gives text semantically equivalent to the ground-truth option, mark CORRECT.\n'
++        'Otherwise mark WRONG. Do not give partial credit.\n'
++        'Return exactly one word: CORRECT or WRONG.\n\n'
++        f'Question:\n{item["question"]}\n\n'
++        f'Options:\n{_format_options_for_judge(choices)}\n\n'
++        f'Ground-truth answer:\n{_format_gt_for_judge(item, choices)}\n\n'
++        f'Model answer extracted from <answer>:\n{extracted_answer}\n\n'
++        'Judgement:'
++    )
++
++
++class _LocalQwenJudge:
++
++    def __init__(self):
++        import torch
++        from transformers import AutoModelForCausalLM, AutoTokenizer
++
++        self.model_path = os.environ.get('MMSTAR_QWEN_JUDGE_MODEL_PATH', 'Qwen/Qwen2.5-7B-Instruct')
++        self.max_new_tokens = int(os.environ.get('MMSTAR_QWEN_JUDGE_MAX_NEW_TOKENS', 16))
++        device = os.environ.get('MMSTAR_QWEN_JUDGE_DEVICE', 'cuda:0' if torch.cuda.is_available() else 'cpu')
++        dtype_name = os.environ.get('MMSTAR_QWEN_JUDGE_DTYPE', 'bfloat16' if torch.cuda.is_available() else 'float32')
++        if dtype_name == 'auto':
++            torch_dtype = 'auto'
++        else:
++            torch_dtype = getattr(torch, dtype_name)
++
++        if device == 'auto':
++            device_map = 'auto'
++        else:
++            device_map = {'': device}
++
++        self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
++        self.model = AutoModelForCausalLM.from_pretrained(
++            self.model_path,
++            trust_remote_code=True,
++            torch_dtype=torch_dtype,
++            device_map=device_map,
++        ).eval()
++        self.input_device = next(self.model.parameters()).device
++
++    def generate(self, prompt):
++        import torch
++
++        messages = [
++            {
++                'role': 'system',
++                'content': 'You are a concise and strict answer judge. Return only CORRECT or WRONG.',
++            },
++            {'role': 'user', 'content': prompt},
++        ]
++        if hasattr(self.tokenizer, 'apply_chat_template'):
++            text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
++        else:
++            text = messages[0]['content'] + '\n\n' + messages[1]['content']
++        inputs = self.tokenizer([text], return_tensors='pt').to(self.input_device)
++        with torch.inference_mode():
++            output_ids = self.model.generate(
++                **inputs,
++                max_new_tokens=self.max_new_tokens,
++                do_sample=False,
++                pad_token_id=self.tokenizer.eos_token_id,
++            )
++        new_tokens = output_ids[0][inputs.input_ids.shape[1]:]
++        return self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
++
++
++_MMSTAR_QWEN_JUDGE = None
++_MMSTAR_QWEN_JUDGE_LOCK = threading.Lock()
++
++
++def _get_mmstar_qwen_judge():
++    global _MMSTAR_QWEN_JUDGE
++    with _MMSTAR_QWEN_JUDGE_LOCK:
++        if _MMSTAR_QWEN_JUDGE is None:
++            _MMSTAR_QWEN_JUDGE = _LocalQwenJudge()
++        return _MMSTAR_QWEN_JUDGE
++
++
++def _parse_mmstar_qwen_verdict(text):
++    text = str(text).strip().upper()
++    if re.search(r'\bCORRECT\b', text):
++        return 1
++    if re.search(r'\bWRONG\b', text) or re.search(r'\bINCORRECT\b', text):
++        return 0
++    return None
++
++
++def _mmstar_qwen_judge_eval(item, original_result):
++    extracted_answer = _extract_answer_tag_text(item['prediction'])
++    if not extracted_answer:
++        return original_result
++
++    choices = build_choices(item)
++    prompt = _build_mmstar_qwen_judge_prompt(item, extracted_answer, choices)
++    try:
++        raw_judgement = _get_mmstar_qwen_judge().generate(prompt)
++    except Exception as err:
++        if _env_flag('MMSTAR_QWEN_JUDGE_STRICT', True):
++            raise
++        original_result['log'] += f' MMStar Qwen judge failed: {type(err).__name__}: {err}. '
++        return original_result
++
++    verdict = _parse_mmstar_qwen_verdict(raw_judgement)
++    if verdict is None:
++        if _env_flag('MMSTAR_QWEN_JUDGE_STRICT', True):
++            raise RuntimeError(f'Cannot parse MMStar Qwen judge output: {raw_judgement}')
++        original_result['log'] += (
++            f' MMStar Qwen judge unparseable. Extracted answer: {extracted_answer}. '
++            f'Judge output: {raw_judgement}. '
++        )
++        return original_result
++
++    original_result['hit'] = verdict
++    original_result['log'] += (
++        f' MMStar Qwen judge enabled. Extracted <answer>: {extracted_answer}. '
++        f'GT: {_format_gt_for_judge(item, choices)}. Judge output: {raw_judgement}. '
++    )
++    return original_result
++
++
+ def prefetch_answer(item):
+     choices = build_choices(item)
+     return can_infer(item['prediction'], choices)
+@@ -424,9 +598,13 @@ def eval_vanilla(model, item, dataset_name=None):
+     res = extract_answer_from_item(model, item, dataset_name=dataset_name)
+     opt, match_log = res['opt'], res['log']
+     if opt == item['GT']:
+-        return dict(hit=1, log=f'Match Log: {match_log}. ')
++        result = dict(hit=1, log=f'Match Log: {match_log}. ')
+     else:
+-        return dict(hit=0, log=f'Match Log: {match_log}. ')
++        result = dict(hit=0, log=f'Match Log: {match_log}. ')
++    qwen_scope = _mmstar_qwen_judge_scope()
++    if _mmstar_qwen_judge_enabled(dataset_name) and (qwen_scope == 'all' or result['hit'] == 0):
++        result = _mmstar_qwen_judge_eval(item, result)
++    return result
+ 
+ 
+ # For Circular Evaluation
+@@ -469,6 +647,10 @@ def mcq_vanilla_eval(model, data, meta, nproc, result_file, dataset_name=None):
+     if osp.exists(result_file):
+         result = load(result_file)
+     answer_map = {i: c for i, c in zip(meta['index'], meta['answer'])}
++    if _mmstar_qwen_judge_enabled(dataset_name) and nproc != 1:
++        logger = get_logger('Evaluation')
++        logger.warning('MMSTAR_QWEN_JUDGE is enabled; forcing MCQ evaluation nproc=1 for local Qwen judge safety.')
++        nproc = 1
+ 
+     if 'MMMU' in dataset_name:
+         data = MMMU_preproc(data)
 diff --git a/vlmeval/vlm/qwen2_vl/model.py b/vlmeval/vlm/qwen2_vl/model.py
 index 75e76f07..77a6ae7c 100644
 --- a/vlmeval/vlm/qwen2_vl/model.py
