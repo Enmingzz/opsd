@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import random
+import re
 import sys
 from pathlib import Path
 from typing import Any, Iterable
@@ -12,8 +14,10 @@ from PIL import Image
 
 from .prompting import (
     FormattedAOKVQASample,
+    THINKING_INSTRUCTION,
     build_reasoning_prompt,
     build_target,
+    is_thinking_prompt_mode,
     option_index_to_letter,
     strip_image_tokens,
 )
@@ -99,6 +103,57 @@ def _extract_image(record: dict[str, Any]) -> Any:
     return image
 
 
+def _extract_answer_body(answer: str) -> str:
+    match = re.search(r"<answer>\s*(.*?)\s*</answer>", str(answer or ""), flags=re.IGNORECASE | re.DOTALL)
+    return match.group(1).strip() if match else str(answer or "").strip()
+
+
+def _extract_optional_correct_letter(answer: str) -> str:
+    body = _extract_answer_body(answer)
+    match = re.search(r"\b([ABCD])\s*[\.)]", body, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+    match = re.fullmatch(r"\s*([ABCD])\s*", body, flags=re.IGNORECASE)
+    return match.group(1).upper() if match else ""
+
+
+def _generic_prompt(question: str, prompt_mode: str | bool | None = None) -> str:
+    question = strip_image_tokens(question)
+    if is_thinking_prompt_mode(prompt_mode):
+        return f"<image>\n\n{question}\n\n{THINKING_INSTRUCTION}"
+    return f"<image>\n\n{question}"
+
+
+def normalize_reasoning_answer_jsonl_sample(
+    record: Any,
+    index: int = 0,
+    prompt_mode: str | bool | None = None,
+) -> FormattedAOKVQASample:
+    raw = _as_dict(record)
+    question = strip_image_tokens(str(_first_present(raw, ("question", "raw_question", "prompt"), "") or ""))
+    if not question:
+        raise ValueError(f"JSONL sample is missing a non-empty question field: keys={sorted(raw)}")
+    target = str(_first_present(raw, ("answer", "ground_truth", "target", "processed_target"), "") or "").strip()
+    if not target:
+        raise ValueError(f"JSONL sample is missing a non-empty answer/target field: keys={sorted(raw)}")
+    sample_id = str(_first_present(raw, ("sample_id", "id", "question_id"), index))
+    correct_letter = _extract_optional_correct_letter(target)
+    correct_index = ord(correct_letter) - ord("A") if correct_letter else -1
+    reasoning = str(_first_present(raw, ("reasoning", "rationale"), "") or "").strip()
+    return FormattedAOKVQASample(
+        sample_id=sample_id,
+        image=_extract_image(raw),
+        question=question,
+        options=list(raw.get("choices") or raw.get("options") or []),
+        correct_index=correct_index,
+        correct_letter=correct_letter,
+        reasoning=reasoning,
+        prompt=_generic_prompt(question, prompt_mode=prompt_mode),
+        target=target,
+        raw=raw,
+    )
+
+
 def normalize_aokvqa_sample(
     record: Any,
     index: int = 0,
@@ -133,7 +188,29 @@ def load_aokvqa_dataset(
     limit: int = 0,
     seed: int = 42,
     prompt_mode: str | bool | None = None,
+    shuffle: bool = True,
 ) -> list[FormattedAOKVQASample]:
+    dataset_path = Path(str(dataset_name))
+    if dataset_path.exists() and dataset_path.suffix.lower() == ".jsonl":
+        normalized: list[FormattedAOKVQASample] = []
+        with dataset_path.open("r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f):
+                if not line.strip():
+                    continue
+                normalized.append(
+                    normalize_reasoning_answer_jsonl_sample(
+                        json.loads(line),
+                        index=line_no,
+                        prompt_mode=prompt_mode,
+                    )
+                )
+        if shuffle:
+            rng = random.Random(int(seed))
+            rng.shuffle(normalized)
+        if limit and limit > 0:
+            normalized = normalized[: int(limit)]
+        return normalized
+
     try:
         from datasets import load_dataset
     except Exception as exc:
@@ -145,8 +222,9 @@ def load_aokvqa_dataset(
         ds = load_dataset(dataset_name, split=split)
         for idx, record in enumerate(ds):
             normalized.append(normalize_aokvqa_sample(record, index=len(normalized), prompt_mode=prompt_mode))
-    rng = random.Random(int(seed))
-    rng.shuffle(normalized)
+    if shuffle:
+        rng = random.Random(int(seed))
+        rng.shuffle(normalized)
     if limit and limit > 0:
         normalized = normalized[: int(limit)]
     return normalized

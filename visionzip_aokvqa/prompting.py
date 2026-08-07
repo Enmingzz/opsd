@@ -110,6 +110,32 @@ After reading the reference solution above, make sure you truly understand the r
 {thinking_instruction}"""
 
 
+OPSD_TEACHER_OPEN_PROMPT_TEMPLATE = """<image>
+
+{question}
+
+Here is a reference solution to this problem:
+=== Reference Solution Begin ===
+{reference_solution}
+=== Reference Solution End ===
+
+After reading the reference solution above, make sure you truly understand the reasoning behind each step - do not copy or paraphrase it. Now, using your own words and independent reasoning, derive the same final answer to the problem above. Think step by step, explore different approaches, and do not be afraid to backtrack or reconsider if something does not work out."""
+
+
+OPSD_TEACHER_OPEN_THINKING_PROMPT_TEMPLATE = """<image>
+
+{question}
+
+Here is a reference solution to this problem:
+=== Reference Solution Begin ===
+{reference_solution}
+=== Reference Solution End ===
+
+After reading the reference solution above, make sure you truly understand the reasoning behind each step - do not copy or paraphrase it. Now, using your own words and independent reasoning, derive the same final answer to the problem above. Think step by step, explore different approaches, and do not be afraid to backtrack or reconsider if something does not work out.
+
+{thinking_instruction}"""
+
+
 @dataclass
 class FormattedAOKVQASample:
     sample_id: str
@@ -203,20 +229,27 @@ def build_opsd_teacher_prompt(
 ) -> str:
     """Build the privileged teacher prompt used by the official OPSD setup."""
 
-    if len(options) != 4:
-        raise ValueError(f"A-OKVQA teacher prompt requires exactly four options, got {len(options)}.")
+    if len(options) not in {0, 4}:
+        raise ValueError(f"OPSD teacher prompt requires either zero or four options, got {len(options)}.")
     clean_options = [str(option).strip() for option in options]
     reference = str(reference_solution or "").strip()
     if not reference:
         reference = "Reasoning: The correct option is supported by the image and question."
     mode = normalize_prompt_mode(prompt_mode, enable_thinking=enable_thinking)
-    template = OPSD_TEACHER_THINKING_PROMPT_TEMPLATE if mode == "thinking" else OPSD_TEACHER_PROMPT_TEMPLATE
+    if clean_options:
+        template = OPSD_TEACHER_THINKING_PROMPT_TEMPLATE if mode == "thinking" else OPSD_TEACHER_PROMPT_TEMPLATE
+    else:
+        template = (
+            OPSD_TEACHER_OPEN_THINKING_PROMPT_TEMPLATE
+            if mode == "thinking"
+            else OPSD_TEACHER_OPEN_PROMPT_TEMPLATE
+        )
     return template.format(
         question=strip_image_tokens(question),
-        option_0=clean_options[0],
-        option_1=clean_options[1],
-        option_2=clean_options[2],
-        option_3=clean_options[3],
+        option_0=clean_options[0] if clean_options else "",
+        option_1=clean_options[1] if clean_options else "",
+        option_2=clean_options[2] if clean_options else "",
+        option_3=clean_options[3] if clean_options else "",
         reference_solution=reference,
         thinking_instruction=THINKING_INSTRUCTION,
     )

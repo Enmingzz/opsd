@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import hashlib
 import json
+import math
 import os
 import random
+import shutil
 import sys
 import time
 from contextlib import contextmanager, nullcontext
@@ -23,12 +27,75 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from opsd.visionzip_aokvqa.aokvqa import FormattedAOKVQASample, load_aokvqa_dataset
+from opsd.visionzip_aokvqa.data_integrity import verify_decontaminated_training_data
+from opsd.visionzip_aokvqa.epic_official import (
+    UPSTREAM_COMMIT as EPIC_UPSTREAM_COMMIT,
+    UPSTREAM_REPOSITORY as EPIC_UPSTREAM_REPOSITORY,
+    UPSTREAM_TRAINER_SHA256 as EPIC_UPSTREAM_TRAINER_SHA256,
+    enable_visual_checkpoint_input_grads,
+    extract_official_epic_response_logits,
+    sample_official_epic_curriculum,
+)
 from opsd.visionzip_aokvqa.losses import (
+    compute_budget_gradient_alignment,
+    compute_budget_gradient_geometry,
+    compute_budget_gradient_projection_geometry,
+    compute_teacher_gradient_budget_consensus,
+    compute_teacher_mass_on_student_support,
+    compute_budget_contrastive_per_token_kl,
     compute_forward_kl,
     compute_generalized_jsd,
+    compute_per_token_kl,
     compute_sequence_logprob,
     compute_token_ce,
     grpo_policy_loss,
+)
+from opsd.visionzip_aokvqa.native_budget_weighting import (
+    budget_gradient_aligned_bridge_gate,
+    budget_gradient_consensus_weights,
+    budget_counterfactual_teachability_weights,
+    budget_tangent_residual_weights,
+    budget_residual_hardness_weights,
+    budget_contrastive_gate,
+    budget_consistent_rank_weights,
+    counterfactual_budget_bridge,
+    counterfactual_cancellation_strength,
+    counterfactual_gradient_residual_gate,
+    counterfactual_rescue_amplification_weights,
+    counterfactual_teachability_mixture_weights,
+    counterfactual_teachability_modulation_weights,
+    conditional_rescue_residual_weights,
+    generated_token_valid_mask,
+    grouped_kl_mass_weights,
+    native_budget_robustness_weights,
+    normalize_candidate_loss_mass,
+    symmetric_teacher_gap_stability_weights,
+    teacher_gap_persistence_weights,
+)
+from opsd.visionzip_aokvqa.paired_sampling import (
+    paired_retention_ratio,
+    paired_rollout_seed,
+    torch_seed_scope,
+)
+from opsd.visionzip_aokvqa.phase_ratio_scaling import (
+    resolve_phase_ratio_scale,
+    validate_phase_ratio_scaling_config,
+)
+from opsd.visionzip_aokvqa.trajectory_weighting import (
+    RobustnessGatedCurriculumState,
+    SensitivityFrontierState,
+    direct_inverse_sensitivity_probability_weights,
+    effective_batch_local_objective,
+    inverse_sensitivity_probability_weights,
+    ratio_group_fraction_probability_weights,
+    residualized_budget_sensitivity,
+    robustness_gated_curriculum_weights,
+    sensitivity_frontier_weights,
+    softmax_inverse_sensitivity_probability_weights,
+    teacher_gap_mass_robustness,
+    trajectory_priority_downweights,
+    trajectory_rank_downweights,
+    trajectory_sigmoid_downweights,
 )
 from opsd.visionzip_aokvqa.prompting import build_opsd_teacher_prompt, normalize_prompt_mode, parse_final_answer
 from opsd.visionzip_aokvqa.qwen_wrapper import (
@@ -41,19 +108,38 @@ from opsd.visionzip_aokvqa.qwen_wrapper import (
     generate_pruned,
     load_qwen_model_and_processor,
     model_input_subset,
+    normalize_pruning_method,
     primary_device,
     teacher_adapter_disabled,
 )
 
 
 OUTPUT_ROOT = Path("outputs/visionzip_aokvqa_reasoning")
-METHODS = ("sft", "grpo", "epic", "opsd", "opsd_fixed_teacher", "opsd_nogt", "offpolicy")
+METHODS = (
+    "sft",
+    "grpo",
+    "epic",
+    "epic_official",
+    "opsd",
+    "opsd_fixed_teacher",
+    "opsd_nogt",
+    "opsd_gt_prompt",
+    "offpolicy",
+)
 OPSD_DYNAMIC_TEACHER_ALIASES = {"", "dynamic", "dynamic_shared_current", "shared_current", "latest"}
 OPSD_FIXED_TEACHER_ALIASES = {"fixed_base", "fixed_teacher", "legacy_fixed_base", "base"}
 OPSD_EMA_TEACHER_ALIASES = {"ema", "ema_teacher", "ema_shared", "ema_reference"}
 OPSD_EXTERNAL_TEACHER_ALIASES = {"external", "external_adapter", "teacher_adapter", "sft_teacher"}
 DEFAULT_TEACHER_ADAPTER_NAME = "teacher"
 STUDENT_TEXT_LOG_KEY = "_student_text_log"
+ROLLOUT_CACHE_KEY = "_effective_batch_rollout_cache"
+EFFECTIVE_BATCH_PROBABILITY_MODES = {
+    "jsd_over_current_kl_batch",
+    "jsd_over_current_kl_direct_inverse_batch",
+    "jsd_over_current_kl_softmax_batch",
+    "jsd_over_step0_kl_batch",
+    "ratio_group_counterfactual_teachability_batch",
+}
 
 
 def load_yaml(path: str | Path) -> dict[str, Any]:
@@ -92,6 +178,17 @@ def set_nested(cfg: dict[str, Any], dotted: str, value: Any) -> None:
     cur[parts[-1]] = value
 
 
+def verify_decontaminated_dataset(cfg: dict[str, Any]) -> dict[str, Any] | None:
+    manifest_value = str(get_nested(cfg, "dataset.decontamination_manifest", "") or "").strip()
+    if not manifest_value:
+        return None
+    return verify_decontaminated_training_data(
+        train_path=str(get_nested(cfg, "dataset.name")),
+        manifest_path=manifest_value,
+        expected_rows=int(get_nested(cfg, "dataset.expected_rows", 10_000)),
+    )
+
+
 def grpo_group_advantages(rewards: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     rewards = rewards.float().flatten()
     if rewards.numel() == 0:
@@ -116,6 +213,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--enable_thinking", action="store_true")
     p.add_argument("--max_new_tokens", type=int, default=None)
     p.add_argument("--attn_implementation", default=None)
+    p.add_argument("--resume_from_checkpoint", default="")
     return p
 
 
@@ -153,6 +251,8 @@ def resolve_config(args: argparse.Namespace) -> dict[str, Any]:
         set_nested(cfg, "generation.max_new_tokens", int(args.max_new_tokens))
     if args.attn_implementation:
         set_nested(cfg, "training.attn_implementation", args.attn_implementation)
+    if args.resume_from_checkpoint:
+        set_nested(cfg, "checkpointing.resume_from", args.resume_from_checkpoint)
     return cfg
 
 
@@ -276,6 +376,19 @@ def image_pixel_bounds_from_config(cfg: dict[str, Any]) -> tuple[int | None, int
     )
 
 
+def configure_pruning_backend(cfg: dict[str, Any]) -> str:
+    method = normalize_pruning_method(str(get_nested(cfg, "pruning.method", "visionzip") or "visionzip"))
+    os.environ["OPSD_PRUNING_METHOD"] = method
+    if method == "random":
+        os.environ["OPSD_RANDOM_PRUNER_SEED"] = str(
+            int(get_nested(cfg, "pruning.random_seed", get_nested(cfg, "training.seed", 42)))
+        )
+    if method == "fastv":
+        os.environ["OPSD_FASTV_TOKENS_ANCHOR"] = str(get_nested(cfg, "pruning.fastv_tokens_anchor", "all") or "all")
+        os.environ["OPSD_FASTV_TOKENS_PRUNE_LAYERS"] = str(get_nested(cfg, "pruning.fastv_tokens_prune_layers", "4") or "4")
+    return method
+
+
 def write_jsonl(path: Path, row: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
@@ -289,6 +402,8 @@ def build_student_text_log(
     generated_tokens: int,
     teacher_source: str = "",
     teacher_strategy: str = "",
+    rollout_decoder: str = "",
+    rollout_use_cache: bool | None = None,
 ) -> dict[str, Any]:
     parsed = parse_final_answer(generated_text)
     return {
@@ -303,6 +418,8 @@ def build_student_text_log(
         "generated_tokens": int(generated_tokens),
         "teacher_source": teacher_source,
         "opsd_teacher_strategy": teacher_strategy,
+        "rollout_decoder": rollout_decoder,
+        "rollout_use_cache": rollout_use_cache,
         "student_text": generated_text,
     }
 
@@ -329,6 +446,7 @@ def sample_retention_ratio(
     rng: random.Random,
     progress_step: int | None = None,
     total_steps: int | None = None,
+    sample_id: str | None = None,
 ) -> float:
     ratios = [float(x) for x in get_nested(cfg, "pruning.train_retention_ratios", [0.1, 0.2, 0.3, 0.4])]
     schedule = str(get_nested(cfg, "pruning.retention_ratio_schedule", "random") or "random").strip().lower()
@@ -336,9 +454,45 @@ def sample_retention_ratio(
         if progress_step is None or total_steps is None or total_steps <= 0:
             raise ValueError("progressive retention ratio scheduling requires progress_step and total_steps.")
         ordered = sorted(ratios, reverse=True)
+        phase_end_steps_raw = get_nested(cfg, "pruning.progressive_phase_end_steps", None)
+        if phase_end_steps_raw is not None:
+            phase_end_steps = [int(value) for value in phase_end_steps_raw]
+            if len(phase_end_steps) != len(ordered):
+                raise ValueError(
+                    "pruning.progressive_phase_end_steps must match the number of retention ratios; "
+                    f"got {len(phase_end_steps)} boundaries for {len(ordered)} ratios."
+                )
+            if any(end <= 0 for end in phase_end_steps) or any(
+                left >= right for left, right in zip(phase_end_steps, phase_end_steps[1:])
+            ):
+                raise ValueError("pruning.progressive_phase_end_steps must be positive and strictly increasing.")
+            if phase_end_steps[-1] != int(total_steps):
+                raise ValueError(
+                    "The final progressive phase boundary must equal training.max_steps; "
+                    f"got {phase_end_steps[-1]} vs {total_steps}."
+                )
+            for stage, end_step in enumerate(phase_end_steps):
+                if int(progress_step) < end_step:
+                    return float(ordered[stage])
+            return float(ordered[-1])
         progress = min(max(float(progress_step) / float(total_steps), 0.0), 0.999999)
         stage = min(len(ordered) - 1, int(progress * len(ordered)))
         return float(ordered[stage])
+    if schedule == "paired_deterministic_uniform":
+        if progress_step is None or sample_id is None:
+            raise ValueError(
+                "paired_deterministic_uniform requires progress_step/global_index and sample_id."
+            )
+        weights_raw = get_nested(cfg, "pruning.train_retention_ratio_weights", None)
+        if weights_raw is not None:
+            raise ValueError("paired_deterministic_uniform does not accept ratio weights.")
+        return paired_retention_ratio(
+            ratios,
+            seed=int(get_nested(cfg, "paired_sampling.ratio_seed", get_nested(cfg, "training.seed", 42))),
+            global_index=int(progress_step),
+            sample_id=str(sample_id),
+            namespace=str(get_nested(cfg, "paired_sampling.namespace", "opsd_pair_v1")),
+        )
     if schedule not in {"random", "weighted_random", "uniform_random"}:
         raise ValueError(f"Unsupported pruning.retention_ratio_schedule={schedule!r}.")
     weights_raw = get_nested(cfg, "pruning.train_retention_ratio_weights", None)
@@ -419,10 +573,10 @@ def resolve_ema_update_settings(cfg: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Specify only one of opsd.ema_decay (official) or opsd.ema_alpha (legacy ablation).")
     if has_decay:
         decay = float(raw_decay)
-        if decay <= 0.0 or decay >= 1.0:
-            raise ValueError(f"opsd.ema_decay must be in (0, 1), got {decay}.")
+        if decay <= 0.0 or decay > 1.0:
+            raise ValueError(f"opsd.ema_decay must be in (0, 1], got {decay}.")
         return {
-            "mode": "official_decay",
+            "mode": "official_decay_freeze" if decay == 1.0 else "official_decay",
             "decay": decay,
             "alpha": 1.0 - decay,
             "lazy_init": bool(get_nested(cfg, "opsd.ema_lazy_init", True)),
@@ -452,8 +606,10 @@ def update_ema_teacher(source_model: Any, target_model: Any, names: list[str], d
     source_params = dict(unwrap_model(source_model).named_parameters())
     target_params = dict(unwrap_model(target_model).named_parameters())
     decay = float(decay)
-    if decay < 0.0 or decay >= 1.0:
-        raise ValueError(f"EMA decay must be in [0, 1), got {decay}.")
+    if decay < 0.0 or decay > 1.0:
+        raise ValueError(f"EMA decay must be in [0, 1], got {decay}.")
+    if decay == 1.0:
+        return
     with torch.no_grad():
         for name in names:
             target_params[name].data.mul_(decay).add_(source_params[name].detach().data, alpha=1.0 - decay)
@@ -475,8 +631,10 @@ def update_ema_adapter(
 ) -> None:
     params = dict(unwrap_model(model).named_parameters())
     decay = float(decay)
-    if decay < 0.0 or decay >= 1.0:
-        raise ValueError(f"EMA decay must be in [0, 1), got {decay}.")
+    if decay < 0.0 or decay > 1.0:
+        raise ValueError(f"EMA decay must be in [0, 1], got {decay}.")
+    if decay == 1.0:
+        return
     missing: list[str] = []
     with torch.no_grad():
         for source_name in names:
@@ -515,8 +673,10 @@ def load_ema_shadow(path: str | Path, model: Any, names: list[str]) -> dict[str,
 def update_ema_shadow(model: Any, shadow: dict[str, torch.Tensor], names: list[str], decay: float) -> None:
     params = dict(unwrap_model(model).named_parameters())
     decay = float(decay)
-    if decay < 0.0 or decay >= 1.0:
-        raise ValueError(f"EMA decay must be in [0, 1), got {decay}.")
+    if decay < 0.0 or decay > 1.0:
+        raise ValueError(f"EMA decay must be in [0, 1], got {decay}.")
+    if decay == 1.0:
+        return
     with torch.no_grad():
         for name in names:
             shadow[name].mul_(decay).add_(params[name].detach().data, alpha=1.0 - decay)
@@ -546,6 +706,33 @@ def temporary_eval(model: Any):
     finally:
         if was_training:
             model.train()
+
+
+@contextmanager
+def temporary_cached_rollout(model: Any):
+    """Match inference-time model state while generating cached OPSD rollouts."""
+
+    target = unwrap_model(model)
+    model_config = getattr(target, "config", None)
+    generation_config = getattr(target, "generation_config", None)
+    original_model_use_cache = getattr(model_config, "use_cache", None)
+    original_generation_use_cache = getattr(generation_config, "use_cache", None)
+    with temporary_eval(model):
+        if model_config is not None:
+            model_config.use_cache = True
+        if generation_config is not None:
+            generation_config.use_cache = True
+        try:
+            if model_config is not None and model_config.use_cache is not True:
+                raise RuntimeError("Failed to enable model KV cache for cached OPSD rollout.")
+            if generation_config is not None and generation_config.use_cache is not True:
+                raise RuntimeError("Failed to enable generation KV cache for cached OPSD rollout.")
+            yield
+        finally:
+            if model_config is not None:
+                model_config.use_cache = original_model_use_cache
+            if generation_config is not None:
+                generation_config.use_cache = original_generation_use_cache
 
 
 def save_ema_shadow(path: Path, shadow: dict[str, torch.Tensor] | None) -> None:
@@ -717,6 +904,8 @@ def epic_tcd_step(
     sample: FormattedAOKVQASample,
     cfg: dict[str, Any],
     retention_ratio: float,
+    teacher_retention_override: float | str | None = None,
+    official_logit_alignment: bool = False,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """EPIC-style token consistency distillation adapted to Qwen2.5-VL/VisionZip.
 
@@ -750,8 +939,21 @@ def epic_tcd_step(
     student_prompt_len = int(student_pruned["metadata"]["student_prompt_len"])
     student_logits = extract_generated_logits(student_outputs.logits, student_prompt_len, int(answer_ids.numel()))
     student_loss_sft = compute_token_ce(student_logits, answer_ids)
+    student_distillation_logits = (
+        extract_official_epic_response_logits(
+            student_outputs.logits,
+            response_start=student_prompt_len,
+            response_count=int(answer_ids.numel()),
+        )
+        if official_logit_alignment
+        else student_logits
+    )
 
-    teacher_ratio = epic_teacher_retention_ratio(cfg, retention_ratio)
+    teacher_ratio = (
+        epic_teacher_retention_ratio(cfg, retention_ratio)
+        if teacher_retention_override is None
+        else teacher_retention_override
+    )
     with torch.no_grad():
         if teacher_ratio == "full" or float(teacher_ratio) >= 1.0:
             teacher_outputs = model(**model_input_subset(full_inputs), use_cache=False)
@@ -773,10 +975,18 @@ def epic_tcd_step(
                 "teacher_num_full_visual_tokens": int(teacher_pruned["metadata"].get("num_full_visual_tokens", 0)),
                 "teacher_num_kept_visual_tokens": int(teacher_pruned["metadata"].get("num_kept_visual_tokens", 0)),
             }
-    teacher_logits = extract_generated_logits(teacher_outputs.logits, teacher_prompt_len, int(answer_ids.numel())).detach()
+    teacher_logits = (
+        extract_official_epic_response_logits(
+            teacher_outputs.logits,
+            response_start=teacher_prompt_len,
+            response_count=int(answer_ids.numel()),
+        )
+        if official_logit_alignment
+        else extract_generated_logits(teacher_outputs.logits, teacher_prompt_len, int(answer_ids.numel()))
+    ).detach()
     distillation_loss = compute_forward_kl(
         teacher_logits,
-        student_logits,
+        student_distillation_logits,
         temperature=float(get_nested(cfg, "epic.temperature", 1.0)),
     )
     alpha = float(get_nested(cfg, "epic.alpha", 0.5))
@@ -790,6 +1000,12 @@ def epic_tcd_step(
         "student_loss_sft": float(student_loss_sft.detach().cpu()),
         "epic_alpha": alpha,
         "epic_temperature": float(get_nested(cfg, "epic.temperature", 1.0)),
+        "epic_logit_alignment": (
+            "official_unshifted_response_label_positions"
+            if official_logit_alignment
+            else "legacy_causal_target_positions"
+        ),
+        "epic_distilled_positions": int(student_distillation_logits.shape[0]),
         "epic_reference": "ZichenWen1/EPIC TCD adapted to Qwen2.5-VL/VisionZip",
         **teacher_meta,
         **numeric_metadata(student_pruned["metadata"]),
@@ -805,28 +1021,78 @@ def opsd_nogt_step(
     teacher_model: Any | None = None,
     ema_shadow: dict[str, torch.Tensor] | None = None,
     teacher_adapter_name: str = "",
+    teacher_uses_ground_truth: bool = False,
+    rollout_seed: int | None = None,
+    progress_step: int | None = None,
+    total_steps: int | None = None,
+    fixed_rollout_token_ids: torch.Tensor | None = None,
+    fixed_rollout_text: str | None = None,
+    fixed_rollout_metadata: dict[str, Any] | None = None,
+    capture_rollout: bool = False,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     device = primary_device(model)
     prompt_inputs = encode_prompt(processor, sample, image_root=get_nested(cfg, "dataset.image_root", ""), device=device)
-    gen_ids, gen_text, _ = generate_pruned(
-        model,
-        processor,
-        prompt_inputs,
-        retention_ratio,
-        max_new_tokens=int(get_nested(cfg, "generation.max_new_tokens", 128)),
-        do_sample=generation_do_sample(cfg),
-        temperature=float(get_nested(cfg, "generation.temperature", 0.7)),
-        top_p=float(get_nested(cfg, "generation.top_p", 0.9)),
-        top_k=generation_top_k(cfg),
-        allow_embedding_fallback=bool(get_nested(cfg, "pruning.allow_embedding_fallback", False)),
-        manual_decode=bool(get_nested(cfg, "generation.manual_pruned_generate", True)),
-        max_unparseable_tokens=generation_max_unparseable_tokens(cfg),
-        stop_on_parse=generation_stop_on_parse(cfg),
-    )
+    manual_rollout = bool(get_nested(cfg, "generation.manual_pruned_generate", True))
+    require_kv_cache = bool(get_nested(cfg, "generation.require_kv_cache", False))
+    if require_kv_cache and manual_rollout:
+        raise ValueError("generation.require_kv_cache=true is incompatible with manual_pruned_generate=true.")
+    if fixed_rollout_token_ids is not None:
+        if fixed_rollout_text is None:
+            raise ValueError("Fixed rollout token IDs require the matching generated text.")
+        gen_ids = fixed_rollout_token_ids.detach().to(device=device, dtype=torch.long).reshape(-1)
+        gen_text = str(fixed_rollout_text)
+        generation_meta = dict(fixed_rollout_metadata or {})
+        generation_meta["rollout_decoder"] = "effective_batch_fixed_prefix_replay"
+        rollout_decoder = "effective_batch_fixed_prefix_replay"
+    else:
+        rollout_decoder = "manual_no_cache" if manual_rollout else "hf_generate_kv_cache"
+        rollout_context = nullcontext() if manual_rollout else temporary_cached_rollout(model)
+        with torch_seed_scope(rollout_seed, device), rollout_context:
+            gen_ids, gen_text, generation_meta = generate_pruned(
+                model,
+                processor,
+                prompt_inputs,
+                retention_ratio,
+                max_new_tokens=int(get_nested(cfg, "generation.max_new_tokens", 128)),
+                do_sample=generation_do_sample(cfg),
+                temperature=float(get_nested(cfg, "generation.temperature", 0.7)),
+                top_p=float(get_nested(cfg, "generation.top_p", 0.9)),
+                top_k=generation_top_k(cfg),
+                allow_embedding_fallback=bool(get_nested(cfg, "pruning.allow_embedding_fallback", False)),
+                manual_decode=manual_rollout,
+                max_unparseable_tokens=generation_max_unparseable_tokens(cfg),
+                stop_on_parse=generation_stop_on_parse(cfg),
+                sample_id=sample.sample_id,
+                question=sample.question,
+            )
+    rollout_decoder = str(generation_meta.get("rollout_decoder", rollout_decoder))
     if gen_ids.numel() == 0:
         raise RuntimeError("OPSD student generated zero tokens.")
-    seq_inputs = sequence_inputs_from_prompt(prompt_inputs, gen_ids)
-    prompt_len = int(prompt_inputs["input_ids"].shape[1])
+    student_seq_inputs = sequence_inputs_from_prompt(prompt_inputs, gen_ids)
+    student_prompt_len = int(prompt_inputs["input_ids"].shape[1])
+    if teacher_uses_ground_truth:
+        teacher_prompt = build_opsd_teacher_prompt(
+            sample.question,
+            sample.options,
+            sample.target,
+            prompt_mode=prompt_mode_from_config(cfg),
+        )
+        teacher_prompt_inputs = encode_prompt_text(
+            processor,
+            sample,
+            teacher_prompt,
+            image_root=get_nested(cfg, "dataset.image_root", ""),
+            device=device,
+        )
+        teacher_seq_inputs = sequence_inputs_from_prompt(teacher_prompt_inputs, gen_ids)
+        teacher_prompt_len = int(teacher_prompt_inputs["input_ids"].shape[1])
+        teacher_context = "ground_truth_reference_solution"
+        source_context = "privileged_gt_prompt"
+    else:
+        teacher_seq_inputs = student_seq_inputs
+        teacher_prompt_len = student_prompt_len
+        teacher_context = "student_prompt_no_ground_truth"
+        source_context = "no_gt"
 
     raw_teacher_strategy = str(get_nested(cfg, "opsd.teacher_strategy", "") or "").strip()
     explicit_teacher_strategy = (
@@ -841,62 +1107,1314 @@ def opsd_nogt_step(
     )
     if teacher_strategy == "external":
         with torch.no_grad():
-            teacher_outputs = teacher_model(**model_input_subset(seq_inputs), use_cache=False)
-        teacher_source = "external_no_gt_full_token"
+            teacher_outputs = teacher_model(**model_input_subset(teacher_seq_inputs), use_cache=False)
+        teacher_source = f"external_{source_context}_full_token"
     elif teacher_strategy == "external_adapter":
         with torch.no_grad(), active_lora_adapter(model, teacher_adapter_name), temporary_eval(model):
-            teacher_outputs = model(**model_input_subset(seq_inputs), use_cache=False)
-        teacher_source = "external_adapter_no_gt_full_token"
+            teacher_outputs = model(**model_input_subset(teacher_seq_inputs), use_cache=False)
+        teacher_source = f"external_adapter_{source_context}_full_token"
     elif teacher_strategy == "ema":
         if teacher_model is not None:
             with torch.no_grad():
-                teacher_outputs = teacher_model(**model_input_subset(seq_inputs), use_cache=False)
-            teacher_source = "ema_no_gt_full_token"
+                teacher_outputs = teacher_model(**model_input_subset(teacher_seq_inputs), use_cache=False)
+            teacher_source = f"ema_{source_context}_full_token"
         elif teacher_adapter_name:
             with torch.no_grad(), active_lora_adapter(model, teacher_adapter_name), temporary_eval(model):
-                teacher_outputs = model(**model_input_subset(seq_inputs), use_cache=False)
-            teacher_source = "ema_adapter_no_gt_full_token"
+                teacher_outputs = model(**model_input_subset(teacher_seq_inputs), use_cache=False)
+            teacher_source = f"ema_adapter_{source_context}_full_token"
         elif ema_shadow is not None:
             with torch.no_grad(), swapped_ema_parameters(model, ema_shadow), temporary_eval(model):
-                teacher_outputs = model(**model_input_subset(seq_inputs), use_cache=False)
-            teacher_source = "ema_lora_shadow_no_gt_full_token"
+                teacher_outputs = model(**model_input_subset(teacher_seq_inputs), use_cache=False)
+            teacher_source = f"ema_lora_shadow_{source_context}_full_token"
         else:
             with torch.no_grad(), temporary_eval(model):
-                teacher_outputs = model(**model_input_subset(seq_inputs), use_cache=False)
-            teacher_source = "ema_uninitialized_current_no_gt_full_token"
+                teacher_outputs = model(**model_input_subset(teacher_seq_inputs), use_cache=False)
+            teacher_source = f"ema_uninitialized_current_{source_context}_full_token"
     elif teacher_strategy == "dynamic_shared_current":
         with torch.no_grad(), temporary_eval(model):
-            teacher_outputs = model(**model_input_subset(seq_inputs), use_cache=False)
-        teacher_source = "dynamic_shared_current_no_gt_full_token"
+            teacher_outputs = model(**model_input_subset(teacher_seq_inputs), use_cache=False)
+        teacher_source = f"dynamic_shared_current_{source_context}_full_token"
     elif teacher_strategy == "fixed_base":
         with torch.no_grad(), teacher_adapter_disabled(model):
-            teacher_outputs = model(**model_input_subset(seq_inputs), use_cache=False)
-        teacher_source = "base_full_token"
+            teacher_outputs = model(**model_input_subset(teacher_seq_inputs), use_cache=False)
+        teacher_source = "base_privileged_gt_prompt_full_token" if teacher_uses_ground_truth else "base_full_token"
     else:
         raise AssertionError(teacher_strategy)
 
-    teacher_logits = extract_generated_logits(teacher_outputs.logits, prompt_len, int(gen_ids.numel())).detach()
+    teacher_logits = extract_generated_logits(
+        teacher_outputs.logits,
+        teacher_prompt_len,
+        int(gen_ids.numel()),
+    ).detach().clone()
     del teacher_outputs
+
+    native_weighting_enabled = bool(get_nested(cfg, "opsd.native_budget_weighting.enabled", False))
+    b_plus_ratio: float | None = None
+    b_plus_logits: torch.Tensor | None = None
+    b_plus_metadata: dict[str, Any] = {}
+    if native_weighting_enabled:
+        budget_delta_mode = str(
+            get_nested(cfg, "opsd.native_budget_weighting.budget_delta_mode", "absolute")
+        ).strip().lower()
+        if budget_delta_mode == "absolute":
+            b_plus_ratio = float(retention_ratio) + float(
+                get_nested(cfg, "opsd.native_budget_weighting.budget_delta", 0.05)
+            )
+        elif budget_delta_mode == "relative":
+            relative_fraction = float(
+                get_nested(cfg, "opsd.native_budget_weighting.budget_delta_fraction", 0.25)
+            )
+            b_plus_ratio = float(retention_ratio) * (1.0 + relative_fraction)
+        else:
+            raise ValueError(f"Unsupported native budget delta mode: {budget_delta_mode!r}.")
+        if b_plus_ratio >= 1.0:
+            raise ValueError(f"Native budget probe must remain pruned; got b_plus={b_plus_ratio}.")
 
     student_outputs, pruned = forward_pruned(
         model,
-        seq_inputs,
+        student_seq_inputs,
         retention_ratio,
-        prompt_len=prompt_len,
+        prompt_len=student_prompt_len,
         allow_embedding_fallback=bool(get_nested(cfg, "pruning.allow_embedding_fallback", False)),
+        sample_id=sample.sample_id,
+        question=sample.question,
     )
+    if normalize_pruning_method() == "random":
+        rollout_mask_hash = str(generation_meta.get("random_mask_hash", ""))
+        scoring_mask_hash = str(pruned["metadata"].get("random_mask_hash", ""))
+        if not rollout_mask_hash or rollout_mask_hash != scoring_mask_hash:
+            raise RuntimeError(
+                "RandomPruner OPSD must reuse one mask for rollout and student scoring: "
+                f"rollout={rollout_mask_hash!r}, scoring={scoring_mask_hash!r}."
+            )
     student_logits = extract_generated_logits(student_outputs.logits, int(pruned["metadata"]["student_prompt_len"]), int(gen_ids.numel()))
-    kl = compute_forward_kl(teacher_logits, student_logits, temperature=float(get_nested(cfg, "opsd.temperature", 1.0)))
+    opsd_temperature = float(get_nested(cfg, "opsd.temperature", 1.0))
+    weighting_mode = str(
+        get_nested(cfg, "opsd.native_budget_weighting.mode", "inverse_student_gap")
+    ).strip().lower()
+    trajectory_scalar_kl: torch.Tensor | None = None
+    if native_weighting_enabled and weighting_mode in {
+        "trajectory_probe",
+        "symmetric_teacher_gap_stability",
+    }:
+        trajectory_scalar_kl = compute_forward_kl(
+            teacher_logits,
+            student_logits,
+            temperature=opsd_temperature,
+        )
+    # Preserve the original teacher -> differentiable student forward order.
+    # The auxiliary branch is no-grad and runs only after the OPSD graph exists.
+    if native_weighting_enabled:
+        if b_plus_ratio is None:
+            raise AssertionError("Native budget weighting requires b_plus ratio.")
+        with torch.no_grad():
+            b_plus_outputs, b_plus_pruned = forward_pruned(
+                unwrap_model(model),
+                student_seq_inputs,
+                b_plus_ratio,
+                prompt_len=student_prompt_len,
+                allow_embedding_fallback=bool(
+                    get_nested(cfg, "pruning.allow_embedding_fallback", False)
+                ),
+                sample_id=sample.sample_id,
+                question=sample.question,
+            )
+            b_plus_metadata = b_plus_pruned["metadata"]
+            b_plus_logits = extract_generated_logits(
+                b_plus_outputs.logits,
+                int(b_plus_metadata["student_prompt_len"]),
+                int(gen_ids.numel()),
+            ).detach().clone()
+        del b_plus_outputs
+    weighting_metrics: dict[str, Any] = {
+        "native_budget_weighting_enabled": native_weighting_enabled,
+        "native_budget_weighting_mode": weighting_mode if native_weighting_enabled else None,
+        "native_budget_delta_mode": (
+            str(get_nested(cfg, "opsd.native_budget_weighting.budget_delta_mode", "absolute"))
+            if native_weighting_enabled
+            else None
+        ),
+        "sampled_b": float(retention_ratio),
+        "sampled_b_plus": b_plus_ratio,
+    }
+    if native_weighting_enabled:
+        if b_plus_logits is None:
+            raise AssertionError("Native budget weighting requires b_plus logits.")
+        per_token_opsd = compute_per_token_kl(
+            teacher_logits,
+            student_logits.detach() if weighting_mode == "trajectory_probe" else student_logits,
+            temperature=opsd_temperature,
+            chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
+        )
+        per_token_bridge: torch.Tensor | None = None
+        if weighting_mode in {
+            "counterfactual_budget_bridge",
+            "budget_gradient_aligned_bridge",
+            "counterfactual_gradient_residual",
+        }:
+            per_token_bridge = compute_per_token_kl(
+                b_plus_logits,
+                student_logits,
+                temperature=opsd_temperature,
+                chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
+            )
+        with torch.no_grad():
+            sensitivity = compute_per_token_kl(
+                b_plus_logits,
+                student_logits.detach(),
+                temperature=float(
+                    get_nested(cfg, "opsd.native_budget_weighting.sensitivity_temperature", 1.0)
+                ),
+                chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
+            )
+            valid_mask = generated_token_valid_mask(gen_ids)
+            eps = float(get_nested(cfg, "opsd.native_budget_weighting.eps", 1e-8))
+            if weighting_mode == "inverse_student_gap":
+                weights = native_budget_robustness_weights(
+                    sensitivity,
+                    valid_mask,
+                    eps=eps,
+                )
+                valid = weights.valid_mask
+                token_weight = weights.weight
+                mode_metrics = {
+                    "native_tau": float(weights.tau.cpu()),
+                    "native_robustness_mean": float(weights.robustness[valid].mean().cpu()),
+                }
+                loss_type = "opsd_nogt_native_budget_weighted_forward_kl"
+            elif weighting_mode == "trajectory_probe":
+                student_budget_jsd = compute_generalized_jsd(
+                    b_plus_logits,
+                    student_logits.detach(),
+                    beta=0.5,
+                    temperature=float(
+                        get_nested(cfg, "opsd.native_budget_weighting.sensitivity_temperature", 1.0)
+                    ),
+                    top_k=None,
+                    token_clip=None,
+                    clip_mode="token",
+                    chunk_size=int(
+                        get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)
+                    ),
+                ).detach().float()
+                trajectory_mode = str(
+                    get_nested(cfg, "opsd.trajectory_weighting.mode", "")
+                ).strip().lower()
+                teachability_metrics: dict[str, float] = {}
+                if trajectory_mode == "ratio_group_counterfactual_teachability_batch":
+                    teacher_student_jsd_b = compute_generalized_jsd(
+                        teacher_logits,
+                        student_logits.detach(),
+                        beta=0.5,
+                        temperature=float(
+                            get_nested(
+                                cfg,
+                                "opsd.native_budget_weighting.sensitivity_temperature",
+                                1.0,
+                            )
+                        ),
+                        top_k=None,
+                        token_clip=None,
+                        clip_mode="token",
+                        chunk_size=int(
+                            get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)
+                        ),
+                    ).detach().float()
+                    teacher_student_jsd_b_plus = compute_generalized_jsd(
+                        teacher_logits,
+                        b_plus_logits,
+                        beta=0.5,
+                        temperature=float(
+                            get_nested(
+                                cfg,
+                                "opsd.native_budget_weighting.sensitivity_temperature",
+                                1.0,
+                            )
+                        ),
+                        top_k=None,
+                        token_clip=None,
+                        clip_mode="token",
+                        chunk_size=int(
+                            get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)
+                        ),
+                    ).detach().float()
+                    budget_projection_mass = 0.5 * (
+                        teacher_student_jsd_b
+                        + student_budget_jsd
+                        - teacher_student_jsd_b_plus
+                    )
+                    budget_explained_fraction = (
+                        budget_projection_mass
+                        / (teacher_student_jsd_b + eps)
+                    ).clamp(0.0, 1.0)
+                    teachability_metrics = {
+                        "native_teacher_student_jsd_b_mean": float(
+                            teacher_student_jsd_b.cpu()
+                        ),
+                        "native_teacher_student_jsd_b_plus_mean": float(
+                            teacher_student_jsd_b_plus.cpu()
+                        ),
+                        "native_trajectory_budget_explained_fraction": float(
+                            budget_explained_fraction.cpu()
+                        ),
+                        "native_trajectory_budget_projection_mass": float(
+                            budget_projection_mass.cpu()
+                        ),
+                        "native_trajectory_teacher_js_mass": float(
+                            teacher_student_jsd_b.cpu()
+                        ),
+                    }
+                per_token_b_plus_teacher_gap = compute_per_token_kl(
+                    teacher_logits,
+                    b_plus_logits,
+                    temperature=opsd_temperature,
+                    chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
+                ).detach().float()
+                gap_b = per_token_opsd.detach().float()
+                valid = valid_mask
+                token_weight = torch.zeros_like(gap_b)
+                token_weight[valid] = 1.0
+                positive_closure = (gap_b - per_token_b_plus_teacher_gap).clamp_min(0.0)
+                gap_mass = gap_b[valid].sum()
+                closure_mass = positive_closure[valid].sum() / gap_mass.clamp_min(eps)
+                nonnegative_gap = gap_b[valid].clamp_min(0.0)
+                nonnegative_sensitivity = sensitivity[valid].detach().float().clamp_min(0.0)
+                local_relative_sensitivity = nonnegative_sensitivity / (
+                    nonnegative_gap + nonnegative_sensitivity + eps
+                )
+                trajectory_teacher_gap_change = (
+                    gap_b[valid].mean() - per_token_b_plus_teacher_gap[valid].mean()
+                )
+                trajectory_teacher_gap_sensitivity = trajectory_teacher_gap_change.abs()
+                trajectory_mass_robustness = teacher_gap_mass_robustness(
+                    gap_b,
+                    sensitivity,
+                    valid_mask,
+                    eps=eps,
+                )
+                mode_metrics = {
+                    "native_teacher_gap_b_mean": float(gap_b[valid].mean().cpu()),
+                    "native_student_budget_jsd_mean": float(student_budget_jsd.cpu()),
+                    "native_teacher_gap_b_plus_mean": float(
+                        per_token_b_plus_teacher_gap[valid].mean().cpu()
+                    ),
+                    "native_trajectory_teacher_gap_change": float(
+                        trajectory_teacher_gap_change.cpu()
+                    ),
+                    "native_trajectory_teacher_gap_sensitivity": float(
+                        trajectory_teacher_gap_sensitivity.cpu()
+                    ),
+                    "native_trajectory_budget_closure_mass": float(closure_mass.cpu()),
+                    "native_trajectory_positive_closure_mean": float(
+                        positive_closure[valid].mean().cpu()
+                    ),
+                    "native_trajectory_mass_robustness": float(
+                        trajectory_mass_robustness.clamp(0.0, 1.0).cpu()
+                    ),
+                    "native_local_relative_sensitivity_mean": float(
+                        local_relative_sensitivity.mean().cpu()
+                    ),
+                    "native_trajectory_scalar_objective": "compute_forward_kl_exact",
+                    "native_loss_mass_scale": 1.0,
+                    **teachability_metrics,
+                }
+                loss_type = "opsd_nogt_native_budget_trajectory_probe_forward_kl"
+            elif weighting_mode == "teacher_gap_persistence":
+                per_token_b_plus_teacher_gap = compute_per_token_kl(
+                    teacher_logits,
+                    b_plus_logits,
+                    temperature=opsd_temperature,
+                    chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
+                )
+                weights = teacher_gap_persistence_weights(
+                    per_token_opsd,
+                    per_token_b_plus_teacher_gap,
+                    valid_mask,
+                    alpha=float(get_nested(cfg, "opsd.native_budget_weighting.alpha", 0.5)),
+                    eps=eps,
+                )
+                valid = weights.valid_mask
+                token_weight = weights.weight
+                gap_b = weights.teacher_gap_b[valid]
+                gap_b_plus = weights.teacher_gap_b_plus[valid]
+                mode_metrics = {
+                    "native_teacher_gap_b_mean": float(gap_b.mean().cpu()),
+                    "native_teacher_gap_b_median": float(torch.quantile(gap_b, 0.5).cpu()),
+                    "native_teacher_gap_b_plus_mean": float(gap_b_plus.mean().cpu()),
+                    "native_teacher_gap_b_plus_median": float(torch.quantile(gap_b_plus, 0.5).cpu()),
+                    "native_teacher_gap_tau": float(weights.tau_teacher_gap.cpu()),
+                    "native_budget_rescue_mean": float(weights.rescue_fraction[valid].mean().cpu()),
+                    "native_teacher_gap_persistence_mean": float(weights.persistence[valid].mean().cpu()),
+                    "native_teacher_gap_confidence_mean": float(weights.confidence[valid].mean().cpu()),
+                    "native_teacher_gap_priority_mean": float(weights.priority[valid].mean().cpu()),
+                    "native_teacher_gap_alpha": float(
+                        get_nested(cfg, "opsd.native_budget_weighting.alpha", 0.5)
+                    ),
+                    "native_loss_mass_scale": float(weights.loss_mass_scale.cpu()),
+                }
+                loss_type = "opsd_nogt_native_budget_teacher_gap_persistence_weighted_forward_kl"
+            elif weighting_mode == "symmetric_teacher_gap_stability":
+                per_token_b_plus_teacher_gap = compute_per_token_kl(
+                    teacher_logits,
+                    b_plus_logits,
+                    temperature=opsd_temperature,
+                    chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
+                )
+                weights = symmetric_teacher_gap_stability_weights(
+                    per_token_opsd,
+                    per_token_b_plus_teacher_gap,
+                    valid_mask,
+                    alpha=float(get_nested(cfg, "opsd.native_budget_weighting.alpha", 0.25)),
+                    eps=eps,
+                )
+                valid = weights.valid_mask
+                token_weight = weights.weight
+                mode_metrics = {
+                    "native_teacher_gap_b_mean": float(weights.teacher_gap_b[valid].mean().cpu()),
+                    "native_teacher_gap_b_plus_mean": float(
+                        weights.teacher_gap_b_plus[valid].mean().cpu()
+                    ),
+                    "native_signed_budget_change_mean": float(
+                        weights.signed_budget_change[valid].mean().cpu()
+                    ),
+                    "native_normalized_budget_change_mean": float(
+                        weights.normalized_budget_change[valid].mean().cpu()
+                    ),
+                    "native_normalized_budget_change_median": float(
+                        torch.quantile(weights.normalized_budget_change[valid], 0.5).cpu()
+                    ),
+                    "native_normalized_budget_change_max": float(
+                        weights.normalized_budget_change[valid].max().cpu()
+                    ),
+                    "native_budget_robustness_mean": float(weights.robustness[valid].mean().cpu()),
+                    "native_teacher_gap_stability_alpha": float(
+                        get_nested(cfg, "opsd.native_budget_weighting.alpha", 0.25)
+                    ),
+                    "native_loss_mass_scale": float(weights.loss_mass_scale.cpu()),
+                    "native_token_scalar_objective": "compute_forward_kl_plus_zero_value_gradient_redistribution",
+                }
+                loss_type = "opsd_nogt_symmetric_teacher_gap_stability_forward_kl"
+            elif weighting_mode == "counterfactual_rescue_amplification":
+                per_token_b_plus_teacher_gap = compute_per_token_kl(
+                    teacher_logits,
+                    b_plus_logits,
+                    temperature=opsd_temperature,
+                    chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
+                )
+                weights = counterfactual_rescue_amplification_weights(
+                    per_token_opsd,
+                    per_token_b_plus_teacher_gap,
+                    valid_mask,
+                    alpha=float(get_nested(cfg, "opsd.native_budget_weighting.alpha", 0.5)),
+                    eps=eps,
+                )
+                valid = weights.valid_mask
+                token_weight = weights.weight
+                mode_metrics = {
+                    "native_teacher_gap_b_mean": float(weights.teacher_gap_b[valid].mean().cpu()),
+                    "native_teacher_gap_b_plus_mean": float(
+                        weights.teacher_gap_b_plus[valid].mean().cpu()
+                    ),
+                    "native_counterfactual_rescue_mean": float(
+                        weights.rescue_fraction[valid].mean().cpu()
+                    ),
+                    "native_counterfactual_rescue_alpha": float(
+                        get_nested(cfg, "opsd.native_budget_weighting.alpha", 0.5)
+                    ),
+                    "native_loss_mass_scale": float(weights.loss_mass_scale.cpu()),
+                }
+                loss_type = (
+                    "opsd_nogt_native_budget_counterfactual_rescue_amplification_forward_kl"
+                )
+            elif weighting_mode in {
+                "native_budget_rescue_grouped",
+                "counterfactual_teachability_grouped",
+                "teacher_gap_grouped_control",
+            }:
+                per_token_b_plus_teacher_gap = compute_per_token_kl(
+                    teacher_logits,
+                    b_plus_logits,
+                    temperature=opsd_temperature,
+                    chunk_size=int(
+                        get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)
+                    ),
+                )
+                if weighting_mode == "native_budget_rescue_grouped":
+                    ranking_signal = (
+                        per_token_opsd.detach().float()
+                        - per_token_b_plus_teacher_gap.detach().float()
+                    ).clamp_min(0.0)
+                    rescue_fraction = (
+                        ranking_signal
+                        / per_token_opsd.detach().float().clamp_min(eps)
+                    ).clamp(0.0, 1.0)
+                elif weighting_mode == "counterfactual_teachability_grouped":
+                    modulation = counterfactual_teachability_modulation_weights(
+                        per_token_opsd,
+                        per_token_b_plus_teacher_gap,
+                        valid_mask,
+                        alpha=0.0,
+                        rescue_modulation=float(
+                            get_nested(
+                                cfg,
+                                "opsd.native_budget_weighting.rescue_modulation",
+                                0.1,
+                            )
+                        ),
+                        eps=eps,
+                    )
+                    ranking_signal = modulation.priority
+                    rescue_fraction = modulation.rescue_fraction
+                else:
+                    ranking_signal = per_token_opsd.detach().float()
+                    rescue_fraction = torch.zeros_like(ranking_signal)
+                weights = grouped_kl_mass_weights(
+                    per_token_opsd,
+                    ranking_signal,
+                    valid_mask,
+                    top_fraction=float(
+                        get_nested(cfg, "opsd.native_budget_weighting.top_fraction", 0.2)
+                    ),
+                    high_group_mass=float(
+                        get_nested(cfg, "opsd.native_budget_weighting.high_group_mass", 0.5)
+                    ),
+                    eps=eps,
+                )
+                valid = weights.valid_mask
+                token_weight = weights.weight
+                mode_metrics = {
+                    "native_teacher_gap_b_mean": float(per_token_opsd[valid].mean().cpu()),
+                    "native_teacher_gap_b_plus_mean": float(
+                        per_token_b_plus_teacher_gap[valid].mean().cpu()
+                    ),
+                    "native_group_ranking_signal_mean": float(
+                        weights.ranking_signal[valid].mean().cpu()
+                    ),
+                    "native_counterfactual_rescue_mean": float(
+                        rescue_fraction[valid].mean().cpu()
+                    ),
+                    "native_group_high_fraction": float(
+                        weights.high_group_mask[valid].float().mean().cpu()
+                    ),
+                    "native_group_top_fraction": float(
+                        get_nested(cfg, "opsd.native_budget_weighting.top_fraction", 0.2)
+                    ),
+                    "native_group_high_mass": float(
+                        get_nested(cfg, "opsd.native_budget_weighting.high_group_mass", 0.5)
+                    ),
+                    "native_loss_mass_scale": float(weights.loss_mass_scale.cpu()),
+                }
+                loss_type = f"opsd_nogt_{weighting_mode}_forward_kl"
+            elif weighting_mode == "counterfactual_teachability_mixture":
+                per_token_b_plus_teacher_gap = compute_per_token_kl(
+                    teacher_logits,
+                    b_plus_logits,
+                    temperature=opsd_temperature,
+                    chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
+                )
+                weights = counterfactual_teachability_mixture_weights(
+                    per_token_opsd,
+                    per_token_b_plus_teacher_gap,
+                    valid_mask,
+                    alpha=float(get_nested(cfg, "opsd.native_budget_weighting.alpha", 0.5)),
+                    rescue_mix=float(
+                        get_nested(cfg, "opsd.native_budget_weighting.rescue_mix", 0.1)
+                    ),
+                    eps=eps,
+                )
+                valid = weights.valid_mask
+                token_weight = weights.weight
+                mode_metrics = {
+                    "native_teacher_gap_b_mean": float(weights.teacher_gap_b[valid].mean().cpu()),
+                    "native_teacher_gap_b_plus_mean": float(
+                        weights.teacher_gap_b_plus[valid].mean().cpu()
+                    ),
+                    "native_teacher_gap_rank_mean": float(
+                        weights.teacher_gap_rank[valid].mean().cpu()
+                    ),
+                    "native_counterfactual_rescue_mean": float(
+                        weights.rescue_fraction[valid].mean().cpu()
+                    ),
+                    "native_counterfactual_teachability_priority_mean": float(
+                        weights.priority[valid].mean().cpu()
+                    ),
+                    "native_counterfactual_teachability_alpha": float(
+                        get_nested(cfg, "opsd.native_budget_weighting.alpha", 0.5)
+                    ),
+                    "native_counterfactual_rescue_mix": float(
+                        get_nested(cfg, "opsd.native_budget_weighting.rescue_mix", 0.1)
+                    ),
+                    "native_loss_mass_scale": float(weights.loss_mass_scale.cpu()),
+                }
+                loss_type = (
+                    "opsd_nogt_native_budget_counterfactual_teachability_mixture_forward_kl"
+                )
+            elif weighting_mode == "counterfactual_teachability_modulation":
+                per_token_b_plus_teacher_gap = compute_per_token_kl(
+                    teacher_logits,
+                    b_plus_logits,
+                    temperature=opsd_temperature,
+                    chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
+                )
+                weights = counterfactual_teachability_modulation_weights(
+                    per_token_opsd,
+                    per_token_b_plus_teacher_gap,
+                    valid_mask,
+                    alpha=float(get_nested(cfg, "opsd.native_budget_weighting.alpha", 0.5)),
+                    rescue_modulation=float(
+                        get_nested(
+                            cfg,
+                            "opsd.native_budget_weighting.rescue_modulation",
+                            0.1,
+                        )
+                    ),
+                    eps=eps,
+                )
+                valid = weights.valid_mask
+                token_weight = weights.weight
+                mode_metrics = {
+                    "native_teacher_gap_b_mean": float(weights.teacher_gap_b[valid].mean().cpu()),
+                    "native_teacher_gap_b_plus_mean": float(
+                        weights.teacher_gap_b_plus[valid].mean().cpu()
+                    ),
+                    "native_teacher_gap_rank_mean": float(
+                        weights.teacher_gap_rank[valid].mean().cpu()
+                    ),
+                    "native_counterfactual_rescue_mean": float(
+                        weights.rescue_fraction[valid].mean().cpu()
+                    ),
+                    "native_counterfactual_teachability_priority_mean": float(
+                        weights.priority[valid].mean().cpu()
+                    ),
+                    "native_counterfactual_teachability_alpha": float(
+                        get_nested(cfg, "opsd.native_budget_weighting.alpha", 0.5)
+                    ),
+                    "native_counterfactual_rescue_modulation": float(
+                        get_nested(
+                            cfg,
+                            "opsd.native_budget_weighting.rescue_modulation",
+                            0.1,
+                        )
+                    ),
+                    "native_loss_mass_scale": float(weights.loss_mass_scale.cpu()),
+                }
+                loss_type = (
+                    "opsd_nogt_native_budget_counterfactual_teachability_modulation_forward_kl"
+                )
+            elif weighting_mode == "conditional_rescue_residual":
+                per_token_b_plus_teacher_gap = compute_per_token_kl(
+                    teacher_logits,
+                    b_plus_logits,
+                    temperature=opsd_temperature,
+                    chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
+                )
+                weights = conditional_rescue_residual_weights(
+                    per_token_opsd,
+                    per_token_b_plus_teacher_gap,
+                    valid_mask,
+                    alpha=float(get_nested(cfg, "opsd.native_budget_weighting.alpha", 0.1)),
+                    difficulty_bins=int(
+                        get_nested(cfg, "opsd.native_budget_weighting.difficulty_bins", 5)
+                    ),
+                    eps=eps,
+                )
+                valid = weights.valid_mask
+                token_weight = weights.weight
+                mode_metrics = {
+                    "native_teacher_gap_b_mean": float(weights.teacher_gap_b[valid].mean().cpu()),
+                    "native_teacher_gap_b_plus_mean": float(
+                        weights.teacher_gap_b_plus[valid].mean().cpu()
+                    ),
+                    "native_teacher_gap_rank_mean": float(
+                        weights.teacher_gap_rank[valid].mean().cpu()
+                    ),
+                    "native_counterfactual_rescue_mean": float(
+                        weights.rescue_fraction[valid].mean().cpu()
+                    ),
+                    "native_expected_rescue_mean": float(
+                        weights.expected_rescue[valid].mean().cpu()
+                    ),
+                    "native_rescue_residual_mean": float(
+                        weights.rescue_residual[valid].mean().cpu()
+                    ),
+                    "native_rescue_residual_abs_mean": float(
+                        weights.rescue_residual[valid].abs().mean().cpu()
+                    ),
+                    "native_conditional_rescue_alpha": float(
+                        get_nested(cfg, "opsd.native_budget_weighting.alpha", 0.1)
+                    ),
+                    "native_difficulty_bins": int(
+                        get_nested(cfg, "opsd.native_budget_weighting.difficulty_bins", 5)
+                    ),
+                    "native_loss_mass_scale": float(weights.loss_mass_scale.cpu()),
+                }
+                loss_type = (
+                    "opsd_nogt_native_budget_conditional_rescue_residual_forward_kl"
+                )
+            elif weighting_mode == "budget_consistent_rank":
+                per_token_b_plus_teacher_gap = compute_per_token_kl(
+                    teacher_logits,
+                    b_plus_logits,
+                    temperature=opsd_temperature,
+                    chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
+                )
+                weights = budget_consistent_rank_weights(
+                    per_token_opsd,
+                    per_token_b_plus_teacher_gap,
+                    valid_mask,
+                    alpha=float(get_nested(cfg, "opsd.native_budget_weighting.alpha", 1.0)),
+                    eps=eps,
+                )
+                valid = weights.valid_mask
+                token_weight = weights.weight
+                mode_metrics = {
+                    "native_teacher_gap_b_mean": float(weights.teacher_gap_b[valid].mean().cpu()),
+                    "native_teacher_gap_b_plus_mean": float(weights.teacher_gap_b_plus[valid].mean().cpu()),
+                    "native_persistent_gap_mean": float(weights.persistent_gap[valid].mean().cpu()),
+                    "native_persistent_rank_mean": float(weights.persistent_rank[valid].mean().cpu()),
+                    "native_teacher_gap_alpha": float(
+                        get_nested(cfg, "opsd.native_budget_weighting.alpha", 1.0)
+                    ),
+                    "native_loss_mass_scale": float(weights.loss_mass_scale.cpu()),
+                }
+                loss_type = "opsd_nogt_native_budget_consistent_rank_weighted_forward_kl"
+            elif weighting_mode == "budget_residual_hardness":
+                per_token_b_plus_teacher_gap = compute_per_token_kl(
+                    teacher_logits,
+                    b_plus_logits,
+                    temperature=opsd_temperature,
+                    chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
+                )
+                weights = budget_residual_hardness_weights(
+                    per_token_opsd,
+                    per_token_b_plus_teacher_gap,
+                    valid_mask,
+                    alpha=float(get_nested(cfg, "opsd.native_budget_weighting.alpha", 1.0)),
+                    persistence_mix=float(
+                        get_nested(cfg, "opsd.native_budget_weighting.persistence_mix", 0.1)
+                    ),
+                    eps=eps,
+                )
+                valid = weights.valid_mask
+                token_weight = weights.weight
+                mode_metrics = {
+                    "native_teacher_gap_b_mean": float(weights.teacher_gap_b[valid].mean().cpu()),
+                    "native_teacher_gap_b_plus_mean": float(weights.teacher_gap_b_plus[valid].mean().cpu()),
+                    "native_persistent_gap_mean": float(weights.persistent_gap[valid].mean().cpu()),
+                    "native_teacher_gap_rank_mean": float(weights.teacher_gap_rank[valid].mean().cpu()),
+                    "native_persistent_rank_mean": float(weights.persistent_rank[valid].mean().cpu()),
+                    "native_budget_residual_priority_mean": float(weights.priority[valid].mean().cpu()),
+                    "native_teacher_gap_alpha": float(
+                        get_nested(cfg, "opsd.native_budget_weighting.alpha", 1.0)
+                    ),
+                    "native_persistence_mix": float(
+                        get_nested(cfg, "opsd.native_budget_weighting.persistence_mix", 0.1)
+                    ),
+                    "native_loss_mass_scale": float(weights.loss_mass_scale.cpu()),
+                }
+                loss_type = "opsd_nogt_native_budget_residual_hardness_weighted_forward_kl"
+            elif weighting_mode == "budget_gradient_consensus":
+                gradient_consensus, gradient_norm_consistency = (
+                    compute_teacher_gradient_budget_consensus(
+                        teacher_logits,
+                        b_plus_logits,
+                        student_logits,
+                        temperature=opsd_temperature,
+                        chunk_size=int(
+                            get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)
+                        ),
+                        eps=eps,
+                    )
+                )
+                weights = budget_gradient_consensus_weights(
+                    per_token_opsd,
+                    gradient_consensus,
+                    gradient_norm_consistency,
+                    valid_mask,
+                    alpha=float(get_nested(cfg, "opsd.native_budget_weighting.alpha", 0.5)),
+                    eps=eps,
+                )
+                valid = weights.valid_mask
+                token_weight = weights.weight
+                mode_metrics = {
+                    "native_teacher_gap_b_mean": float(weights.teacher_gap_b[valid].mean().cpu()),
+                    "native_teacher_gap_rank_mean": float(weights.teacher_gap_rank[valid].mean().cpu()),
+                    "native_gradient_consensus_mean": float(
+                        weights.gradient_consensus[valid].mean().cpu()
+                    ),
+                    "native_gradient_consensus_positive_fraction": float(
+                        (weights.gradient_consensus[valid] > 0.0).float().mean().cpu()
+                    ),
+                    "native_gradient_norm_consistency_mean": float(
+                        weights.gradient_norm_consistency[valid].mean().cpu()
+                    ),
+                    "native_invariant_priority_mean": float(
+                        weights.invariant_priority[valid].mean().cpu()
+                    ),
+                    "native_teacher_gap_alpha": float(
+                        get_nested(cfg, "opsd.native_budget_weighting.alpha", 0.5)
+                    ),
+                    "native_loss_mass_scale": float(weights.loss_mass_scale.cpu()),
+                }
+                loss_type = "opsd_nogt_native_budget_gradient_consensus_weighted_forward_kl"
+            elif weighting_mode == "counterfactual_budget_bridge":
+                if per_token_bridge is None:
+                    raise AssertionError("Counterfactual budget bridge requires differentiable bridge KL.")
+                per_token_b_plus_teacher_gap = compute_per_token_kl(
+                    teacher_logits,
+                    b_plus_logits,
+                    temperature=opsd_temperature,
+                    chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
+                )
+                weights = counterfactual_budget_bridge(
+                    per_token_opsd,
+                    per_token_b_plus_teacher_gap,
+                    per_token_bridge,
+                    valid_mask,
+                    max_bridge_fraction=float(
+                        get_nested(cfg, "opsd.native_budget_weighting.max_bridge_fraction", 0.5)
+                    ),
+                    eps=eps,
+                )
+                valid = weights.valid_mask
+                token_weight = weights.full_teacher_weight + weights.bridge_teacher_weight
+                mode_metrics = {
+                    "native_teacher_gap_b_mean": float(weights.teacher_gap_b[valid].mean().cpu()),
+                    "native_teacher_gap_b_plus_mean": float(weights.teacher_gap_b_plus[valid].mean().cpu()),
+                    "native_bridge_gap_mean": float(weights.bridge_gap[valid].mean().cpu()),
+                    "native_budget_rescue_mean": float(weights.rescue_fraction[valid].mean().cpu()),
+                    "native_teacher_gap_confidence_mean": float(weights.confidence[valid].mean().cpu()),
+                    "native_bridge_fraction_mean": float(weights.bridge_fraction[valid].mean().cpu()),
+                    "native_bridge_fraction_max": float(weights.bridge_fraction[valid].max().cpu()),
+                    "native_full_teacher_weight_mean": float(weights.full_teacher_weight[valid].mean().cpu()),
+                    "native_bridge_teacher_weight_mean": float(weights.bridge_teacher_weight[valid].mean().cpu()),
+                    "native_max_bridge_fraction": float(
+                        get_nested(cfg, "opsd.native_budget_weighting.max_bridge_fraction", 0.5)
+                    ),
+                    "native_loss_mass_scale": float(weights.loss_mass_scale.cpu()),
+                }
+                loss_type = "opsd_nogt_counterfactual_budget_bridge_forward_kl"
+            elif weighting_mode == "budget_gradient_aligned_bridge":
+                if per_token_bridge is None:
+                    raise AssertionError("Gradient-aligned bridge requires differentiable bridge KL.")
+                per_token_b_plus_teacher_gap = compute_per_token_kl(
+                    teacher_logits,
+                    b_plus_logits,
+                    temperature=opsd_temperature,
+                    chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
+                )
+                gradient_alignment = compute_budget_gradient_alignment(
+                    teacher_logits,
+                    b_plus_logits,
+                    student_logits,
+                    temperature=opsd_temperature,
+                    chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
+                    eps=eps,
+                )
+                weights = budget_gradient_aligned_bridge_gate(
+                    per_token_opsd,
+                    per_token_b_plus_teacher_gap,
+                    gradient_alignment,
+                    valid_mask,
+                    max_bridge_fraction=float(
+                        get_nested(cfg, "opsd.native_budget_weighting.max_bridge_fraction", 0.5)
+                    ),
+                    eps=eps,
+                )
+                valid = weights.valid_mask
+                with torch.enable_grad():
+                    per_token_aligned_candidate = (
+                        per_token_opsd + weights.bridge_fraction * per_token_bridge
+                    )
+                mass_normalization = normalize_candidate_loss_mass(
+                    per_token_opsd,
+                    per_token_aligned_candidate,
+                    torch.ones_like(per_token_opsd),
+                    valid,
+                    eps=eps,
+                )
+                token_weight = mass_normalization.weight
+                aligned = weights.gradient_alignment[valid]
+                mode_metrics = {
+                    "native_teacher_gap_b_mean": float(weights.teacher_gap_b[valid].mean().cpu()),
+                    "native_teacher_gap_b_plus_mean": float(weights.teacher_gap_b_plus[valid].mean().cpu()),
+                    "native_budget_rescue_mean": float(weights.rescue_fraction[valid].mean().cpu()),
+                    "native_teacher_gap_confidence_mean": float(weights.confidence[valid].mean().cpu()),
+                    "native_gradient_alignment_mean": float(aligned.mean().cpu()),
+                    "native_gradient_alignment_positive_fraction": float((aligned > 0.0).float().mean().cpu()),
+                    "native_bridge_fraction_mean": float(weights.bridge_fraction[valid].mean().cpu()),
+                    "native_bridge_fraction_max": float(weights.bridge_fraction[valid].max().cpu()),
+                    "native_max_bridge_fraction": float(
+                        get_nested(cfg, "opsd.native_budget_weighting.max_bridge_fraction", 0.5)
+                    ),
+                    "native_loss_mass_scale": float(mass_normalization.loss_mass_scale.cpu()),
+                }
+                loss_type = "opsd_nogt_budget_gradient_aligned_bridge_forward_kl"
+            elif weighting_mode == "counterfactual_gradient_residual":
+                if per_token_bridge is None:
+                    raise AssertionError(
+                        "Counterfactual gradient residualization requires differentiable bridge KL."
+                    )
+                per_token_b_plus_teacher_gap = compute_per_token_kl(
+                    teacher_logits,
+                    b_plus_logits,
+                    temperature=opsd_temperature,
+                    chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
+                )
+                (
+                    gradient_alignment,
+                    projection_coefficient,
+                    teacher_gradient_norm_sq,
+                    budget_gradient_norm_sq,
+                    gradient_dot_product,
+                ) = compute_budget_gradient_projection_geometry(
+                    teacher_logits,
+                    b_plus_logits,
+                    student_logits,
+                    temperature=opsd_temperature,
+                    chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
+                    eps=eps,
+                )
+                cancellation_schedule = str(
+                    get_nested(
+                        cfg,
+                        "opsd.native_budget_weighting.cancellation_schedule",
+                        "constant",
+                    )
+                )
+                base_cancellation_strength = float(
+                    get_nested(cfg, "opsd.native_budget_weighting.cancellation_strength", 0.5)
+                )
+                effective_cancellation_strength = counterfactual_cancellation_strength(
+                    base_cancellation_strength,
+                    schedule=cancellation_schedule,
+                    progress_step=progress_step,
+                    total_steps=total_steps,
+                    decay_fraction=float(
+                        get_nested(
+                            cfg,
+                            "opsd.native_budget_weighting.cancellation_decay_fraction",
+                            0.5,
+                        )
+                    ),
+                )
+                weights = counterfactual_gradient_residual_gate(
+                    per_token_opsd,
+                    per_token_b_plus_teacher_gap,
+                    gradient_alignment,
+                    projection_coefficient,
+                    teacher_gradient_norm_sq,
+                    budget_gradient_norm_sq,
+                    gradient_dot_product,
+                    valid_mask,
+                    cancellation_strength=effective_cancellation_strength,
+                    max_projection_coefficient=float(
+                        get_nested(
+                            cfg,
+                            "opsd.native_budget_weighting.max_projection_coefficient",
+                            1.0,
+                        )
+                    ),
+                    eps=eps,
+                )
+                valid = weights.valid_mask
+                token_weight = torch.ones_like(per_token_opsd).detach()
+                with torch.enable_grad():
+                    per_token_gradient_residual = (
+                        per_token_opsd
+                        - weights.cancellation_coefficient * per_token_bridge
+                    )
+                    raw_residual_mean = per_token_gradient_residual[valid].mean()
+                    unweighted_forward_mean = per_token_opsd[valid].mean()
+                # Preserve the exact vanilla OPSD scalar while retaining the
+                # counterfactual-residual gradient. The correction is detached.
+                gradient_residual_scalar_correction = (
+                    unweighted_forward_mean.detach() - raw_residual_mean.detach()
+                )
+                rescued = weights.budget_rescue_indicator[valid]
+                coefficients = weights.cancellation_coefficient[valid]
+                mode_metrics = {
+                    "native_teacher_gap_b_mean": float(weights.teacher_gap_b[valid].mean().cpu()),
+                    "native_teacher_gap_b_plus_mean": float(
+                        weights.teacher_gap_b_plus[valid].mean().cpu()
+                    ),
+                    "native_gradient_alignment_mean": float(
+                        weights.gradient_alignment[valid].mean().cpu()
+                    ),
+                    "native_gradient_alignment_positive_fraction": float(
+                        (weights.gradient_alignment[valid] > 0.0).float().mean().cpu()
+                    ),
+                    "native_budget_rescue_indicator_mean": float(rescued.mean().cpu()),
+                    "native_raw_projection_coefficient_mean": float(
+                        weights.raw_projection_coefficient[valid].mean().cpu()
+                    ),
+                    "native_clipped_projection_coefficient_mean": float(
+                        weights.clipped_projection_coefficient[valid].mean().cpu()
+                    ),
+                    "native_cancellation_coefficient_mean": float(coefficients.mean().cpu()),
+                    "native_cancellation_coefficient_max": float(coefficients.max().cpu()),
+                    "native_residual_gradient_norm_ratio_mean": float(
+                        weights.residual_gradient_norm_ratio[valid].mean().cpu()
+                    ),
+                    "native_cancellation_strength": effective_cancellation_strength,
+                    "native_base_cancellation_strength": base_cancellation_strength,
+                    "native_cancellation_schedule": cancellation_schedule,
+                    "native_cancellation_decay_fraction": float(
+                        get_nested(
+                            cfg,
+                            "opsd.native_budget_weighting.cancellation_decay_fraction",
+                            0.5,
+                        )
+                    ),
+                    "native_cancellation_progress_step": progress_step,
+                    "native_cancellation_total_steps": total_steps,
+                    "native_max_projection_coefficient": float(
+                        get_nested(
+                            cfg,
+                            "opsd.native_budget_weighting.max_projection_coefficient",
+                            1.0,
+                        )
+                    ),
+                    "native_gradient_residual_raw_loss": float(raw_residual_mean.detach().cpu()),
+                    "native_gradient_residual_scalar_correction": float(
+                        gradient_residual_scalar_correction.cpu()
+                    ),
+                }
+                loss_type = "opsd_nogt_counterfactual_gradient_residual_forward_kl"
+            elif weighting_mode == "budget_tangent_residual":
+                per_token_b_plus_teacher_gap = compute_per_token_kl(
+                    teacher_logits,
+                    b_plus_logits,
+                    temperature=opsd_temperature,
+                    chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
+                )
+                gradient_alignment, explained_fraction, residual_fraction = (
+                    compute_budget_gradient_geometry(
+                        teacher_logits,
+                        b_plus_logits,
+                        student_logits,
+                        temperature=opsd_temperature,
+                        chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
+                        eps=eps,
+                    )
+                )
+                weights = budget_tangent_residual_weights(
+                    per_token_opsd,
+                    gradient_alignment,
+                    explained_fraction,
+                    valid_mask,
+                    alpha=float(get_nested(cfg, "opsd.native_budget_weighting.alpha", 1.0)),
+                    eps=eps,
+                )
+                valid = weights.valid_mask
+                token_weight = weights.weight
+                mode_metrics = {
+                    "native_teacher_gap_b_mean": float(weights.teacher_gap_b[valid].mean().cpu()),
+                    "native_teacher_gap_b_plus_mean": float(per_token_b_plus_teacher_gap[valid].mean().cpu()),
+                    "native_gradient_alignment_mean": float(weights.gradient_alignment[valid].mean().cpu()),
+                    "native_gradient_alignment_positive_fraction": float(
+                        (weights.gradient_alignment[valid] > 0.0).float().mean().cpu()
+                    ),
+                    "native_budget_explained_fraction_mean": float(
+                        weights.budget_explained_fraction[valid].mean().cpu()
+                    ),
+                    "native_budget_residual_fraction_mean": float(
+                        weights.budget_residual_fraction[valid].mean().cpu()
+                    ),
+                    "native_budget_tangent_priority_mean": float(weights.priority[valid].mean().cpu()),
+                    "native_teacher_gap_alpha": float(
+                        get_nested(cfg, "opsd.native_budget_weighting.alpha", 1.0)
+                    ),
+                    "native_loss_mass_scale": float(weights.loss_mass_scale.cpu()),
+                }
+                loss_type = "opsd_nogt_budget_tangent_residual_weighted_forward_kl"
+            elif weighting_mode == "budget_counterfactual_teachability":
+                per_token_b_plus_teacher_gap = compute_per_token_kl(
+                    teacher_logits,
+                    b_plus_logits,
+                    temperature=opsd_temperature,
+                    chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
+                )
+                gradient_alignment, explained_fraction, residual_fraction = (
+                    compute_budget_gradient_geometry(
+                        teacher_logits,
+                        b_plus_logits,
+                        student_logits,
+                        temperature=opsd_temperature,
+                        chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
+                        eps=eps,
+                    )
+                )
+                support_top_k = int(
+                    get_nested(cfg, "opsd.native_budget_weighting.support_top_k", 32)
+                )
+                teacher_support_coverage = compute_teacher_mass_on_student_support(
+                    teacher_logits,
+                    student_logits,
+                    top_k=support_top_k,
+                    temperature=opsd_temperature,
+                    chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
+                )
+                weights = budget_counterfactual_teachability_weights(
+                    per_token_opsd,
+                    gradient_alignment,
+                    explained_fraction,
+                    teacher_support_coverage,
+                    valid_mask,
+                    alpha=float(get_nested(cfg, "opsd.native_budget_weighting.alpha", 1.0)),
+                    eps=eps,
+                )
+                valid = weights.valid_mask
+                token_weight = weights.weight
+                mode_metrics = {
+                    "native_teacher_gap_b_mean": float(weights.teacher_gap_b[valid].mean().cpu()),
+                    "native_teacher_gap_b_plus_mean": float(per_token_b_plus_teacher_gap[valid].mean().cpu()),
+                    "native_gradient_alignment_mean": float(weights.gradient_alignment[valid].mean().cpu()),
+                    "native_gradient_alignment_positive_fraction": float(
+                        (weights.gradient_alignment[valid] > 0.0).float().mean().cpu()
+                    ),
+                    "native_budget_explained_fraction_mean": float(
+                        weights.budget_explained_fraction[valid].mean().cpu()
+                    ),
+                    "native_budget_residual_fraction_mean": float(
+                        weights.budget_residual_fraction[valid].mean().cpu()
+                    ),
+                    "native_teacher_support_coverage_mean": float(
+                        weights.teacher_support_coverage[valid].mean().cpu()
+                    ),
+                    "native_support_coverage_rank_mean": float(
+                        weights.support_coverage_rank[valid].mean().cpu()
+                    ),
+                    "native_budget_counterfactual_teachability_priority_mean": float(
+                        weights.priority[valid].mean().cpu()
+                    ),
+                    "native_teacher_gap_alpha": float(
+                        get_nested(cfg, "opsd.native_budget_weighting.alpha", 1.0)
+                    ),
+                    "native_support_top_k": support_top_k,
+                    "native_loss_mass_scale": float(weights.loss_mass_scale.cpu()),
+                }
+                loss_type = "opsd_nogt_budget_counterfactual_teachability_weighted_forward_kl"
+            elif weighting_mode == "budget_contrastive_target":
+                per_token_b_plus_teacher_gap = compute_per_token_kl(
+                    teacher_logits,
+                    b_plus_logits,
+                    temperature=opsd_temperature,
+                    chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
+                )
+                weights = budget_contrastive_gate(
+                    per_token_opsd,
+                    per_token_b_plus_teacher_gap,
+                    valid_mask,
+                    beta_max=float(get_nested(cfg, "opsd.native_budget_weighting.beta_max", 0.5)),
+                    eps=eps,
+                )
+                valid = weights.valid_mask
+                with torch.enable_grad():
+                    per_token_contrastive, per_token_target_shift = compute_budget_contrastive_per_token_kl(
+                        teacher_logits,
+                        b_plus_logits,
+                        student_logits,
+                        weights.shaping_strength,
+                        advantage_clip=float(
+                            get_nested(cfg, "opsd.native_budget_weighting.advantage_clip", 2.0)
+                        ),
+                        temperature=opsd_temperature,
+                        chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
+                        return_target_shift=True,
+                    )
+                mass_normalization = normalize_candidate_loss_mass(
+                    per_token_opsd,
+                    per_token_contrastive,
+                    torch.ones_like(per_token_opsd),
+                    valid,
+                    eps=eps,
+                )
+                loss_mass_scale = mass_normalization.loss_mass_scale
+                token_weight = mass_normalization.weight
+                mode_metrics = {
+                    "native_teacher_gap_b_mean": float(weights.teacher_gap_b[valid].mean().cpu()),
+                    "native_teacher_gap_b_plus_mean": float(weights.teacher_gap_b_plus[valid].mean().cpu()),
+                    "native_budget_rescue_mean": float(weights.rescue_fraction[valid].mean().cpu()),
+                    "native_teacher_gap_confidence_mean": float(weights.confidence[valid].mean().cpu()),
+                    "native_contrastive_strength_mean": float(weights.shaping_strength[valid].mean().cpu()),
+                    "native_contrastive_strength_max": float(weights.shaping_strength[valid].max().cpu()),
+                    "native_target_shift_mean": float(per_token_target_shift[valid].mean().cpu()),
+                    "native_target_shift_max": float(per_token_target_shift[valid].max().cpu()),
+                    "native_beta_max": float(get_nested(cfg, "opsd.native_budget_weighting.beta_max", 0.5)),
+                    "native_advantage_clip": float(
+                        get_nested(cfg, "opsd.native_budget_weighting.advantage_clip", 2.0)
+                    ),
+                    "native_loss_mass_scale": float(loss_mass_scale.cpu()),
+                }
+                loss_type = "opsd_nogt_budget_contrastive_target_forward_kl"
+            elif weighting_mode == "dual_budget_decomposition":
+                per_token_b_plus_teacher_gap = compute_per_token_kl(
+                    teacher_logits,
+                    b_plus_logits,
+                    temperature=opsd_temperature,
+                    chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
+                )
+                hardness = budget_residual_hardness_weights(
+                    per_token_opsd,
+                    per_token_b_plus_teacher_gap,
+                    valid_mask,
+                    alpha=float(get_nested(cfg, "opsd.native_budget_weighting.alpha", 1.0)),
+                    persistence_mix=float(
+                        get_nested(cfg, "opsd.native_budget_weighting.persistence_mix", 0.1)
+                    ),
+                    eps=eps,
+                )
+                gate = budget_contrastive_gate(
+                    per_token_opsd,
+                    per_token_b_plus_teacher_gap,
+                    valid_mask,
+                    beta_max=float(get_nested(cfg, "opsd.native_budget_weighting.beta_max", 0.5)),
+                    eps=eps,
+                )
+                valid = hardness.valid_mask
+                with torch.enable_grad():
+                    per_token_contrastive, per_token_target_shift = compute_budget_contrastive_per_token_kl(
+                        teacher_logits,
+                        b_plus_logits,
+                        student_logits,
+                        gate.shaping_strength,
+                        advantage_clip=float(
+                            get_nested(cfg, "opsd.native_budget_weighting.advantage_clip", 2.0)
+                        ),
+                        temperature=opsd_temperature,
+                        chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
+                        return_target_shift=True,
+                    )
+                mass_normalization = normalize_candidate_loss_mass(
+                    per_token_opsd,
+                    per_token_contrastive,
+                    hardness.raw_weight,
+                    valid,
+                    eps=eps,
+                )
+                loss_mass_scale = mass_normalization.loss_mass_scale
+                token_weight = mass_normalization.weight
+                mode_metrics = {
+                    "native_teacher_gap_b_mean": float(hardness.teacher_gap_b[valid].mean().cpu()),
+                    "native_teacher_gap_b_plus_mean": float(hardness.teacher_gap_b_plus[valid].mean().cpu()),
+                    "native_persistent_gap_mean": float(hardness.persistent_gap[valid].mean().cpu()),
+                    "native_budget_residual_priority_mean": float(hardness.priority[valid].mean().cpu()),
+                    "native_budget_rescue_mean": float(gate.rescue_fraction[valid].mean().cpu()),
+                    "native_teacher_gap_confidence_mean": float(gate.confidence[valid].mean().cpu()),
+                    "native_contrastive_strength_mean": float(gate.shaping_strength[valid].mean().cpu()),
+                    "native_contrastive_strength_max": float(gate.shaping_strength[valid].max().cpu()),
+                    "native_target_shift_mean": float(per_token_target_shift[valid].mean().cpu()),
+                    "native_target_shift_max": float(per_token_target_shift[valid].max().cpu()),
+                    "native_teacher_gap_alpha": float(
+                        get_nested(cfg, "opsd.native_budget_weighting.alpha", 1.0)
+                    ),
+                    "native_persistence_mix": float(
+                        get_nested(cfg, "opsd.native_budget_weighting.persistence_mix", 0.1)
+                    ),
+                    "native_beta_max": float(get_nested(cfg, "opsd.native_budget_weighting.beta_max", 0.5)),
+                    "native_advantage_clip": float(
+                        get_nested(cfg, "opsd.native_budget_weighting.advantage_clip", 2.0)
+                    ),
+                    "native_loss_mass_scale": float(loss_mass_scale.cpu()),
+                }
+                loss_type = "opsd_nogt_dual_budget_decomposition_forward_kl"
+            else:
+                raise ValueError(f"Unknown native budget weighting mode: {weighting_mode!r}.")
+        if weighting_mode in {"trajectory_probe", "symmetric_teacher_gap_stability"}:
+            if trajectory_scalar_kl is None:
+                raise AssertionError("Exact-scalar weighting requires the original scalar OPSD KL.")
+            unweighted_kl = trajectory_scalar_kl
+            if weighting_mode == "trajectory_probe":
+                kl = trajectory_scalar_kl
+        else:
+            unweighted_kl = per_token_opsd[valid].mean()
+        if weighting_mode == "trajectory_probe":
+            pass
+        elif weighting_mode == "symmetric_teacher_gap_stability":
+            weighted_token_kl = (token_weight[valid] * per_token_opsd[valid]).mean()
+            unweighted_token_kl = per_token_opsd[valid].mean()
+            kl = trajectory_scalar_kl + weighted_token_kl - unweighted_token_kl
+        elif weighting_mode == "counterfactual_budget_bridge":
+            if per_token_bridge is None:
+                raise AssertionError("Counterfactual budget bridge KL was not computed.")
+            kl = (
+                weights.full_teacher_weight[valid] * per_token_opsd[valid]
+                + weights.bridge_teacher_weight[valid] * per_token_bridge[valid]
+            ).mean()
+        elif weighting_mode == "budget_gradient_aligned_bridge":
+            kl = (token_weight[valid] * per_token_aligned_candidate[valid]).mean()
+        elif weighting_mode == "counterfactual_gradient_residual":
+            kl = (
+                per_token_gradient_residual[valid].mean()
+                + gradient_residual_scalar_correction
+            )
+        elif weighting_mode in {"budget_contrastive_target", "dual_budget_decomposition"}:
+            kl = (token_weight[valid] * per_token_contrastive[valid]).mean()
+        else:
+            kl = (token_weight[valid] * per_token_opsd[valid]).mean()
+        sensitivity_valid = sensitivity.detach().float()[valid]
+        weight_valid = token_weight[valid]
+        kl_mass_ratio = kl.detach().float() / unweighted_kl.detach().float().clamp_min(1e-8)
+        weighting_metrics.update(
+            {
+                "loss_type": loss_type,
+                "unweighted_kl_loss": float(unweighted_kl.detach().cpu()),
+                "weighted_kl_loss": float(kl.detach().cpu()),
+                "native_weighted_to_unweighted_kl_ratio": float(kl_mass_ratio.cpu()),
+                "native_b_num_full_visual_tokens": int(pruned["metadata"].get("num_full_visual_tokens", 0)),
+                "native_b_num_kept_visual_tokens": int(pruned["metadata"].get("num_kept_visual_tokens", 0)),
+                "native_b_plus_num_full_visual_tokens": int(b_plus_metadata.get("num_full_visual_tokens", 0)),
+                "native_b_plus_num_kept_visual_tokens": int(b_plus_metadata.get("num_kept_visual_tokens", 0)),
+                "native_sensitivity_min": float(sensitivity_valid.min().cpu()),
+                "native_sensitivity_mean": float(sensitivity_valid.mean().cpu()),
+                "native_sensitivity_median": float(torch.quantile(sensitivity_valid, 0.5).cpu()),
+                "native_sensitivity_max": float(sensitivity_valid.max().cpu()),
+                "native_token_weight_min": float(weight_valid.min().cpu()),
+                "native_token_weight_mean": float(weight_valid.mean().cpu()),
+                "native_token_weight_max": float(weight_valid.max().cpu()),
+                "native_valid_generated_tokens": int(valid.sum().cpu()),
+                "native_weight_detached": not token_weight.requires_grad,
+                "native_probe_grad_enabled": False,
+                **mode_metrics,
+            }
+        )
+        del b_plus_logits
+    else:
+        kl = compute_forward_kl(teacher_logits, student_logits, temperature=opsd_temperature)
+        weighting_metrics.update(
+            {
+                "loss_type": "opsd_gt_prompt_forward_kl" if teacher_uses_ground_truth else "opsd_nogt_forward_kl",
+                "unweighted_kl_loss": float(kl.detach().cpu()),
+                "weighted_kl_loss": None,
+            }
+        )
     parsed = parse_final_answer(gen_text)
-    return kl, {
-        "loss_type": "opsd_nogt_forward_kl",
+    output_metrics = {
+        "loss_type": weighting_metrics.pop("loss_type"),
         "generated_tokens": int(gen_ids.numel()),
         "kl_loss": float(kl.detach().cpu()),
         "parseable": parsed is not None,
         "student_correct": parsed == sample.correct_letter,
         "teacher_source": teacher_source,
         "opsd_teacher_strategy": teacher_strategy,
-        "teacher_context": "student_prompt_no_ground_truth",
+        "teacher_context": teacher_context,
+        "teacher_ground_truth_access": teacher_uses_ground_truth,
+        "teacher_prompt_tokens": teacher_prompt_len,
+        "student_prompt_tokens": student_prompt_len,
+        "rollout_decoder": rollout_decoder,
+        "rollout_use_cache": not manual_rollout,
+        "rollout_model_eval": not manual_rollout,
+        "rollout_num_full_visual_tokens": int(generation_meta.get("num_full_visual_tokens", 0)),
+        "rollout_num_kept_visual_tokens": int(generation_meta.get("num_kept_visual_tokens", 0)),
+        "rollout_random_mask_hash": generation_meta.get("random_mask_hash"),
+        "scoring_random_mask_hash": pruned["metadata"].get("random_mask_hash"),
+        "cached_vs_no_cache_greedy_equal": generation_meta.get("cached_vs_no_cache_greedy_equal"),
+        "random_mask_reused_for_rollout_and_scoring": (
+            generation_meta.get("random_mask_hash") == pruned["metadata"].get("random_mask_hash")
+            if normalize_pruning_method() == "random"
+            else None
+        ),
         STUDENT_TEXT_LOG_KEY: build_student_text_log(
             sample,
             retention_ratio,
@@ -904,9 +2422,15 @@ def opsd_nogt_step(
             int(gen_ids.numel()),
             teacher_source=teacher_source,
             teacher_strategy=teacher_strategy,
+            rollout_decoder=rollout_decoder,
+            rollout_use_cache=not manual_rollout,
         ),
         "opsd_reference": (
-            "no_gt_ema_teacher_ablation"
+            "privileged_gt_prompt_ema_teacher_ablation"
+            if teacher_uses_ground_truth and teacher_strategy == "ema"
+            else "privileged_gt_prompt_teacher_ablation"
+            if teacher_uses_ground_truth
+            else "no_gt_ema_teacher_ablation"
             if teacher_strategy == "ema"
             else "no_gt_dynamic_shared_current_teacher_ablation"
             if teacher_strategy == "dynamic_shared_current"
@@ -916,8 +2440,18 @@ def opsd_nogt_step(
             if teacher_strategy == "external_adapter"
             else "no_gt_external_teacher_ablation"
         ),
+        **weighting_metrics,
         **numeric_metadata(pruned["metadata"]),
     }
+    if capture_rollout:
+        token_ids_cpu = gen_ids.detach().to(device="cpu", dtype=torch.long).clone()
+        output_metrics[ROLLOUT_CACHE_KEY] = {
+            "token_ids": token_ids_cpu,
+            "token_ids_sha256": hashlib.sha256(token_ids_cpu.numpy().tobytes()).hexdigest(),
+            "text": gen_text,
+            "generation_metadata": numeric_metadata(generation_meta),
+        }
+    return kl, output_metrics
 
 
 def opsd_step(
@@ -1205,12 +2739,1701 @@ def aggregate_microbatch_metrics(metrics: list[dict[str, Any]]) -> dict[str, Any
     return out
 
 
+def trajectory_probability_mode(cfg: dict[str, Any]) -> str | None:
+    if not bool(get_nested(cfg, "opsd.trajectory_weighting.enabled", False)):
+        return None
+    mode = str(get_nested(cfg, "opsd.trajectory_weighting.mode", "")).strip().lower()
+    return mode if mode in EFFECTIVE_BATCH_PROBABILITY_MODES else None
+
+
+def trajectory_sensitivity_signal(
+    metrics: dict[str, Any],
+    cfg: dict[str, Any],
+    mode: str,
+) -> float:
+    eps = float(get_nested(cfg, "opsd.trajectory_weighting.eps", 1e-8))
+    jsd = max(float(metrics["native_student_budget_jsd_mean"]), 0.0)
+    if mode in {
+        "jsd_over_current_kl_batch",
+        "jsd_over_current_kl_direct_inverse_batch",
+        "jsd_over_current_kl_softmax_batch",
+    }:
+        denominator = max(float(metrics["native_teacher_gap_b_mean"]), eps)
+    elif mode == "jsd_over_step0_kl_batch":
+        calibration = get_nested(
+            cfg,
+            "opsd.trajectory_weighting.step0_teacher_kl_by_ratio",
+            None,
+        )
+        if not isinstance(calibration, dict):
+            raise ValueError(
+                "jsd_over_step0_kl_batch requires step0_teacher_kl_by_ratio calibration."
+            )
+        key = f"{float(metrics['sampled_b']):.2f}"
+        if key not in calibration:
+            raise KeyError(f"Missing step-0 teacher KL calibration for ratio {key}.")
+        denominator = float(calibration[key])
+        if not math.isfinite(denominator) or denominator <= 0.0:
+            raise ValueError(
+                f"Invalid step-0 teacher KL calibration for ratio {key}: {denominator}."
+            )
+    elif mode == "ratio_group_counterfactual_teachability_batch":
+        signal = float(metrics["native_trajectory_budget_explained_fraction"])
+        if not math.isfinite(signal) or not 0.0 <= signal <= 1.0:
+            raise FloatingPointError(
+                f"Invalid counterfactual-teachability signal: {signal}."
+            )
+        return signal
+    else:
+        raise ValueError(f"Unsupported probability weighting mode: {mode!r}.")
+    signal = jsd / denominator
+    if not math.isfinite(signal) or signal < 0.0:
+        raise FloatingPointError(f"Invalid trajectory sensitivity signal: {signal}.")
+    return signal
+
+
+def prepare_effective_batch_probability_window(
+    model: Any,
+    processor: Any,
+    dataset: Any,
+    cfg: dict[str, Any],
+    rng: random.Random,
+    *,
+    teacher_model: Any | None,
+    ema_shadow: dict[str, torch.Tensor] | None,
+    teacher_adapter_name: str,
+    start_step: int,
+    local_step_start: int,
+    accumulation_steps: int,
+    max_steps: int,
+    distributed: bool,
+    rank: int,
+    world_size: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Probe one complete effective batch, then assign 32-way weights.
+
+    Rollout token IDs are cached on CPU and replayed by the differentiable pass,
+    so the probe and train passes use exactly the same student-generated prefix.
+    """
+
+    mode = trajectory_probability_mode(cfg)
+    if mode is None:
+        raise ValueError("Effective-batch probability probing requires a probability mode.")
+    local_records: list[dict[str, Any]] = []
+    probe_model = unwrap_model(model)
+    global_step_unit = world_size if distributed else 1
+    for offset in range(int(accumulation_steps)):
+        local_step = int(local_step_start) + offset
+        global_index = int(start_step) + local_step * global_step_unit + (rank if distributed else 0)
+        sample = dataset[global_index % len(dataset)]
+        ratio = sample_retention_ratio(
+            cfg,
+            rng,
+            progress_step=global_index,
+            total_steps=max_steps,
+            sample_id=sample.sample_id,
+        )
+        rollout_seed = paired_rollout_seed(
+            seed=int(
+                get_nested(
+                    cfg,
+                    "paired_sampling.rollout_seed",
+                    get_nested(cfg, "training.seed", 42),
+                )
+            ),
+            global_index=global_index,
+            sample_id=sample.sample_id,
+            namespace=str(get_nested(cfg, "paired_sampling.namespace", "opsd_pair_v1")),
+        )
+        with torch.no_grad():
+            probe_loss, probe_metrics = opsd_nogt_step(
+                probe_model,
+                processor,
+                sample,
+                cfg,
+                ratio,
+                teacher_model=teacher_model,
+                ema_shadow=ema_shadow,
+                teacher_adapter_name=teacher_adapter_name,
+                teacher_uses_ground_truth=False,
+                rollout_seed=rollout_seed,
+                progress_step=global_index,
+                total_steps=max_steps,
+                capture_rollout=True,
+            )
+        rollout_cache = probe_metrics.pop(ROLLOUT_CACHE_KEY, None)
+        if not isinstance(rollout_cache, dict):
+            raise AssertionError("Effective-batch probe did not return a rollout cache.")
+        probe_metrics.pop(STUDENT_TEXT_LOG_KEY, None)
+        signal = trajectory_sensitivity_signal(probe_metrics, cfg, mode)
+        local_records.append(
+            {
+                "global_index": global_index,
+                "sample_id": sample.sample_id,
+                "ratio": float(ratio),
+                "rollout_seed": int(rollout_seed),
+                "probe_loss": float(probe_loss.detach().float().cpu()),
+                "signal": signal,
+                "projection_mass": float(
+                    probe_metrics.get("native_trajectory_budget_projection_mass", 0.0)
+                ),
+                "teacher_js_mass": float(
+                    probe_metrics.get("native_trajectory_teacher_js_mass", 0.0)
+                ),
+                "jsd": float(probe_metrics["native_student_budget_jsd_mean"]),
+                "current_teacher_kl": float(probe_metrics["native_teacher_gap_b_mean"]),
+                "b_plus_teacher_kl": float(
+                    probe_metrics["native_teacher_gap_b_plus_mean"]
+                ),
+                "sampled_b_plus": float(probe_metrics["sampled_b_plus"]),
+                "b_visual_tokens": int(probe_metrics["native_b_num_kept_visual_tokens"]),
+                "b_plus_visual_tokens": int(
+                    probe_metrics["native_b_plus_num_kept_visual_tokens"]
+                ),
+                "rollout": rollout_cache,
+            }
+        )
+        del probe_loss, probe_metrics
+
+    device = primary_device(model)
+    local_signals = torch.tensor(
+        [record["signal"] for record in local_records], dtype=torch.float32, device=device
+    )
+    local_losses = torch.tensor(
+        [record["probe_loss"] for record in local_records], dtype=torch.float32, device=device
+    )
+    use_distributed = distributed and dist.is_initialized() and world_size > 1
+    if use_distributed:
+        gathered_signals = [torch.empty_like(local_signals) for _ in range(world_size)]
+        gathered_losses = [torch.empty_like(local_losses) for _ in range(world_size)]
+        dist.all_gather(gathered_signals, local_signals)
+        dist.all_gather(gathered_losses, local_losses)
+        global_signals = torch.cat(gathered_signals)
+        global_losses = torch.cat(gathered_losses)
+        gathered_records: list[list[dict[str, Any]] | None] = [None] * world_size
+        public_records = [
+            {key: value for key, value in record.items() if key != "rollout"}
+            for record in local_records
+        ]
+        dist.all_gather_object(gathered_records, public_records)
+        global_records = [
+            record
+            for rank_records in gathered_records
+            if rank_records is not None
+            for record in rank_records
+        ]
+    else:
+        global_signals = local_signals
+        global_losses = local_losses
+        global_records = [
+            {key: value for key, value in record.items() if key != "rollout"}
+            for record in local_records
+        ]
+
+    eps = float(get_nested(cfg, "opsd.trajectory_weighting.eps", 1e-8))
+    if mode == "ratio_group_counterfactual_teachability_batch":
+        global_ratios = torch.tensor(
+            [float(record["ratio"]) for record in global_records],
+            dtype=torch.float32,
+            device=global_signals.device,
+        )
+        global_projection_mass = torch.tensor(
+            [float(record["projection_mass"]) for record in global_records],
+            dtype=torch.float32,
+            device=global_signals.device,
+        )
+        global_teacher_js_mass = torch.tensor(
+            [float(record["teacher_js_mass"]) for record in global_records],
+            dtype=torch.float32,
+            device=global_signals.device,
+        )
+        weights = ratio_group_fraction_probability_weights(
+            global_projection_mass,
+            global_teacher_js_mass,
+            global_ratios,
+            eps=eps,
+        )
+        batch_tau: float | None = None
+        group_signal = weights.group_signal
+    elif mode == "jsd_over_current_kl_direct_inverse_batch":
+        weights = direct_inverse_sensitivity_probability_weights(global_signals, eps=eps)
+        batch_tau = None
+        group_signal = global_signals
+    elif mode == "jsd_over_current_kl_softmax_batch":
+        weights = softmax_inverse_sensitivity_probability_weights(
+            global_signals,
+            temperature=float(
+                get_nested(cfg, "opsd.trajectory_weighting.temperature")
+            ),
+        )
+        batch_tau = None
+        group_signal = global_signals
+    else:
+        weights = inverse_sensitivity_probability_weights(global_signals, eps=eps)
+        batch_tau = float(weights.tau.cpu())
+        group_signal = global_signals
+    expected_size = int(accumulation_steps) * (world_size if use_distributed else 1)
+    if int(weights.probability_weight.numel()) != expected_size:
+        raise AssertionError(
+            f"Effective-batch weight count mismatch: {weights.probability_weight.numel()} vs {expected_size}."
+        )
+    start = rank * int(accumulation_steps) if use_distributed else 0
+    local_weights = weights.probability_weight[start : start + int(accumulation_steps)]
+    local_group_signal = group_signal[start : start + int(accumulation_steps)]
+    for record, probability_weight, current_group_signal in zip(
+        local_records, local_weights, local_group_signal
+    ):
+        record["probability_weight"] = float(probability_weight.cpu())
+        record["ratio_group_signal"] = float(current_group_signal.cpu())
+    for record, probability_weight, current_group_signal in zip(
+        global_records, weights.probability_weight, group_signal
+    ):
+        record["probability_weight"] = float(probability_weight.cpu())
+        record["ratio_group_signal"] = float(current_group_signal.cpu())
+
+    weighted_kl = (weights.probability_weight * global_losses).sum()
+    unweighted_kl = global_losses.mean()
+    summary = {
+        "trajectory_weighting_mode": mode,
+        "trajectory_normalization": "effective_batch_probability_sum_one",
+        "trajectory_effective_batch_size": expected_size,
+        "trajectory_probability_weight_sum": float(weights.probability_weight.sum().cpu()),
+        "trajectory_probability_weight_min": float(weights.probability_weight.min().cpu()),
+        "trajectory_probability_weight_max": float(weights.probability_weight.max().cpu()),
+        "trajectory_effective_multiplier_min": float(
+            (weights.probability_weight * expected_size).min().cpu()
+        ),
+        "trajectory_effective_multiplier_max": float(
+            (weights.probability_weight * expected_size).max().cpu()
+        ),
+        "trajectory_batch_tau": batch_tau,
+        "trajectory_weight_transform": (
+            "direct_inverse"
+            if mode == "jsd_over_current_kl_direct_inverse_batch"
+            else (
+                "softmax_negative_sensitivity"
+                if mode == "jsd_over_current_kl_softmax_batch"
+                else "median_inverse"
+            )
+        ),
+        "trajectory_weight_temperature": (
+            float(get_nested(cfg, "opsd.trajectory_weighting.temperature"))
+            if mode == "jsd_over_current_kl_softmax_batch"
+            else None
+        ),
+        "trajectory_ratio_group_signal_min": float(group_signal.min().cpu()),
+        "trajectory_ratio_group_signal_mean": float(group_signal.mean().cpu()),
+        "trajectory_ratio_group_signal_max": float(group_signal.max().cpu()),
+        "trajectory_signal_min": float(global_signals.min().cpu()),
+        "trajectory_signal_mean": float(global_signals.mean().cpu()),
+        "trajectory_signal_max": float(global_signals.max().cpu()),
+        "trajectory_global_unweighted_kl": float(unweighted_kl.cpu()),
+        "trajectory_global_weighted_kl": float(weighted_kl.cpu()),
+        "trajectory_global_scalar_error": float((weighted_kl - unweighted_kl).cpu()),
+        "trajectory_loss_scale_ratio": float(
+            (weighted_kl / unweighted_kl.clamp_min(eps)).cpu()
+        ),
+        "trajectory_weight_detached": not weights.probability_weight.requires_grad,
+        "global_records": global_records,
+    }
+    return local_records, summary
+
+
+def initialize_trajectory_curriculum_state(
+    cfg: dict[str, Any],
+) -> RobustnessGatedCurriculumState | SensitivityFrontierState | None:
+    if not bool(get_nested(cfg, "opsd.trajectory_weighting.enabled", False)):
+        return None
+    mode = str(get_nested(cfg, "opsd.trajectory_weighting.mode", "")).strip().lower()
+    if mode == "sensitivity_frontier":
+        return SensitivityFrontierState(
+            calibration_target_per_ratio=int(
+                get_nested(cfg, "opsd.trajectory_weighting.calibration_target_per_ratio", 64)
+            ),
+            ema_half_life_trajectories=float(
+                get_nested(cfg, "opsd.trajectory_weighting.ema_half_life_trajectories", 256.0)
+            ),
+            progress_drop_scale=float(
+                get_nested(cfg, "opsd.trajectory_weighting.progress_drop_scale", 0.5)
+            ),
+            progress_power=float(
+                get_nested(cfg, "opsd.trajectory_weighting.progress_power", 2.0)
+            ),
+        )
+    if mode != "robustness_gated_curriculum":
+        return None
+    calibration = get_nested(cfg, "opsd.trajectory_weighting.calibration", None)
+    if not isinstance(calibration, dict):
+        raise ValueError(
+            "robustness_gated_curriculum requires a frozen trajectory_weighting.calibration mapping."
+        )
+    initial_gap = float(calibration["initial_teacher_gap_mean"])
+    return RobustnessGatedCurriculumState(
+        initial_teacher_gap_mean=initial_gap,
+        ema_teacher_gap_mean=initial_gap,
+        ema_half_life_trajectories=float(
+            get_nested(cfg, "opsd.trajectory_weighting.ema_half_life_trajectories", 256.0)
+        ),
+        progress_power=float(get_nested(cfg, "opsd.trajectory_weighting.progress_power", 3.0)),
+    )
+
+
+def apply_distributed_trajectory_weighting(
+    batch_losses: list[torch.Tensor],
+    batch_metrics: list[dict[str, Any]],
+    cfg: dict[str, Any],
+    *,
+    distributed: bool,
+    rank: int,
+    world_size: int,
+    curriculum_state: RobustnessGatedCurriculumState | SensitivityFrontierState | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Redistribute whole-trajectory OPSD gradients across a synchronized DDP block."""
+
+    enabled = bool(get_nested(cfg, "opsd.trajectory_weighting.enabled", False))
+    vanilla = torch.stack(batch_losses).mean()
+    if not enabled:
+        return vanilla, {"trajectory_weighting_enabled": False}
+    mode = str(get_nested(cfg, "opsd.trajectory_weighting.mode", "closure_rank")).strip().lower()
+    probability_modes = {
+        "jsd_over_current_kl_batch",
+        "jsd_over_current_kl_direct_inverse_batch",
+        "jsd_over_current_kl_softmax_batch",
+        "jsd_over_step0_kl_batch",
+        "ratio_group_counterfactual_teachability_batch",
+    }
+    if mode not in probability_modes and (
+        not distributed or not dist.is_initialized() or world_size < 2
+    ):
+        raise ValueError("Trajectory rank weighting requires synchronized multi-rank DDP.")
+
+    signal_spec = {
+        "closure_rank": ("native_trajectory_budget_closure_mass", True),
+        "teacher_gap_rank": ("native_teacher_gap_b_mean", True),
+        "robustness_rank": ("native_sensitivity_mean", False),
+        "relative_robustness_rank": ("derived_relative_sensitivity", False),
+        "residual_robustness_rank": ("derived_residual_sensitivity", False),
+        "residual_robustness_soft": ("derived_residual_sensitivity", False),
+        "robustness_gated_curriculum": ("native_trajectory_mass_robustness", True),
+        "sensitivity_frontier": ("native_trajectory_teacher_gap_sensitivity", False),
+        "jsd_over_current_kl_batch": ("derived_jsd_over_current_kl", False),
+        "jsd_over_current_kl_direct_inverse_batch": (
+            "derived_jsd_over_current_kl",
+            False,
+        ),
+        "jsd_over_current_kl_softmax_batch": (
+            "derived_jsd_over_current_kl",
+            False,
+        ),
+        "jsd_over_step0_kl_batch": ("derived_jsd_over_step0_kl", False),
+        "ratio_group_counterfactual_teachability_batch": (
+            "native_trajectory_budget_explained_fraction",
+            True,
+        ),
+    }
+    if mode not in signal_spec:
+        raise ValueError(
+            f"Unknown trajectory weighting mode {mode!r}; expected one of {sorted(signal_spec)}."
+        )
+    signal_key, higher_is_better = signal_spec[mode]
+    if len(batch_losses) != len(batch_metrics):
+        raise AssertionError("Every trajectory loss must have one metrics record.")
+    required_keys = {signal_key}
+    if mode in {
+        "relative_robustness_rank",
+        "residual_robustness_rank",
+        "residual_robustness_soft",
+    }:
+        required_keys = {"native_sensitivity_mean", "native_teacher_gap_b_mean"}
+    if mode in {"residual_robustness_rank", "residual_robustness_soft"}:
+        required_keys.add("sampled_b")
+    if mode == "robustness_gated_curriculum":
+        required_keys = {
+            "native_trajectory_mass_robustness",
+            "native_teacher_gap_b_mean",
+        }
+    if mode == "sensitivity_frontier":
+        required_keys = {
+            "native_trajectory_teacher_gap_sensitivity",
+            "sampled_b",
+        }
+    if mode in {
+        "jsd_over_current_kl_batch",
+        "jsd_over_current_kl_direct_inverse_batch",
+        "jsd_over_current_kl_softmax_batch",
+    }:
+        required_keys = {
+            "native_student_budget_jsd_mean",
+            "native_teacher_gap_b_mean",
+        }
+    if mode == "jsd_over_step0_kl_batch":
+        required_keys = {
+            "native_student_budget_jsd_mean",
+            "sampled_b",
+        }
+    if mode == "ratio_group_counterfactual_teachability_batch":
+        required_keys = {
+            "native_trajectory_budget_explained_fraction",
+            "native_trajectory_budget_projection_mass",
+            "native_trajectory_teacher_js_mass",
+            "sampled_b",
+        }
+    for required_key in sorted(required_keys):
+        missing = [index for index, item in enumerate(batch_metrics) if required_key not in item]
+        if missing:
+            raise KeyError(
+                f"Trajectory signal input {required_key!r} missing for local items {missing}."
+            )
+
+    device = batch_losses[0].device
+    local_losses = torch.stack([item.detach().float() for item in batch_losses])
+    local_teacher_gaps: torch.Tensor | None = None
+    local_ratios: torch.Tensor | None = None
+    local_projection_mass: torch.Tensor | None = None
+    local_teacher_js_mass: torch.Tensor | None = None
+    if mode == "robustness_gated_curriculum":
+        if curriculum_state is None:
+            raise ValueError("robustness_gated_curriculum requires initialized curriculum state.")
+        local_signals = torch.tensor(
+            [float(item["native_trajectory_mass_robustness"]) for item in batch_metrics],
+            dtype=torch.float32,
+            device=device,
+        )
+        local_teacher_gaps = torch.tensor(
+            [max(float(item["native_teacher_gap_b_mean"]), 0.0) for item in batch_metrics],
+            dtype=torch.float32,
+            device=device,
+        )
+    elif mode == "sensitivity_frontier":
+        if not isinstance(curriculum_state, SensitivityFrontierState):
+            raise ValueError("sensitivity_frontier requires initialized frontier state.")
+        local_signals = torch.tensor(
+            [float(item["native_trajectory_teacher_gap_sensitivity"]) for item in batch_metrics],
+            dtype=torch.float32,
+            device=device,
+        )
+        local_ratios = torch.tensor(
+            [float(item["sampled_b"]) for item in batch_metrics],
+            dtype=torch.float32,
+            device=device,
+        )
+    elif mode == "ratio_group_counterfactual_teachability_batch":
+        local_signals = torch.tensor(
+            [
+                float(item["native_trajectory_budget_explained_fraction"])
+                for item in batch_metrics
+            ],
+            dtype=torch.float32,
+            device=device,
+        )
+        local_ratios = torch.tensor(
+            [float(item["sampled_b"]) for item in batch_metrics],
+            dtype=torch.float32,
+            device=device,
+        )
+        local_projection_mass = torch.tensor(
+            [
+                float(item["native_trajectory_budget_projection_mass"])
+                for item in batch_metrics
+            ],
+            dtype=torch.float32,
+            device=device,
+        )
+        local_teacher_js_mass = torch.tensor(
+            [float(item["native_trajectory_teacher_js_mass"]) for item in batch_metrics],
+            dtype=torch.float32,
+            device=device,
+        )
+    elif mode == "relative_robustness_rank":
+        local_signals = torch.tensor(
+            [
+                float(item["native_sensitivity_mean"])
+                / max(float(item["native_teacher_gap_b_mean"]), 1e-8)
+                for item in batch_metrics
+            ],
+            dtype=torch.float32,
+            device=device,
+        )
+    elif mode in {
+        "jsd_over_current_kl_batch",
+        "jsd_over_current_kl_direct_inverse_batch",
+        "jsd_over_current_kl_softmax_batch",
+    }:
+        eps = float(get_nested(cfg, "opsd.trajectory_weighting.eps", 1e-8))
+        local_signals = torch.tensor(
+            [
+                max(float(item["native_student_budget_jsd_mean"]), 0.0)
+                / max(float(item["native_teacher_gap_b_mean"]), eps)
+                for item in batch_metrics
+            ],
+            dtype=torch.float32,
+            device=device,
+        )
+    elif mode == "jsd_over_step0_kl_batch":
+        calibration = get_nested(
+            cfg,
+            "opsd.trajectory_weighting.step0_teacher_kl_by_ratio",
+            None,
+        )
+        if not isinstance(calibration, dict):
+            raise ValueError(
+                "jsd_over_step0_kl_batch requires step0_teacher_kl_by_ratio calibration."
+            )
+
+        def step0_kl(item: dict[str, Any]) -> float:
+            key = f"{float(item['sampled_b']):.2f}"
+            if key not in calibration:
+                raise KeyError(f"Missing step-0 teacher KL calibration for ratio {key}.")
+            value = float(calibration[key])
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"Invalid step-0 teacher KL calibration for ratio {key}: {value}.")
+            return value
+
+        local_signals = torch.tensor(
+            [
+                max(float(item["native_student_budget_jsd_mean"]), 0.0)
+                / step0_kl(item)
+                for item in batch_metrics
+            ],
+            dtype=torch.float32,
+            device=device,
+        )
+    elif mode in {"residual_robustness_rank", "residual_robustness_soft"}:
+        calibration = get_nested(cfg, "opsd.trajectory_weighting.residual_calibration", None)
+        if not isinstance(calibration, dict):
+            raise ValueError("Residual robustness requires a frozen residual_calibration mapping.")
+        local_signals = residualized_budget_sensitivity(
+            torch.tensor(
+                [float(item["native_sensitivity_mean"]) for item in batch_metrics],
+                dtype=torch.float32,
+                device=device,
+            ),
+            torch.tensor(
+                [float(item["native_teacher_gap_b_mean"]) for item in batch_metrics],
+                dtype=torch.float32,
+                device=device,
+            ),
+            torch.tensor(
+                [float(item["sampled_b"]) for item in batch_metrics],
+                dtype=torch.float32,
+                device=device,
+            ),
+            ratio_intercepts={
+                str(key): float(value) for key, value in calibration["ratio_intercepts"].items()
+            },
+            ratio_log_teacher_gap_coefficients={
+                str(key): float(value)
+                for key, value in calibration["ratio_log_teacher_gap_coefficients"].items()
+            },
+            ratio_scales={str(key): float(value) for key, value in calibration["ratio_scales"].items()},
+            eps=float(get_nested(cfg, "opsd.trajectory_weighting.eps", 1e-8)),
+        )
+    else:
+        local_signals = torch.tensor(
+            [float(item[signal_key]) for item in batch_metrics],
+            dtype=torch.float32,
+            device=device,
+        )
+    use_distributed_gather = distributed and dist.is_initialized() and world_size > 1
+    if use_distributed_gather:
+        gathered_losses = [torch.empty_like(local_losses) for _ in range(world_size)]
+        gathered_signals = [torch.empty_like(local_signals) for _ in range(world_size)]
+        dist.all_gather(gathered_losses, local_losses)
+        dist.all_gather(gathered_signals, local_signals)
+        global_losses = torch.cat(gathered_losses)
+        global_signals = torch.cat(gathered_signals)
+    else:
+        global_losses = local_losses
+        global_signals = local_signals
+    global_teacher_gaps: torch.Tensor | None = None
+    if local_teacher_gaps is not None:
+        gathered_teacher_gaps = [torch.empty_like(local_teacher_gaps) for _ in range(world_size)]
+        dist.all_gather(gathered_teacher_gaps, local_teacher_gaps)
+        global_teacher_gaps = torch.cat(gathered_teacher_gaps)
+    global_ratios: torch.Tensor | None = None
+    if local_ratios is not None:
+        if use_distributed_gather:
+            gathered_ratios = [torch.empty_like(local_ratios) for _ in range(world_size)]
+            dist.all_gather(gathered_ratios, local_ratios)
+            global_ratios = torch.cat(gathered_ratios)
+        else:
+            global_ratios = local_ratios
+    global_projection_mass: torch.Tensor | None = None
+    global_teacher_js_mass: torch.Tensor | None = None
+    if local_projection_mass is not None and local_teacher_js_mass is not None:
+        if use_distributed_gather:
+            gathered_projection_mass = [
+                torch.empty_like(local_projection_mass) for _ in range(world_size)
+            ]
+            gathered_teacher_js_mass = [
+                torch.empty_like(local_teacher_js_mass) for _ in range(world_size)
+            ]
+            dist.all_gather(gathered_projection_mass, local_projection_mass)
+            dist.all_gather(gathered_teacher_js_mass, local_teacher_js_mass)
+            global_projection_mass = torch.cat(gathered_projection_mass)
+            global_teacher_js_mass = torch.cat(gathered_teacher_js_mass)
+        else:
+            global_projection_mass = local_projection_mass
+            global_teacher_js_mass = local_teacher_js_mass
+    strength = float(get_nested(cfg, "opsd.trajectory_weighting.downweight_strength", 0.25))
+    eps = float(get_nested(cfg, "opsd.trajectory_weighting.eps", 1e-8))
+    curriculum_metrics: dict[str, Any] = {}
+    frontier_ratio_gate: torch.Tensor | None = None
+    frontier_local_robustness: torch.Tensor | None = None
+    if mode in probability_modes:
+        if mode == "ratio_group_counterfactual_teachability_batch":
+            if (
+                global_ratios is None
+                or global_projection_mass is None
+                or global_teacher_js_mass is None
+            ):
+                raise AssertionError(
+                    "Ratio-group teachability requires synchronized ratios and geometry masses."
+                )
+            probability = ratio_group_fraction_probability_weights(
+                global_projection_mass,
+                global_teacher_js_mass,
+                global_ratios,
+                eps=eps,
+            )
+            batch_tau: float | None = None
+            group_signal = probability.group_signal
+        elif mode == "jsd_over_current_kl_direct_inverse_batch":
+            probability = direct_inverse_sensitivity_probability_weights(
+                global_signals, eps=eps
+            )
+            batch_tau = None
+            group_signal = global_signals
+        elif mode == "jsd_over_current_kl_softmax_batch":
+            probability = softmax_inverse_sensitivity_probability_weights(
+                global_signals,
+                temperature=float(
+                    get_nested(cfg, "opsd.trajectory_weighting.temperature")
+                ),
+            )
+            batch_tau = None
+            group_signal = global_signals
+        else:
+            probability = inverse_sensitivity_probability_weights(global_signals, eps=eps)
+            batch_tau = float(probability.tau.cpu())
+            group_signal = global_signals
+        start = rank * len(batch_losses) if use_distributed_gather else 0
+        end = start + len(batch_losses)
+        local_probability = probability.probability_weight[start:end].to(device=device)
+        local_loss_vector = torch.stack(batch_losses)
+        ddp_scale = float(world_size) if use_distributed_gather else 1.0
+        weighted = ddp_scale * (local_probability * local_loss_vector).sum()
+        global_weighted_kl = (
+            probability.probability_weight * global_losses
+        ).sum()
+        global_unweighted_kl = global_losses.mean()
+        effective_multiplier = probability.probability_weight * global_losses.numel()
+        return weighted, {
+            "trajectory_weighting_enabled": True,
+            "trajectory_weighting_mode": mode,
+            "trajectory_signal_key": signal_key,
+            "trajectory_signal": float(local_signals.mean().cpu()),
+            "trajectory_signal_min": float(global_signals.min().cpu()),
+            "trajectory_signal_mean": float(global_signals.mean().cpu()),
+            "trajectory_signal_max": float(global_signals.max().cpu()),
+            "trajectory_batch_tau": batch_tau,
+            "trajectory_weight_transform": (
+                "direct_inverse"
+                if mode == "jsd_over_current_kl_direct_inverse_batch"
+                else (
+                    "softmax_negative_sensitivity"
+                    if mode == "jsd_over_current_kl_softmax_batch"
+                    else "median_inverse"
+                )
+            ),
+            "trajectory_weight_temperature": (
+                float(get_nested(cfg, "opsd.trajectory_weighting.temperature"))
+                if mode == "jsd_over_current_kl_softmax_batch"
+                else None
+            ),
+            "trajectory_ratio_group_signal": float(
+                group_signal[start:end].mean().cpu()
+            ),
+            "trajectory_raw_weight": float(probability.raw_weight[start:end].mean().cpu()),
+            "trajectory_probability_weight": float(local_probability.mean().cpu()),
+            "trajectory_probability_weight_sum": float(
+                probability.probability_weight.sum().cpu()
+            ),
+            "trajectory_effective_multiplier": float(
+                effective_multiplier[start:end].mean().cpu()
+            ),
+            "trajectory_global_unweighted_kl": float(global_unweighted_kl.cpu()),
+            "trajectory_global_weighted_kl": float(global_weighted_kl.cpu()),
+            "trajectory_global_scalar_error": float(
+                (global_weighted_kl - global_unweighted_kl).cpu()
+            ),
+            "trajectory_loss_scale_ratio": float(
+                (global_weighted_kl / global_unweighted_kl.clamp_min(eps)).cpu()
+            ),
+            "trajectory_rank_block_size": int(global_losses.numel()),
+            "trajectory_normalization": "synchronized_probability_sum_one",
+            "trajectory_ddp_objective_scale": ddp_scale,
+            "trajectory_weight_detached": not local_probability.requires_grad,
+        }
+    if mode == "robustness_gated_curriculum":
+        if curriculum_state is None or global_teacher_gaps is None:
+            raise AssertionError("Curriculum state and teacher gaps must be available.")
+        calibration = get_nested(cfg, "opsd.trajectory_weighting.calibration", None)
+        if not isinstance(calibration, dict):
+            raise ValueError("Missing frozen robustness-gated curriculum calibration.")
+        stage = curriculum_state.stage
+        result = robustness_gated_curriculum_weights(
+            global_losses,
+            global_signals,
+            global_teacher_gaps,
+            curriculum_stage=stage,
+            log_teacher_gap_center=float(calibration["log_teacher_gap_center"]),
+            log_teacher_gap_scale=float(calibration["log_teacher_gap_scale"]),
+            weight_floor=float(get_nested(cfg, "opsd.trajectory_weighting.weight_floor", 0.1)),
+            eps=eps,
+        )
+        state_update = curriculum_state.update(
+            float(global_teacher_gaps.mean().cpu()),
+            int(global_teacher_gaps.numel()),
+        )
+        curriculum_metrics = {
+            "trajectory_curriculum_stage": float(stage),
+            "trajectory_curriculum_stage_after_update": float(state_update["stage_after"]),
+            "trajectory_curriculum_ema_teacher_gap": float(
+                state_update["ema_teacher_gap_mean"]
+            ),
+            "trajectory_curriculum_initial_teacher_gap": float(
+                curriculum_state.initial_teacher_gap_mean
+            ),
+            "trajectory_curriculum_ema_decay": float(state_update["ema_decay"]),
+            "trajectory_curriculum_updates": int(state_update["updates"]),
+            "trajectory_curriculum_trajectories_seen": int(
+                state_update["trajectories_seen"]
+            ),
+            "trajectory_global_teacher_gap": float(global_teacher_gaps.mean().cpu()),
+        }
+    elif mode == "sensitivity_frontier":
+        if not isinstance(curriculum_state, SensitivityFrontierState) or global_ratios is None:
+            raise AssertionError("Sensitivity frontier state and ratios must be available.")
+        ready_before = curriculum_state.ready
+        progress_before = curriculum_state.progress
+        frontier_before = curriculum_state.frontier_index
+        weight_floor = float(get_nested(cfg, "opsd.trajectory_weighting.weight_floor", 0.1))
+        if ready_before:
+            result = sensitivity_frontier_weights(
+                global_losses,
+                global_signals,
+                global_ratios,
+                curriculum_state,
+                weight_floor=weight_floor,
+                eps=eps,
+            )
+            frontier_ratio_gate = result.ratio_gate
+            frontier_local_robustness = result.local_robustness
+        else:
+            result = trajectory_priority_downweights(
+                global_losses,
+                torch.ones_like(global_losses),
+                downweight_strength=1.0 - weight_floor,
+                eps=eps,
+            )
+            frontier_ratio_gate = torch.zeros_like(global_losses)
+            frontier_local_robustness = torch.ones_like(global_losses)
+        state_update = curriculum_state.update(
+            [float(value) for value in global_ratios.detach().cpu().tolist()],
+            [float(value) for value in global_signals.detach().cpu().tolist()],
+        )
+        ratio_weight_means: dict[str, float] = {}
+        ratio_gate_means: dict[str, float] = {}
+        for ratio in curriculum_state.retention_ratios:
+            ratio_mask = torch.isclose(
+                global_ratios,
+                torch.tensor(ratio, dtype=global_ratios.dtype, device=global_ratios.device),
+                rtol=0.0,
+                atol=1e-6,
+            )
+            if bool(ratio_mask.any()):
+                key = f"{ratio:.2f}"
+                ratio_weight_means[key] = float(result.weight[ratio_mask].mean().cpu())
+                ratio_gate_means[key] = float(frontier_ratio_gate[ratio_mask].mean().cpu())
+        curriculum_metrics = {
+            "trajectory_frontier_ready_before": ready_before,
+            "trajectory_frontier_ready_after": bool(state_update["ready_after"]),
+            "trajectory_frontier_progress": float(progress_before),
+            "trajectory_frontier_progress_after_update": float(state_update["progress_after"]),
+            "trajectory_frontier_index": float(frontier_before),
+            "trajectory_frontier_index_after_update": float(state_update["frontier_after"]),
+            "trajectory_frontier_unresolved_sensitivity": float(
+                curriculum_state.unresolved_sensitivity
+            ),
+            "trajectory_frontier_calibration_counts": dict(
+                curriculum_state.calibration_counts
+            ),
+            "trajectory_frontier_initial_sensitivity": dict(
+                curriculum_state.initial_sensitivity
+            ),
+            "trajectory_frontier_ema_sensitivity": dict(curriculum_state.ema_sensitivity),
+            "trajectory_frontier_calibration_complete_at": (
+                curriculum_state.calibration_complete_at_trajectory
+            ),
+            "trajectory_frontier_ratio_weight_means": ratio_weight_means,
+            "trajectory_frontier_ratio_gate_means": ratio_gate_means,
+            "trajectory_frontier_updates": int(curriculum_state.updates),
+            "trajectory_frontier_trajectories_seen": int(
+                curriculum_state.trajectories_seen
+            ),
+            "trajectory_frontier_progress_drop_scale": float(
+                curriculum_state.progress_drop_scale
+            ),
+            "trajectory_frontier_ema_half_life": float(
+                curriculum_state.ema_half_life_trajectories
+            ),
+        }
+    elif mode == "residual_robustness_soft":
+        result = trajectory_sigmoid_downweights(
+            global_losses,
+            global_signals,
+            downweight_strength=strength,
+            temperature=float(
+                get_nested(cfg, "opsd.trajectory_weighting.residual_temperature", 1.0)
+            ),
+            eps=eps,
+        )
+    else:
+        result = trajectory_rank_downweights(
+            global_losses,
+            global_signals,
+            downweight_strength=strength,
+            higher_is_better=higher_is_better,
+            eps=eps,
+        )
+    start = rank * len(batch_losses)
+    local_weights = result.weight[start : start + len(batch_losses)].to(device=device)
+    weighted = torch.stack(
+        [weight * loss for weight, loss in zip(local_weights, batch_losses)]
+    ).mean()
+    scalar_error = result.weighted_loss_mass - result.unweighted_loss_mass
+    output_metrics = {
+        "trajectory_weighting_enabled": True,
+        "trajectory_weighting_mode": mode,
+        "trajectory_signal_key": signal_key,
+        "trajectory_signal": float(local_signals.mean().cpu()),
+        "trajectory_priority": float(result.priority[start : start + len(batch_losses)].mean().cpu()),
+        "trajectory_raw_weight": float(result.raw_weight[start : start + len(batch_losses)].mean().cpu()),
+        "trajectory_weight": float(local_weights.mean().cpu()),
+        "trajectory_loss_mass_scale": float(result.loss_mass_scale.cpu()),
+        "trajectory_global_unweighted_kl": float(
+            (result.unweighted_loss_mass / global_losses.numel()).cpu()
+        ),
+        "trajectory_global_weighted_kl": float(
+            (result.weighted_loss_mass / global_losses.numel()).cpu()
+        ),
+        "trajectory_global_scalar_error": float(scalar_error.cpu()),
+        "trajectory_rank_block_size": int(global_losses.numel()),
+        "trajectory_downweight_strength": float(
+            1.0 - float(get_nested(cfg, "opsd.trajectory_weighting.weight_floor", 0.1))
+            if mode == "sensitivity_frontier"
+            else get_nested(cfg, "opsd.trajectory_weighting.downweight_strength", 0.25)
+        ),
+        "trajectory_residual_temperature": (
+            float(get_nested(cfg, "opsd.trajectory_weighting.residual_temperature", 1.0))
+            if mode == "residual_robustness_soft"
+            else None
+        ),
+        "trajectory_weight_detached": not local_weights.requires_grad,
+    }
+    if mode == "robustness_gated_curriculum":
+        current_slice = slice(start, start + len(batch_losses))
+        output_metrics.update(
+            {
+                "trajectory_robustness": float(global_signals[current_slice].mean().cpu()),
+                "trajectory_difficulty": float(result.difficulty[current_slice].mean().cpu()),
+                "trajectory_focus": float(result.focus[current_slice].mean().cpu()),
+                "trajectory_mean_normalized_weight": float(
+                    result.mean_normalized_weight[current_slice].mean().cpu()
+                ),
+                "trajectory_weight_floor": float(
+                    get_nested(cfg, "opsd.trajectory_weighting.weight_floor", 0.1)
+                ),
+                **curriculum_metrics,
+            }
+        )
+    if mode == "sensitivity_frontier":
+        if frontier_ratio_gate is None or frontier_local_robustness is None:
+            raise AssertionError("Sensitivity frontier diagnostics were not initialized.")
+        current_slice = slice(start, start + len(batch_losses))
+        output_metrics.update(
+            {
+                "trajectory_ratio_gate": float(
+                    frontier_ratio_gate[current_slice].mean().cpu()
+                ),
+                "trajectory_local_robustness": float(
+                    frontier_local_robustness[current_slice].mean().cpu()
+                ),
+                "trajectory_weight_floor": float(
+                    get_nested(cfg, "opsd.trajectory_weighting.weight_floor", 0.1)
+                ),
+                **curriculum_metrics,
+            }
+        )
+    return weighted, output_metrics
+
+
+def validate_paired_native_budget_config(
+    cfg: dict[str, Any],
+    method: str,
+    parameter_scope: str,
+    pruning_method: str,
+) -> None:
+    paired = bool(get_nested(cfg, "paired_sampling.enabled", False))
+    weighted = bool(get_nested(cfg, "opsd.native_budget_weighting.enabled", False))
+    if not paired and not weighted:
+        return
+    if method != "opsd_nogt":
+        raise ValueError("Paired native-budget training is implemented only for training.method=opsd_nogt.")
+    if parameter_scope != "language_decoder_only":
+        raise ValueError("Paired native-budget training requires LLM-only LoRA scope.")
+    if pruning_method != "visionzip":
+        raise ValueError("Native budget sensitivity requires the native VisionZip backend.")
+    if float(get_nested(cfg, "training.lora_dropout", -1.0)) != 0.0:
+        raise ValueError("Paired native-budget training requires training.lora_dropout=0.")
+    if str(get_nested(cfg, "pruning.retention_ratio_schedule", "")).strip().lower() != "paired_deterministic_uniform":
+        raise ValueError(
+            "Paired runs require pruning.retention_ratio_schedule=paired_deterministic_uniform."
+        )
+    ratios = [float(value) for value in get_nested(cfg, "pruning.train_retention_ratios", [])]
+    if ratios != [0.1, 0.2, 0.3, 0.4]:
+        raise ValueError(f"Paired runs require ratios [0.1, 0.2, 0.3, 0.4]; got {ratios}.")
+    if int(get_nested(cfg, "training.max_sample_retries", 0) or 0) != 0:
+        raise ValueError("Paired runs require max_sample_retries=0 so corresponding sample order cannot diverge.")
+    if weighted:
+        delta_mode = str(
+            get_nested(cfg, "opsd.native_budget_weighting.budget_delta_mode", "absolute")
+        ).strip().lower()
+        if delta_mode == "absolute":
+            delta = float(
+                get_nested(cfg, "opsd.native_budget_weighting.budget_delta", float("nan"))
+            )
+            allowed_deltas = (0.03, 0.05, 0.10)
+            if not any(
+                math.isclose(delta, allowed, rel_tol=0.0, abs_tol=1e-12)
+                for allowed in allowed_deltas
+            ):
+                raise ValueError(
+                    f"Native budget weighting requires budget_delta in {allowed_deltas}; got {delta}."
+                )
+        elif delta_mode == "relative":
+            fraction = float(
+                get_nested(
+                    cfg,
+                    "opsd.native_budget_weighting.budget_delta_fraction",
+                    float("nan"),
+                )
+            )
+            if not math.isfinite(fraction) or fraction <= 0.0:
+                raise ValueError("Relative native budget expansion must be finite and positive.")
+            if max(ratios) * (1.0 + fraction) >= 1.0:
+                raise ValueError("Relative native budget expansion must remain pruned.")
+        else:
+            raise ValueError(f"Unsupported native budget delta mode: {delta_mode!r}.")
+        if float(get_nested(cfg, "opsd.native_budget_weighting.sensitivity_temperature", 1.0)) <= 0.0:
+            raise ValueError("Sensitivity KL temperature must be positive.")
+        weighting_mode = str(
+            get_nested(cfg, "opsd.native_budget_weighting.mode", "inverse_student_gap")
+        ).strip().lower()
+        allowed_modes = {
+            "trajectory_probe",
+            "symmetric_teacher_gap_stability",
+            "inverse_student_gap",
+            "teacher_gap_persistence",
+            "counterfactual_rescue_amplification",
+            "native_budget_rescue_grouped",
+            "counterfactual_teachability_grouped",
+            "teacher_gap_grouped_control",
+            "counterfactual_teachability_mixture",
+            "counterfactual_teachability_modulation",
+            "conditional_rescue_residual",
+            "budget_consistent_rank",
+            "budget_residual_hardness",
+            "budget_gradient_consensus",
+            "counterfactual_budget_bridge",
+            "budget_gradient_aligned_bridge",
+            "counterfactual_gradient_residual",
+            "budget_tangent_residual",
+            "budget_counterfactual_teachability",
+            "budget_contrastive_target",
+            "dual_budget_decomposition",
+        }
+        if weighting_mode not in allowed_modes:
+            raise ValueError(
+                f"Native budget weighting mode must be one of {sorted(allowed_modes)}; "
+                f"got {weighting_mode!r}."
+            )
+        trajectory_enabled = bool(get_nested(cfg, "opsd.trajectory_weighting.enabled", False))
+        if trajectory_enabled:
+            if weighting_mode != "trajectory_probe":
+                raise ValueError(
+                    "Trajectory weighting requires native_budget_weighting.mode=trajectory_probe "
+                    "so tokenwise OPSD remains unchanged."
+                )
+            trajectory_mode = str(
+                get_nested(cfg, "opsd.trajectory_weighting.mode", "closure_rank")
+            ).strip().lower()
+            if trajectory_mode not in {
+                "closure_rank",
+                "teacher_gap_rank",
+                "robustness_rank",
+                "relative_robustness_rank",
+                "residual_robustness_rank",
+                "residual_robustness_soft",
+                "robustness_gated_curriculum",
+                "sensitivity_frontier",
+                "jsd_over_current_kl_batch",
+                "jsd_over_current_kl_direct_inverse_batch",
+                "jsd_over_current_kl_softmax_batch",
+                "jsd_over_step0_kl_batch",
+                "ratio_group_counterfactual_teachability_batch",
+            }:
+                raise ValueError(f"Unsupported trajectory weighting mode: {trajectory_mode!r}.")
+            if trajectory_mode == "jsd_over_step0_kl_batch":
+                calibration = get_nested(
+                    cfg,
+                    "opsd.trajectory_weighting.step0_teacher_kl_by_ratio",
+                    None,
+                )
+                expected_keys = {"0.10", "0.20", "0.30", "0.40"}
+                if not isinstance(calibration, dict) or set(calibration) != expected_keys:
+                    raise ValueError(
+                        "jsd_over_step0_kl_batch requires positive calibration values for "
+                        f"{sorted(expected_keys)}."
+                    )
+                if any(
+                    not math.isfinite(float(value)) or float(value) <= 0.0
+                    for value in calibration.values()
+                ):
+                    raise ValueError("Step-0 teacher KL calibration values must be finite and positive.")
+            if trajectory_mode == "jsd_over_current_kl_softmax_batch":
+                temperature = float(
+                    get_nested(cfg, "opsd.trajectory_weighting.temperature", float("nan"))
+                )
+                if not math.isfinite(temperature) or temperature <= 0.0:
+                    raise ValueError(
+                        "jsd_over_current_kl_softmax_batch requires a finite positive temperature."
+                    )
+            if trajectory_mode in EFFECTIVE_BATCH_PROBABILITY_MODES:
+                normalization = str(
+                    get_nested(cfg, "opsd.trajectory_weighting.normalization", "")
+                ).strip().lower()
+                normalization_scope = str(
+                    get_nested(cfg, "opsd.trajectory_weighting.normalization_scope", "")
+                ).strip().lower()
+                if normalization != "probability_sum_one":
+                    raise ValueError(
+                        "JSD trajectory weighting requires normalization=probability_sum_one."
+                    )
+                if normalization_scope != "effective_batch":
+                    raise ValueError(
+                        "JSD trajectory weighting requires normalization_scope=effective_batch."
+                    )
+            if trajectory_mode in {"residual_robustness_rank", "residual_robustness_soft"}:
+                calibration = get_nested(cfg, "opsd.trajectory_weighting.residual_calibration", None)
+                if not isinstance(calibration, dict):
+                    raise ValueError(
+                        "residual_robustness_rank requires a frozen residual_calibration mapping."
+                    )
+            if trajectory_mode == "robustness_gated_curriculum":
+                calibration = get_nested(cfg, "opsd.trajectory_weighting.calibration", None)
+                if not isinstance(calibration, dict):
+                    raise ValueError(
+                        "robustness_gated_curriculum requires a frozen calibration mapping."
+                    )
+                for key in (
+                    "initial_teacher_gap_mean",
+                    "log_teacher_gap_center",
+                    "log_teacher_gap_scale",
+                ):
+                    if key not in calibration or not math.isfinite(float(calibration[key])):
+                        raise ValueError(f"Invalid curriculum calibration value for {key!r}.")
+                if float(calibration["initial_teacher_gap_mean"]) <= 0.0:
+                    raise ValueError("Curriculum initial_teacher_gap_mean must be positive.")
+                if float(calibration["log_teacher_gap_scale"]) <= 0.0:
+                    raise ValueError("Curriculum log_teacher_gap_scale must be positive.")
+                if float(get_nested(cfg, "opsd.trajectory_weighting.progress_power", 3.0)) <= 0.0:
+                    raise ValueError("Curriculum progress_power must be positive.")
+                if float(
+                    get_nested(cfg, "opsd.trajectory_weighting.ema_half_life_trajectories", 256.0)
+                ) <= 0.0:
+                    raise ValueError("Curriculum EMA half-life must be positive.")
+                weight_floor = float(get_nested(cfg, "opsd.trajectory_weighting.weight_floor", 0.1))
+                if not 0.0 < weight_floor <= 1.0:
+                    raise ValueError("Curriculum weight_floor must be in (0, 1].")
+            if trajectory_mode == "sensitivity_frontier":
+                fraction = float(
+                    get_nested(
+                        cfg,
+                        "opsd.native_budget_weighting.budget_delta_fraction",
+                        float("nan"),
+                    )
+                )
+                if delta_mode != "relative" or not math.isclose(
+                    fraction, 0.25, rel_tol=0.0, abs_tol=1e-12
+                ):
+                    raise ValueError(
+                        "sensitivity_frontier requires a 25% relative native budget expansion."
+                    )
+                if int(
+                    get_nested(cfg, "opsd.trajectory_weighting.calibration_target_per_ratio", 64)
+                ) <= 0:
+                    raise ValueError("Sensitivity frontier calibration target must be positive.")
+                for key, default in (
+                    ("ema_half_life_trajectories", 256.0),
+                    ("progress_drop_scale", 0.5),
+                    ("progress_power", 2.0),
+                ):
+                    value = float(get_nested(cfg, f"opsd.trajectory_weighting.{key}", default))
+                    if not math.isfinite(value) or value <= 0.0:
+                        raise ValueError(f"Sensitivity frontier {key} must be finite and positive.")
+                if float(
+                    get_nested(cfg, "opsd.trajectory_weighting.progress_drop_scale", 0.5)
+                ) > 1.0:
+                    raise ValueError("Sensitivity frontier progress_drop_scale must be at most one.")
+                weight_floor = float(
+                    get_nested(cfg, "opsd.trajectory_weighting.weight_floor", 0.1)
+                )
+                if not 0.0 < weight_floor <= 1.0:
+                    raise ValueError("Sensitivity frontier weight_floor must be in (0, 1].")
+            strength = float(get_nested(cfg, "opsd.trajectory_weighting.downweight_strength", 0.25))
+            if not 0.0 <= strength < 1.0:
+                raise ValueError(
+                    "opsd.trajectory_weighting.downweight_strength must be in [0, 1)."
+                )
+        if weighting_mode == "symmetric_teacher_gap_stability":
+            alpha = float(get_nested(cfg, "opsd.native_budget_weighting.alpha", 0.25))
+            if not 0.0 <= alpha < 1.0:
+                raise ValueError(
+                    f"Symmetric teacher-gap stability alpha must be in [0, 1); got {alpha}."
+                )
+        elif weighting_mode == "teacher_gap_persistence":
+            alpha = float(get_nested(cfg, "opsd.native_budget_weighting.alpha", 0.5))
+            if not 0.0 <= alpha <= 1.0:
+                raise ValueError(f"Teacher-gap persistence alpha must be in [0, 1]; got {alpha}.")
+        elif weighting_mode == "counterfactual_rescue_amplification":
+            alpha = float(get_nested(cfg, "opsd.native_budget_weighting.alpha", 0.5))
+            if not 0.0 <= alpha <= 4.0:
+                raise ValueError(
+                    "Counterfactual rescue amplification alpha must be in [0, 4]; "
+                    f"got {alpha}."
+                )
+        elif weighting_mode in {
+            "native_budget_rescue_grouped",
+            "counterfactual_teachability_grouped",
+            "teacher_gap_grouped_control",
+        }:
+            top_fraction = float(
+                get_nested(cfg, "opsd.native_budget_weighting.top_fraction", 0.2)
+            )
+            high_group_mass = float(
+                get_nested(cfg, "opsd.native_budget_weighting.high_group_mass", 0.5)
+            )
+            if not 0.0 < top_fraction < 1.0:
+                raise ValueError(
+                    f"Grouped top_fraction must be in (0, 1); got {top_fraction}."
+                )
+            if not 0.0 < high_group_mass < 1.0:
+                raise ValueError(
+                    "Grouped high_group_mass must be in (0, 1); "
+                    f"got {high_group_mass}."
+                )
+            if weighting_mode == "counterfactual_teachability_grouped":
+                rescue_modulation = float(
+                    get_nested(
+                        cfg,
+                        "opsd.native_budget_weighting.rescue_modulation",
+                        0.1,
+                    )
+                )
+                if not 0.0 <= rescue_modulation <= 1.0:
+                    raise ValueError(
+                        "Grouped rescue_modulation must be in [0, 1]; "
+                        f"got {rescue_modulation}."
+                    )
+        elif weighting_mode == "counterfactual_teachability_mixture":
+            alpha = float(get_nested(cfg, "opsd.native_budget_weighting.alpha", 0.5))
+            rescue_mix = float(
+                get_nested(cfg, "opsd.native_budget_weighting.rescue_mix", 0.1)
+            )
+            if not 0.0 <= alpha <= 4.0:
+                raise ValueError(
+                    "Counterfactual teachability alpha must be in [0, 4]; "
+                    f"got {alpha}."
+                )
+            if not 0.0 <= rescue_mix <= 1.0:
+                raise ValueError(
+                    "Counterfactual teachability rescue_mix must be in [0, 1]; "
+                    f"got {rescue_mix}."
+                )
+        elif weighting_mode == "counterfactual_teachability_modulation":
+            alpha = float(get_nested(cfg, "opsd.native_budget_weighting.alpha", 0.5))
+            rescue_modulation = float(
+                get_nested(
+                    cfg,
+                    "opsd.native_budget_weighting.rescue_modulation",
+                    0.1,
+                )
+            )
+            if not 0.0 <= alpha <= 4.0:
+                raise ValueError(
+                    "Counterfactual teachability alpha must be in [0, 4]; "
+                    f"got {alpha}."
+                )
+            if not 0.0 <= rescue_modulation <= 1.0:
+                raise ValueError(
+                    "Counterfactual teachability rescue_modulation must be in [0, 1]; "
+                    f"got {rescue_modulation}."
+                )
+        elif weighting_mode == "conditional_rescue_residual":
+            alpha = float(get_nested(cfg, "opsd.native_budget_weighting.alpha", 0.1))
+            difficulty_bins = int(
+                get_nested(cfg, "opsd.native_budget_weighting.difficulty_bins", 5)
+            )
+            if not 0.0 <= alpha < 1.0:
+                raise ValueError(
+                    "Conditional rescue residual alpha must be in [0, 1); "
+                    f"got {alpha}."
+                )
+            if difficulty_bins < 2:
+                raise ValueError(
+                    "Conditional rescue residual difficulty_bins must be at least 2; "
+                    f"got {difficulty_bins}."
+                )
+        elif weighting_mode == "budget_consistent_rank":
+            alpha = float(get_nested(cfg, "opsd.native_budget_weighting.alpha", 1.0))
+            if not 0.0 <= alpha <= 4.0:
+                raise ValueError(f"Budget-consistent rank alpha must be in [0, 4]; got {alpha}.")
+        elif weighting_mode == "budget_residual_hardness":
+            alpha = float(get_nested(cfg, "opsd.native_budget_weighting.alpha", 1.0))
+            persistence_mix = float(
+                get_nested(cfg, "opsd.native_budget_weighting.persistence_mix", 0.1)
+            )
+            if not 0.0 <= alpha <= 4.0:
+                raise ValueError(f"Budget-residual alpha must be in [0, 4]; got {alpha}.")
+            if not 0.0 <= persistence_mix <= 1.0:
+                raise ValueError(
+                    "Budget-residual persistence_mix must be in [0, 1]; "
+                    f"got {persistence_mix}."
+                )
+        elif weighting_mode == "budget_gradient_consensus":
+            alpha = float(get_nested(cfg, "opsd.native_budget_weighting.alpha", 0.5))
+            if not 0.0 <= alpha <= 4.0:
+                raise ValueError(f"Budget-gradient consensus alpha must be in [0, 4]; got {alpha}.")
+        elif weighting_mode == "counterfactual_budget_bridge":
+            fraction = float(
+                get_nested(cfg, "opsd.native_budget_weighting.max_bridge_fraction", 0.5)
+            )
+            if not 0.0 <= fraction <= 1.0:
+                raise ValueError(
+                    "Counterfactual max_bridge_fraction must be in [0, 1]; "
+                    f"got {fraction}."
+                )
+        elif weighting_mode == "budget_gradient_aligned_bridge":
+            fraction = float(
+                get_nested(cfg, "opsd.native_budget_weighting.max_bridge_fraction", 0.5)
+            )
+            if not 0.0 <= fraction <= 1.0:
+                raise ValueError(
+                    "Gradient-aligned max_bridge_fraction must be in [0, 1]; "
+                    f"got {fraction}."
+                )
+        elif weighting_mode == "counterfactual_gradient_residual":
+            strength = float(
+                get_nested(cfg, "opsd.native_budget_weighting.cancellation_strength", 0.5)
+            )
+            max_projection = float(
+                get_nested(
+                    cfg,
+                    "opsd.native_budget_weighting.max_projection_coefficient",
+                    1.0,
+                )
+            )
+            if not 0.0 <= strength <= 1.0:
+                raise ValueError(
+                    "Counterfactual cancellation_strength must be in [0, 1]; "
+                    f"got {strength}."
+                )
+            if max_projection <= 0.0:
+                raise ValueError(
+                    "Counterfactual max_projection_coefficient must be positive; "
+                    f"got {max_projection}."
+                )
+            cancellation_schedule = str(
+                get_nested(
+                    cfg,
+                    "opsd.native_budget_weighting.cancellation_schedule",
+                    "constant",
+                )
+            ).strip().lower()
+            if cancellation_schedule not in {"constant", "linear_to_zero"}:
+                raise ValueError(
+                    "Counterfactual cancellation_schedule must be constant or "
+                    f"linear_to_zero; got {cancellation_schedule!r}."
+                )
+            decay_fraction = float(
+                get_nested(
+                    cfg,
+                    "opsd.native_budget_weighting.cancellation_decay_fraction",
+                    0.5,
+                )
+            )
+            if not 0.0 < decay_fraction <= 1.0:
+                raise ValueError(
+                    "Counterfactual cancellation_decay_fraction must be in (0, 1]; "
+                    f"got {decay_fraction}."
+                )
+        elif weighting_mode == "budget_tangent_residual":
+            alpha = float(get_nested(cfg, "opsd.native_budget_weighting.alpha", 1.0))
+            if not 0.0 <= alpha <= 4.0:
+                raise ValueError(f"Budget-tangent residual alpha must be in [0, 4]; got {alpha}.")
+        elif weighting_mode == "budget_counterfactual_teachability":
+            alpha = float(get_nested(cfg, "opsd.native_budget_weighting.alpha", 1.0))
+            support_top_k = int(get_nested(cfg, "opsd.native_budget_weighting.support_top_k", 32))
+            if not 0.0 <= alpha <= 4.0:
+                raise ValueError(
+                    f"Budget-counterfactual teachability alpha must be in [0, 4]; got {alpha}."
+                )
+            if support_top_k <= 0:
+                raise ValueError(
+                    f"Budget-counterfactual support_top_k must be positive; got {support_top_k}."
+                )
+        elif weighting_mode == "budget_contrastive_target":
+            beta_max = float(get_nested(cfg, "opsd.native_budget_weighting.beta_max", 0.5))
+            advantage_clip = float(get_nested(cfg, "opsd.native_budget_weighting.advantage_clip", 2.0))
+            if not 0.0 <= beta_max <= 2.0:
+                raise ValueError(f"Budget-contrastive beta_max must be in [0, 2]; got {beta_max}.")
+            if advantage_clip <= 0.0:
+                raise ValueError(
+                    f"Budget-contrastive advantage_clip must be positive; got {advantage_clip}."
+                )
+        elif weighting_mode == "dual_budget_decomposition":
+            alpha = float(get_nested(cfg, "opsd.native_budget_weighting.alpha", 1.0))
+            persistence_mix = float(
+                get_nested(cfg, "opsd.native_budget_weighting.persistence_mix", 0.1)
+            )
+            beta_max = float(get_nested(cfg, "opsd.native_budget_weighting.beta_max", 0.5))
+            advantage_clip = float(get_nested(cfg, "opsd.native_budget_weighting.advantage_clip", 2.0))
+            if not 0.0 <= alpha <= 4.0:
+                raise ValueError(f"Dual-budget alpha must be in [0, 4]; got {alpha}.")
+            if not 0.0 <= persistence_mix <= 1.0:
+                raise ValueError(
+                    f"Dual-budget persistence_mix must be in [0, 1]; got {persistence_mix}."
+                )
+            if not 0.0 <= beta_max <= 2.0:
+                raise ValueError(f"Dual-budget beta_max must be in [0, 2]; got {beta_max}.")
+            if advantage_clip <= 0.0:
+                raise ValueError(
+                    f"Dual-budget advantage_clip must be positive; got {advantage_clip}."
+                )
+
+
+def checkpoint_contract(cfg: dict[str, Any]) -> dict[str, Any]:
+    contract = copy.deepcopy(cfg)
+    contract.pop("output_dir", None)
+    training = contract.setdefault("training", {})
+    training.pop("start_step", None)
+    training.pop("adapter_path", None)
+    checkpointing = contract.setdefault("checkpointing", {})
+    checkpointing.pop("resume_from", None)
+    checkpointing.pop("stop_at_step", None)
+    return contract
+
+
+def checkpoint_contract_sha256(cfg: dict[str, Any]) -> str:
+    payload = json.dumps(checkpoint_contract(cfg), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _torch_load_full(path: Path) -> Any:
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def _atomic_torch_save(payload: Any, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    torch.save(payload, temporary)
+    os.replace(temporary, path)
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def trim_jsonl_to_step(path: Path, maximum_step: int) -> None:
+    if not path.is_file():
+        return
+    kept: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if int(row.get("step", -1)) <= int(maximum_step):
+            kept.append(json.dumps(row, ensure_ascii=False))
+    temporary = path.with_name(f".{path.name}.trim.{os.getpid()}")
+    temporary.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def distributed_barrier(distributed: bool) -> None:
+    if distributed and dist.is_initialized():
+        dist.barrier()
+
+
+def capture_rank_rng_state(
+    ratio_rng: random.Random,
+    global_step: int,
+    curriculum_state: RobustnessGatedCurriculumState | SensitivityFrontierState | None = None,
+) -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "global_step": int(global_step),
+        "python_global_rng": random.getstate(),
+        "ratio_rng": ratio_rng.getstate(),
+        "torch_cpu_rng": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda_rng"] = torch.cuda.get_rng_state(torch.cuda.current_device())
+    if curriculum_state is not None:
+        state["trajectory_curriculum_state"] = curriculum_state.state_dict()
+    return state
+
+
+def restore_rank_rng_state(
+    state: dict[str, Any], ratio_rng: random.Random, expected_step: int
+) -> dict[str, Any] | None:
+    if int(state.get("global_step", -1)) != int(expected_step):
+        raise ValueError(
+            f"RNG checkpoint step mismatch: {state.get('global_step')} vs expected {expected_step}."
+        )
+    random.setstate(state["python_global_rng"])
+    ratio_rng.setstate(state["ratio_rng"])
+    torch.set_rng_state(state["torch_cpu_rng"])
+    if torch.cuda.is_available() and "torch_cuda_rng" in state:
+        torch.cuda.set_rng_state(state["torch_cuda_rng"], torch.cuda.current_device())
+    curriculum_state = state.get("trajectory_curriculum_state")
+    return curriculum_state if isinstance(curriculum_state, dict) else None
+
+
+def prepare_resume_config(cfg: dict[str, Any], output_dir: Path) -> tuple[Path | None, dict[str, Any] | None]:
+    raw = str(get_nested(cfg, "checkpointing.resume_from", "") or "").strip()
+    if not raw:
+        return None, None
+    checkpoint = Path(raw).resolve()
+    if not (checkpoint / "COMPLETE").is_file():
+        raise FileNotFoundError(f"Resume checkpoint is missing COMPLETE marker: {checkpoint}")
+    metadata_path = checkpoint / "trainer_state.json"
+    if not metadata_path.is_file():
+        raise FileNotFoundError(f"Resume checkpoint is missing trainer_state.json: {checkpoint}")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    expected_contract = checkpoint_contract_sha256(cfg)
+    if metadata.get("config_contract_sha256") != expected_contract:
+        raise ValueError(
+            "Resume config does not match checkpoint contract: "
+            f"checkpoint={metadata.get('config_contract_sha256')} current={expected_contract}."
+        )
+    expected_output = checkpoint.parent.parent.resolve()
+    if output_dir.resolve() != expected_output:
+        raise ValueError(f"Resume output must remain {expected_output}; got {output_dir.resolve()}.")
+    global_step = int(metadata["global_step"])
+    configured_start = int(get_nested(cfg, "training.start_step", 0) or 0)
+    if configured_start not in {0, global_step}:
+        raise ValueError(
+            f"Configured start_step={configured_start} conflicts with checkpoint step={global_step}."
+        )
+    set_nested(cfg, "training.start_step", global_step)
+    set_nested(cfg, "training.adapter_path", str(checkpoint))
+    return checkpoint, metadata
+
+
+def save_lora_evaluation_snapshot(
+    model: Any,
+    output_dir: Path,
+    global_step: int,
+    cfg: dict[str, Any],
+    rank: int,
+    distributed: bool,
+) -> Path:
+    target = output_dir / "eval_snapshots" / f"step_{int(global_step):06d}"
+    distributed_barrier(distributed)
+    if is_main_process(rank) and not (target / "COMPLETE").is_file():
+        if target.exists():
+            raise FileExistsError(f"Incomplete evaluation snapshot already exists: {target}")
+        temporary = target.with_name(f".{target.name}.tmp")
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        temporary.mkdir(parents=True)
+        save_checkpoint(model, temporary, ema_shadow=None)
+        _atomic_write_json(
+            temporary / "snapshot_metadata.json",
+            {
+                "checkpoint_type": "lightweight_lora_evaluation_snapshot",
+                "global_step": int(global_step),
+                "config_contract_sha256": checkpoint_contract_sha256(cfg),
+            },
+        )
+        (temporary / "COMPLETE").write_text("complete\n", encoding="utf-8")
+        os.replace(temporary, target)
+    distributed_barrier(distributed)
+    return target
+
+
+def save_full_resumable_checkpoint(
+    model: Any,
+    optimizer: torch.optim.Optimizer,
+    ema_shadow: dict[str, torch.Tensor] | None,
+    ratio_rng: random.Random,
+    output_dir: Path,
+    global_step: int,
+    cfg: dict[str, Any],
+    rank: int,
+    world_size: int,
+    distributed: bool,
+    curriculum_state: RobustnessGatedCurriculumState | SensitivityFrontierState | None = None,
+) -> Path:
+    target = output_dir / "resume_checkpoints" / f"step_{int(global_step):06d}"
+    temporary = target.with_name(f".{target.name}.tmp")
+    distributed_barrier(distributed)
+    if (target / "COMPLETE").is_file():
+        distributed_barrier(distributed)
+        return target
+    if is_main_process(rank):
+        if target.exists():
+            raise FileExistsError(f"Incomplete resumable checkpoint already exists: {target}")
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        temporary.mkdir(parents=True)
+        save_checkpoint(model, temporary, ema_shadow=ema_shadow)
+        _atomic_torch_save(optimizer.state_dict(), temporary / "optimizer.pt")
+        _atomic_write_json(
+            temporary / "trainer_state.json",
+            {
+                "checkpoint_type": "full_resumable_lora_training_checkpoint",
+                "global_step": int(global_step),
+                "world_size": int(world_size),
+                "gradient_accumulation_remainder": 0,
+                "config_contract_sha256": checkpoint_contract_sha256(cfg),
+                "trajectory_curriculum_state": (
+                    curriculum_state.state_dict() if curriculum_state is not None else None
+                ),
+            },
+        )
+        source_config = output_dir / "config_resolved.yaml"
+        if source_config.is_file():
+            shutil.copy2(source_config, temporary / "config_resolved.yaml")
+    distributed_barrier(distributed)
+    _atomic_torch_save(
+        capture_rank_rng_state(ratio_rng, global_step, curriculum_state),
+        temporary / "rank_rng_states" / f"rank_{rank:02d}.pt",
+    )
+    distributed_barrier(distributed)
+    if is_main_process(rank):
+        rank_states = sorted((temporary / "rank_rng_states").glob("rank_*.pt"))
+        if len(rank_states) != int(world_size):
+            raise RuntimeError(f"Expected {world_size} rank RNG states, found {len(rank_states)}.")
+        (temporary / "COMPLETE").write_text("complete\n", encoding="utf-8")
+        os.replace(temporary, target)
+    distributed_barrier(distributed)
+    return target
+
+
+def point_final_checkpoint_at(output_dir: Path, checkpoint: Path, rank: int, distributed: bool) -> None:
+    distributed_barrier(distributed)
+    if is_main_process(rank):
+        final = output_dir / "final"
+        if final.exists() or final.is_symlink():
+            if final.is_symlink() and final.resolve() == checkpoint.resolve():
+                pass
+            else:
+                raise FileExistsError(f"Refusing to replace existing final checkpoint: {final}")
+        else:
+            final.symlink_to(checkpoint.relative_to(output_dir), target_is_directory=True)
+    distributed_barrier(distributed)
+
+
 def train(cfg: dict[str, Any]) -> Path:
     distributed, rank, local_rank, world_size = setup_distributed()
     method = str(get_nested(cfg, "training.method", "sft")).lower()
+    parameter_scope = str(get_nested(cfg, "experiment.parameter_scope", "") or "").strip()
+    pruning_method = configure_pruning_backend(cfg)
+    if pruning_method == "random" and parameter_scope != "language_decoder_only":
+        raise ValueError(
+            "The RandomPruner backend currently detaches vision-encoder outputs and is therefore "
+            "restricted to experiment.parameter_scope=language_decoder_only."
+        )
     prompt_mode = prompt_mode_from_config(cfg)
     if method not in METHODS:
         raise ValueError(f"Unknown method {method!r}.")
+    validate_paired_native_budget_config(cfg, method, parameter_scope, pruning_method)
+    validate_phase_ratio_scaling_config(
+        get_nested(cfg, "opsd.phase_ratio_scaling", None),
+        method=method,
+        train_retention_ratios=get_nested(cfg, "pruning.train_retention_ratios", []),
+    )
+    curriculum_state = initialize_trajectory_curriculum_state(cfg)
+    teacher_ground_truth_access = bool(get_nested(cfg, "opsd.teacher_ground_truth_access", False))
+    if method == "opsd_gt_prompt" and not teacher_ground_truth_access:
+        raise ValueError("training.method=opsd_gt_prompt requires opsd.teacher_ground_truth_access=true.")
+    if method == "opsd_nogt" and teacher_ground_truth_access:
+        raise ValueError("training.method=opsd_nogt requires opsd.teacher_ground_truth_access=false.")
+    if method == "epic_official":
+        required_values = {
+            "epic.alpha": 0.5,
+            "epic.temperature": 2.0,
+            "epic.warmup_ratio": 0.03,
+            "epic.vision_learning_rate": 2e-6,
+            "training.learning_rate": 2e-5,
+            "training.weight_decay": 0.0,
+            "training.max_grad_norm": 1.0,
+            "training.model_max_length": 2048,
+        }
+        for dotted, expected in required_values.items():
+            actual = float(get_nested(cfg, dotted, float("nan")))
+            if actual != expected:
+                raise ValueError(f"Official EPIC parity requires {dotted}={expected}; got {actual}.")
+        if pruning_method != "visionzip":
+            raise ValueError(f"This official EPIC adaptation is scoped to VisionZip; got {pruning_method!r}.")
+        if str(get_nested(cfg, "epic.teacher_retention_policy", "")) != "official_dynamic_gap":
+            raise ValueError("Official EPIC requires epic.teacher_retention_policy=official_dynamic_gap.")
+        if parameter_scope not in {"language_decoder_only", "vision_encoder_plus_llm"}:
+            raise ValueError(
+                "Official EPIC paired runs require parameter_scope=language_decoder_only or "
+                f"vision_encoder_plus_llm; got {parameter_scope!r}."
+            )
+        if parameter_scope == "vision_encoder_plus_llm":
+            if get_nested(cfg, "training.lora_layers_to_transform", None) is not None:
+                raise ValueError("Official EPIC joint scope cannot restrict LoRA to language-model layers.")
+            if get_nested(cfg, "training.lora_layers_pattern", None) is not None:
+                raise ValueError("Official EPIC joint scope cannot set a language-only LoRA layers pattern.")
+        else:
+            expected_layers = list(range(28))
+            if get_nested(cfg, "training.lora_layers_to_transform", None) != expected_layers:
+                raise ValueError("Official EPIC LLM-only scope must explicitly select Qwen decoder layers 0..27.")
+            if get_nested(cfg, "training.lora_layers_pattern", None) != "layers":
+                raise ValueError("Official EPIC LLM-only scope requires lora_layers_pattern=layers.")
+        if not bool(get_nested(cfg, "training.gradient_checkpointing", False)):
+            raise ValueError("Official EPIC requires training.gradient_checkpointing=true.")
+        if bool(get_nested(cfg, "training.gradient_checkpointing_use_reentrant", True)):
+            raise ValueError(
+                "The Qwen LoRA adaptation requires non-reentrant gradient checkpointing so frozen-base "
+                "visual activations retain LoRA gradients."
+            )
+        if not bool(get_nested(cfg, "training.tf32", False)):
+            raise ValueError("Official EPIC requires training.tf32=true.")
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
     if method == "opsd_fixed_teacher":
         set_nested(cfg, "opsd.teacher_strategy", "fixed_base")
         set_nested(cfg, "opsd.fixed_teacher", True)
@@ -1222,18 +4445,48 @@ def train(cfg: dict[str, Any]) -> Path:
         set_nested(cfg, "opsd.teacher_strategy", "dynamic_shared_current")
         set_nested(cfg, "opsd.fixed_teacher", False)
     output_dir = Path(str(cfg.get("output_dir", OUTPUT_ROOT / "checkpoints" / method)))
+    resume_checkpoint, resume_metadata = prepare_resume_config(cfg, output_dir)
     log_path = output_dir / "training_log.jsonl"
     student_text_log_path = output_dir / "student_text_outputs.jsonl"
     max_steps = int(get_nested(cfg, "training.max_steps", 1000))
     start_step = int(get_nested(cfg, "training.start_step", 0) or 0)
+    stop_at_step = int(get_nested(cfg, "checkpointing.stop_at_step", max_steps) or max_steps)
     if start_step < 0 or start_step > max_steps:
         raise ValueError(f"training.start_step must be in [0, max_steps]; got {start_step} with max_steps={max_steps}.")
+    if stop_at_step <= start_step or stop_at_step > max_steps:
+        raise ValueError(
+            "checkpointing.stop_at_step must satisfy start_step < stop_at_step <= max_steps; "
+            f"got start_step={start_step}, stop_at_step={stop_at_step}, max_steps={max_steps}."
+        )
     if is_main_process(rank) and log_path.exists() and start_step == 0:
         log_path.unlink()
     if is_main_process(rank) and student_text_log_path.exists() and start_step == 0:
         student_text_log_path.unlink()
+    native_rank_log_path = output_dir / f"rank{rank}_native_budget_metrics.jsonl"
+    paired_rank_log_path = output_dir / f"rank{rank}_paired_sampling.jsonl"
+    assignment_rank_log_path = output_dir / f"rank{rank}_sample_assignments.jsonl"
+    if start_step == 0 and native_rank_log_path.exists():
+        native_rank_log_path.unlink()
+    if start_step == 0 and paired_rank_log_path.exists():
+        paired_rank_log_path.unlink()
+    if start_step == 0 and assignment_rank_log_path.exists():
+        assignment_rank_log_path.unlink()
+    if resume_checkpoint is not None:
+        if is_main_process(rank):
+            trim_jsonl_to_step(log_path, start_step)
+            trim_jsonl_to_step(student_text_log_path, start_step)
+        trim_jsonl_to_step(native_rank_log_path, start_step)
+        trim_jsonl_to_step(paired_rank_log_path, start_step)
+        trim_jsonl_to_step(assignment_rank_log_path, start_step)
+        distributed_barrier(distributed)
     if is_main_process(rank):
         save_resolved_config(cfg, output_dir)
+    dataset_verification = verify_decontaminated_dataset(cfg)
+    if is_main_process(rank) and dataset_verification is not None:
+        (output_dir / "training_data_verification.json").write_text(
+            json.dumps(dataset_verification, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     rng = random.Random(int(get_nested(cfg, "training.seed", 42)) + rank)
     torch.manual_seed(int(get_nested(cfg, "training.seed", 42)) + rank)
     dataset = load_aokvqa_dataset(
@@ -1242,6 +4495,7 @@ def train(cfg: dict[str, Any]) -> Path:
         limit=int(get_nested(cfg, "dataset.limit", 0) or 0),
         seed=int(get_nested(cfg, "training.seed", 42)),
         prompt_mode=prompt_mode,
+        shuffle=bool(get_nested(cfg, "dataset.shuffle", True)),
     )
     dataset = apply_selected_ids(dataset, get_nested(cfg, "dataset.selected_ids_path", ""))
     if not dataset:
@@ -1250,7 +4504,11 @@ def train(cfg: dict[str, Any]) -> Path:
         raise ValueError(f"DDP requires max_steps divisible by world_size; got max_steps={max_steps}, world_size={world_size}.")
     if distributed and start_step % world_size != 0:
         raise ValueError(f"DDP requires start_step divisible by world_size; got start_step={start_step}, world_size={world_size}.")
-    remaining_steps = max_steps - start_step
+    if distributed and stop_at_step % world_size != 0:
+        raise ValueError(
+            f"DDP requires stop_at_step divisible by world_size; got {stop_at_step} and world_size={world_size}."
+        )
+    remaining_steps = stop_at_step - start_step
     if distributed and remaining_steps % world_size != 0:
         raise ValueError(
             f"DDP requires remaining steps divisible by world_size; got remaining={remaining_steps}, world_size={world_size}."
@@ -1278,7 +4536,24 @@ def train(cfg: dict[str, Any]) -> Path:
             dropout=float(get_nested(cfg, "training.lora_dropout", 0.05)),
             target_modules=list(get_nested(cfg, "training.target_modules", [])) or None,
             adapter_path=str(get_nested(cfg, "training.adapter_path", "")),
+            layers_to_transform=get_nested(cfg, "training.lora_layers_to_transform", None),
+            layers_pattern=get_nested(cfg, "training.lora_layers_pattern", None),
         )
+    visual_checkpoint_input_module = ""
+    if method == "epic_official" and bool(get_nested(cfg, "training.gradient_checkpointing", False)):
+        if not hasattr(model, "gradient_checkpointing_enable"):
+            raise RuntimeError("Loaded Qwen model does not support required gradient checkpointing.")
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={
+                "use_reentrant": bool(get_nested(cfg, "training.gradient_checkpointing_use_reentrant", False))
+            }
+        )
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+        if parameter_scope == "vision_encoder_plus_llm":
+            visual_checkpoint_input_module = enable_visual_checkpoint_input_grads(model)
+        else:
+            visual_checkpoint_input_module = "not_required_language_decoder_only"
     student_adapter_name = active_lora_adapter_name(model)
     teacher_model = None
     teacher_adapter_name = ""
@@ -1312,13 +4587,47 @@ def train(cfg: dict[str, Any]) -> Path:
     model.train()
     if teacher_model is not None:
         teacher_model.eval()
-    trainable = [p for p in model.parameters() if p.requires_grad]
+    trainable_named = [(name, parameter) for name, parameter in model.named_parameters() if parameter.requires_grad]
+    trainable = [parameter for _, parameter in trainable_named]
+    if bool(get_nested(cfg, "paired_sampling.enabled", False)):
+        stochastic_dropout = [
+            (name, float(module.p))
+            for name, module in unwrap_model(model).named_modules()
+            if isinstance(module, torch.nn.Dropout) and float(module.p) != 0.0
+        ]
+        if stochastic_dropout:
+            raise ValueError(
+                "Paired sensitivity scoring requires deterministic forwards, but nonzero dropout remains: "
+                f"{stochastic_dropout[:10]}"
+            )
+        unexpected_trainable = [
+            name
+            for name, _ in trainable_named
+            if "lora_" not in name or ".language_model.layers." not in name or ".visual." in name
+        ]
+        if unexpected_trainable:
+            raise ValueError(
+                "Paired LLM-only OPSD found trainable parameters outside decoder LoRA: "
+                f"{unexpected_trainable[:10]}"
+            )
+        expected_tensors = int(get_nested(cfg, "training.expected_trainable_tensors", 392))
+        expected_parameters = int(get_nested(cfg, "training.expected_trainable_parameters", 40_370_176))
+        actual_parameters = sum(parameter.numel() for parameter in trainable)
+        if len(trainable_named) != expected_tensors or actual_parameters != expected_parameters:
+            raise ValueError(
+                "Paired LLM-only LoRA scope mismatch: "
+                f"tensors={len(trainable_named)} (expected {expected_tensors}), "
+                f"parameters={actual_parameters} (expected {expected_parameters})."
+            )
     if is_main_process(rank):
         (output_dir / "trainable_params.txt").write_text(
             f"trainable={sum(p.numel() for p in trainable)}\n"
             f"total={sum(p.numel() for p in model.parameters())}\n"
             f"distributed={distributed}\nworld_size={world_size}\n"
             f"prompt_mode={prompt_mode}\n"
+            f"pruning_method={pruning_method}\n"
+            f"fastv_tokens_anchor={os.environ.get('OPSD_FASTV_TOKENS_ANCHOR', '')}\n"
+            f"fastv_tokens_prune_layers={os.environ.get('OPSD_FASTV_TOKENS_PRUNE_LAYERS', '')}\n"
             f"dataset_min_pixels={min_pixels}\n"
             f"dataset_max_pixels={max_pixels}\n"
             f"generation_max_new_tokens={get_nested(cfg, 'generation.max_new_tokens', 128)}\n"
@@ -1333,20 +4642,170 @@ def train(cfg: dict[str, Any]) -> Path:
             f"opsd_ema_alpha={ema_settings.get('alpha', '')}\n"
             f"opsd_ema_lazy_init={ema_settings.get('lazy_init', '')}\n"
             f"opsd_ema_parameter_count={len(ema_parameter_names)}\n"
-            f"opsd_ema_shadow={ema_shadow is not None}\n",
+            f"opsd_ema_shadow={ema_shadow is not None}\n"
+            f"epic_upstream_repository={EPIC_UPSTREAM_REPOSITORY if method == 'epic_official' else ''}\n"
+            f"epic_upstream_commit={EPIC_UPSTREAM_COMMIT if method == 'epic_official' else ''}\n"
+            f"epic_upstream_trainer_sha256={EPIC_UPSTREAM_TRAINER_SHA256 if method == 'epic_official' else ''}\n"
+            f"epic_gradient_checkpointing={get_nested(cfg, 'training.gradient_checkpointing', False) if method == 'epic_official' else ''}\n"
+            f"epic_gradient_checkpointing_use_reentrant={get_nested(cfg, 'training.gradient_checkpointing_use_reentrant', '') if method == 'epic_official' else ''}\n"
+            f"epic_max_grad_norm={get_nested(cfg, 'training.max_grad_norm', '') if method == 'epic_official' else ''}\n"
+            f"epic_tf32={get_nested(cfg, 'training.tf32', False) if method == 'epic_official' else ''}\n"
+            f"epic_model_max_length={get_nested(cfg, 'training.model_max_length', '') if method == 'epic_official' else ''}\n"
+            f"epic_visual_checkpoint_input_module={visual_checkpoint_input_module}\n",
             encoding="utf-8",
         )
-    optimizer = torch.optim.AdamW(
-        trainable,
-        lr=float(get_nested(cfg, "training.learning_rate", 2e-5)),
-        weight_decay=float(get_nested(cfg, "training.weight_decay", 0.0)),
+    learning_rate = float(get_nested(cfg, "training.learning_rate", 2e-5))
+    weight_decay = float(get_nested(cfg, "training.weight_decay", 0.0))
+    vision_learning_rate_value = get_nested(cfg, "training.vision_learning_rate", None)
+    if method == "epic_official" and parameter_scope == "vision_encoder_plus_llm":
+        vision_learning_rate_value = get_nested(cfg, "epic.vision_learning_rate", 2e-6)
+    elif method == "epic_official":
+        # Keep the upstream vision LR in the config for parity documentation,
+        # but no visual optimizer group exists in the controlled LLM-only run.
+        vision_learning_rate_value = None
+
+    vision_learning_rate = (
+        float(vision_learning_rate_value) if vision_learning_rate_value is not None else None
     )
+    if vision_learning_rate is not None:
+        visual_trainable = [parameter for name, parameter in trainable_named if ".visual." in name]
+        nonvisual_trainable = [parameter for name, parameter in trainable_named if ".visual." not in name]
+        if not visual_trainable or not nonvisual_trainable:
+            raise ValueError(
+                "A separate vision learning rate requires both visual and non-visual trainable parameters; "
+                f"found visual={len(visual_trainable)}, nonvisual={len(nonvisual_trainable)}."
+            )
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": nonvisual_trainable, "lr": learning_rate, "initial_lr": learning_rate},
+                {"params": visual_trainable, "lr": vision_learning_rate, "initial_lr": vision_learning_rate},
+            ],
+            weight_decay=weight_decay,
+        )
+    else:
+        optimizer = torch.optim.AdamW(trainable, lr=learning_rate, weight_decay=weight_decay)
     save_every = int(get_nested(cfg, "training.save_every", 500))
     grad_accum = int(get_nested(cfg, "training.gradient_accumulation_steps", 1))
     micro_batch_size = int(get_nested(cfg, "training.micro_batch_size", 1) or 1)
     if micro_batch_size < 1:
         raise ValueError(f"training.micro_batch_size must be >= 1; got {micro_batch_size}.")
     global_step_unit = world_size * micro_batch_size if distributed else micro_batch_size
+    effective_batch_size = global_step_unit * grad_accum
+    probability_mode = trajectory_probability_mode(cfg)
+    probability_scope = str(
+        get_nested(cfg, "opsd.trajectory_weighting.normalization_scope", "synchronized_block")
+    ).strip().lower()
+    effective_batch_probability_weighting = (
+        probability_mode is not None and probability_scope == "effective_batch"
+    )
+    replay_cfg: dict[str, Any] | None = None
+    if effective_batch_probability_weighting:
+        if method != "opsd_nogt":
+            raise ValueError("Effective-batch JSD weighting requires training.method=opsd_nogt.")
+        if micro_batch_size != 1:
+            raise ValueError("Effective-batch JSD weighting currently requires micro_batch_size=1.")
+        if not bool(get_nested(cfg, "paired_sampling.enabled", False)):
+            raise ValueError("Effective-batch JSD weighting requires deterministic paired sampling.")
+        if int(get_nested(cfg, "training.max_sample_retries", 0) or 0) != 0:
+            raise ValueError("Effective-batch JSD weighting requires max_sample_retries=0.")
+        replay_cfg = copy.deepcopy(cfg)
+        set_nested(replay_cfg, "opsd.native_budget_weighting.enabled", False)
+        set_nested(replay_cfg, "opsd.trajectory_weighting.enabled", False)
+    checkpointing_enabled = bool(get_nested(cfg, "checkpointing.enabled", False))
+    eval_snapshot_every = int(get_nested(cfg, "checkpointing.eval_snapshot_every", 0) or 0)
+    resumable_every = int(get_nested(cfg, "checkpointing.resumable_every", 0) or 0)
+    if checkpointing_enabled:
+        for label, interval in (
+            ("eval_snapshot_every", eval_snapshot_every),
+            ("resumable_every", resumable_every),
+        ):
+            if interval <= 0 or interval % effective_batch_size != 0:
+                raise ValueError(
+                    f"checkpointing.{label} must be positive and divisible by effective batch size "
+                    f"{effective_batch_size}; got {interval}."
+                )
+        if (
+            max_steps % effective_batch_size != 0
+            or start_step % effective_batch_size != 0
+            or stop_at_step % effective_batch_size != 0
+        ):
+            raise ValueError(
+                "Full paired runs require max_steps/start_step/stop_at_step on optimizer boundaries; "
+                f"got max_steps={max_steps}, start_step={start_step}, stop_at_step={stop_at_step}, "
+                f"effective_batch_size={effective_batch_size}."
+            )
+        if save_every != 0:
+            raise ValueError("Set training.save_every=0 when structured checkpointing is enabled.")
+        if resume_checkpoint is not None:
+            if resume_metadata is None:
+                raise AssertionError("Resume metadata was not loaded.")
+            if int(resume_metadata.get("world_size", -1)) != int(world_size):
+                raise ValueError(
+                    f"Resume world size mismatch: checkpoint={resume_metadata.get('world_size')} current={world_size}."
+                )
+            optimizer.load_state_dict(_torch_load_full(resume_checkpoint / "optimizer.pt"))
+            rank_state_path = resume_checkpoint / "rank_rng_states" / f"rank_{rank:02d}.pt"
+            if not rank_state_path.is_file():
+                raise FileNotFoundError(f"Missing rank RNG state: {rank_state_path}")
+            restored_curriculum_state = restore_rank_rng_state(
+                _torch_load_full(rank_state_path), rng, expected_step=start_step
+            )
+            if curriculum_state is not None:
+                if restored_curriculum_state is None:
+                    raise ValueError("Resume checkpoint is missing trajectory curriculum state.")
+                curriculum_state.load_state_dict(restored_curriculum_state)
+        elif bool(get_nested(cfg, "checkpointing.save_step_zero", False)):
+            save_lora_evaluation_snapshot(
+                model,
+                output_dir,
+                global_step=0,
+                cfg=cfg,
+                rank=rank,
+                distributed=distributed,
+            )
+    official_epic_rng: random.Random | None = None
+    official_epic_total_optimizer_steps = 0
+    official_epic_optimizer_steps_completed = 0
+    official_epic_scheduler: Any | None = None
+    if method == "epic_official":
+        if micro_batch_size != 1:
+            raise ValueError("Official EPIC parity currently requires training.micro_batch_size=1.")
+        schedule = str(get_nested(cfg, "pruning.retention_ratio_schedule", "") or "").strip().lower()
+        if schedule != "epic_official_progressive_continuous":
+            raise ValueError(
+                "Official EPIC requires pruning.retention_ratio_schedule="
+                "epic_official_progressive_continuous."
+            )
+        effective_batch_size = global_step_unit * grad_accum
+        if max_steps % effective_batch_size != 0 or start_step % effective_batch_size != 0:
+            raise ValueError(
+                "Official EPIC requires max_steps and start_step aligned to optimizer-update boundaries; "
+                f"got max_steps={max_steps}, start_step={start_step}, effective_batch_size={effective_batch_size}."
+            )
+        official_epic_total_optimizer_steps = max_steps // effective_batch_size
+        official_epic_optimizer_steps_completed = start_step // effective_batch_size
+        official_epic_rng = random.Random(int(get_nested(cfg, "training.seed", 42)))
+        prior_local_calls = start_step // global_step_unit
+        for prior_local_call in range(prior_local_calls):
+            sample_official_epic_curriculum(
+                official_epic_rng,
+                optimizer_step=prior_local_call // grad_accum,
+                total_optimizer_steps=official_epic_total_optimizer_steps,
+            )
+        if start_step != 0:
+            raise ValueError(
+                "Official EPIC resume requires optimizer and scheduler state, which this adapter-only checkpoint "
+                "format does not save. Start a fresh run with training.start_step=0."
+            )
+        from transformers.optimization import get_cosine_schedule_with_warmup
+
+        warmup_ratio = float(get_nested(cfg, "epic.warmup_ratio", 0.03))
+        warmup_steps = int(math.ceil(official_epic_total_optimizer_steps * warmup_ratio))
+        official_epic_scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=official_epic_total_optimizer_steps,
+        )
     max_sample_retries = int(get_nested(cfg, "training.max_sample_retries", 0) or 0)
     if max_sample_retries < 0:
         raise ValueError(f"training.max_sample_retries must be >= 0; got {max_sample_retries}.")
@@ -1358,16 +4817,65 @@ def train(cfg: dict[str, Any]) -> Path:
     local_steps = remaining_steps // global_step_unit
     step = 0
     accum = 0
+    effective_batch_window: list[dict[str, Any]] = []
+    effective_batch_summary: dict[str, Any] = {}
     start = time.time()
     try:
         while step < local_steps:
             sample: FormattedAOKVQASample | None = None
             ratio: float | None = None
             try:
+                if effective_batch_probability_weighting and accum == 0:
+                    effective_batch_window, effective_batch_summary = (
+                        prepare_effective_batch_probability_window(
+                            model,
+                            processor,
+                            dataset,
+                            cfg,
+                            rng,
+                            teacher_model=teacher_model,
+                            ema_shadow=ema_shadow,
+                            teacher_adapter_name=teacher_adapter_name,
+                            start_step=start_step,
+                            local_step_start=step,
+                            accumulation_steps=grad_accum,
+                            max_steps=max_steps,
+                            distributed=distributed,
+                            rank=rank,
+                            world_size=world_size,
+                        )
+                    )
+                    if len(effective_batch_window) != grad_accum:
+                        raise AssertionError("Effective-batch probe window has the wrong local size.")
+                    if not math.isclose(
+                        float(effective_batch_summary["trajectory_probability_weight_sum"]),
+                        1.0,
+                        rel_tol=0.0,
+                        abs_tol=1e-6,
+                    ):
+                        raise AssertionError("Effective-batch trajectory weights do not sum to one.")
+                    if is_main_process(rank):
+                        probe_log = dict(effective_batch_summary)
+                        probe_log.update(
+                            {
+                                "optimizer_batch_start_step": int(
+                                    start_step + step * global_step_unit
+                                ),
+                                "optimizer_batch_end_step": int(
+                                    start_step + (step + grad_accum) * global_step_unit
+                                ),
+                            }
+                        )
+                        write_jsonl(
+                            output_dir / "effective_batch_probe_metrics.jsonl",
+                            probe_log,
+                        )
                 batch_losses: list[torch.Tensor] = []
                 batch_metrics: list[dict[str, Any]] = []
                 batch_samples: list[FormattedAOKVQASample] = []
+                batch_global_indices: list[int] = []
                 batch_ratios: list[float] = []
+                batch_rollout_seeds: list[int | None] = []
                 batch_text_logs: list[dict[str, Any]] = []
                 for micro_idx in range(micro_batch_size):
                     if distributed:
@@ -1377,12 +4885,59 @@ def train(cfg: dict[str, Any]) -> Path:
                     for sample_attempt in range(max_sample_retries + 1):
                         global_index = base_global_index + sample_attempt * global_step_unit
                         sample = dataset[global_index % len(dataset)]
-                        ratio = sample_retention_ratio(cfg, rng, progress_step=global_index, total_steps=max_steps)
+                        official_epic_sample = None
+                        if method == "epic_official":
+                            if official_epic_rng is None:
+                                raise AssertionError("Official EPIC RNG was not initialized.")
+                            current_local_call = start_step // global_step_unit + step
+                            official_epic_sample = sample_official_epic_curriculum(
+                                official_epic_rng,
+                                optimizer_step=current_local_call // grad_accum,
+                                total_optimizer_steps=official_epic_total_optimizer_steps,
+                            )
+                            ratio = official_epic_sample.student_retention_ratio
+                        else:
+                            ratio = sample_retention_ratio(
+                                cfg,
+                                rng,
+                                progress_step=global_index,
+                                total_steps=max_steps,
+                                sample_id=sample.sample_id,
+                            )
+                        rollout_seed = (
+                            paired_rollout_seed(
+                                seed=int(
+                                    get_nested(
+                                        cfg,
+                                        "paired_sampling.rollout_seed",
+                                        get_nested(cfg, "training.seed", 42),
+                                    )
+                                ),
+                                global_index=global_index,
+                                sample_id=sample.sample_id,
+                                namespace=str(get_nested(cfg, "paired_sampling.namespace", "opsd_pair_v1")),
+                            )
+                            if bool(get_nested(cfg, "paired_sampling.enabled", False))
+                            else None
+                        )
                         try:
                             if method == "sft":
                                 sample_loss, sample_metrics = sft_like_step(model, processor, sample, cfg, ratio, sample.target)
                             elif method == "epic":
                                 sample_loss, sample_metrics = epic_tcd_step(model, processor, sample, cfg, ratio)
+                            elif method == "epic_official":
+                                if official_epic_sample is None:
+                                    raise AssertionError("Official EPIC curriculum sample was not initialized.")
+                                sample_loss, sample_metrics = epic_tcd_step(
+                                    model,
+                                    processor,
+                                    sample,
+                                    cfg,
+                                    ratio,
+                                    teacher_retention_override=official_epic_sample.teacher_retention_ratio,
+                                    official_logit_alignment=True,
+                                )
+                                sample_metrics.update(official_epic_sample.metrics())
                             elif method == "grpo":
                                 sample_loss, sample_metrics = grpo_step(model, processor, sample, cfg, ratio)
                             elif method in {"opsd", "opsd_fixed_teacher"}:
@@ -1396,21 +4951,145 @@ def train(cfg: dict[str, Any]) -> Path:
                                     ema_shadow=ema_shadow,
                                     teacher_adapter_name=teacher_adapter_name,
                                 )
-                            elif method == "opsd_nogt":
+                            elif method in {"opsd_nogt", "opsd_gt_prompt"}:
+                                effective_record = (
+                                    effective_batch_window[accum]
+                                    if effective_batch_probability_weighting
+                                    else None
+                                )
+                                if effective_record is not None:
+                                    if int(effective_record["global_index"]) != int(global_index):
+                                        raise AssertionError("Probe/replay global index mismatch.")
+                                    if str(effective_record["sample_id"]) != str(sample.sample_id):
+                                        raise AssertionError("Probe/replay sample mismatch.")
+                                    if not math.isclose(
+                                        float(effective_record["ratio"]),
+                                        float(ratio),
+                                        rel_tol=0.0,
+                                        abs_tol=1e-12,
+                                    ):
+                                        raise AssertionError("Probe/replay retention-ratio mismatch.")
+                                    if int(effective_record["rollout_seed"]) != int(rollout_seed):
+                                        raise AssertionError("Probe/replay rollout-seed mismatch.")
+                                    rollout_cache = effective_record["rollout"]
+                                    active_cfg = replay_cfg
+                                else:
+                                    rollout_cache = None
+                                    active_cfg = cfg
+                                if active_cfg is None:
+                                    raise AssertionError("Effective-batch replay config was not initialized.")
                                 sample_loss, sample_metrics = opsd_nogt_step(
                                     model,
                                     processor,
                                     sample,
-                                    cfg,
+                                    active_cfg,
                                     ratio,
                                     teacher_model=teacher_model,
                                     ema_shadow=ema_shadow,
                                     teacher_adapter_name=teacher_adapter_name,
+                                    teacher_uses_ground_truth=method == "opsd_gt_prompt",
+                                    rollout_seed=rollout_seed,
+                                    progress_step=global_index,
+                                    total_steps=max_steps,
+                                    fixed_rollout_token_ids=(
+                                        rollout_cache["token_ids"]
+                                        if rollout_cache is not None
+                                        else None
+                                    ),
+                                    fixed_rollout_text=(
+                                        rollout_cache["text"]
+                                        if rollout_cache is not None
+                                        else None
+                                    ),
+                                    fixed_rollout_metadata=(
+                                        rollout_cache["generation_metadata"]
+                                        if rollout_cache is not None
+                                        else None
+                                    ),
                                 )
+                                if effective_record is not None:
+                                    replay_text_log = sample_metrics.get(STUDENT_TEXT_LOG_KEY)
+                                    if not isinstance(replay_text_log, dict):
+                                        raise AssertionError("Replay did not return a student text record.")
+                                    if replay_text_log.get("student_text") != rollout_cache["text"]:
+                                        raise AssertionError("Probe/replay generated text mismatch.")
+                                    replay_error = abs(
+                                        float(sample_loss.detach().float().cpu())
+                                        - float(effective_record["probe_loss"])
+                                    )
+                                    sample_metrics.update(
+                                        {
+                                            "native_student_budget_jsd_mean": float(
+                                                effective_record["jsd"]
+                                            ),
+                                            "native_teacher_gap_b_mean": float(
+                                                effective_record["current_teacher_kl"]
+                                            ),
+                                            "native_teacher_gap_b_plus_mean": float(
+                                                effective_record["b_plus_teacher_kl"]
+                                            ),
+                                            "sampled_b_plus": float(
+                                                effective_record["sampled_b_plus"]
+                                            ),
+                                            "effective_batch_sensitivity": float(
+                                                effective_record["signal"]
+                                            ),
+                                            "effective_batch_probability_weight": float(
+                                                effective_record["probability_weight"]
+                                            ),
+                                            "effective_batch_probe_replay_kl_abs_error": replay_error,
+                                            "effective_batch_rollout_token_ids_sha256": rollout_cache[
+                                                "token_ids_sha256"
+                                            ],
+                                            "effective_batch_fixed_prefix_replay": True,
+                                        }
+                                    )
+                                    if (
+                                        probability_mode
+                                        == "ratio_group_counterfactual_teachability_batch"
+                                    ):
+                                        sample_metrics.update(
+                                            {
+                                                "native_trajectory_budget_explained_fraction": float(
+                                                    effective_record["signal"]
+                                                ),
+                                                "effective_batch_ratio_group_signal": float(
+                                                    effective_record["ratio_group_signal"]
+                                                ),
+                                                "native_trajectory_budget_projection_mass": float(
+                                                    effective_record["projection_mass"]
+                                                ),
+                                                "native_trajectory_teacher_js_mass": float(
+                                                    effective_record["teacher_js_mass"]
+                                                ),
+                                            }
+                                        )
                             elif method == "offpolicy":
                                 sample_loss, sample_metrics = offpolicy_step(model, processor, sample, cfg, ratio)
                             else:
                                 raise AssertionError(method)
+                            phase_ratio_config = get_nested(cfg, "opsd.phase_ratio_scaling", None)
+                            if isinstance(phase_ratio_config, dict) and bool(
+                                phase_ratio_config.get("enabled", False)
+                            ):
+                                phase_ratio_scale = resolve_phase_ratio_scale(
+                                    phase_ratio_config,
+                                    retention_ratio=float(ratio),
+                                    progress_step=int(global_index),
+                                    total_steps=int(max_steps),
+                                )
+                                unscaled_sample_loss = sample_loss
+                                sample_loss = unscaled_sample_loss * phase_ratio_scale.scale
+                                sample_metrics.update(
+                                    {
+                                        **phase_ratio_scale.metrics(),
+                                        "phase_ratio_unweighted_loss": float(
+                                            unscaled_sample_loss.detach().cpu()
+                                        ),
+                                        "phase_ratio_weighted_loss": float(sample_loss.detach().cpu()),
+                                        "phase_ratio_weight_detached": True,
+                                    }
+                                )
                             sample_text_log = sample_metrics.pop(STUDENT_TEXT_LOG_KEY, None)
                             if isinstance(sample_text_log, dict):
                                 batch_text_logs.append(
@@ -1444,9 +5123,52 @@ def train(cfg: dict[str, Any]) -> Path:
                     batch_losses.append(sample_loss)
                     batch_metrics.append(sample_metrics)
                     batch_samples.append(sample)
+                    batch_global_indices.append(global_index)
                     batch_ratios.append(float(ratio))
-                loss = torch.stack(batch_losses).mean()
+                    batch_rollout_seeds.append(rollout_seed)
+                if effective_batch_probability_weighting:
+                    if len(batch_losses) != 1:
+                        raise AssertionError("Effective-batch probability weighting expects one local loss.")
+                    effective_record = effective_batch_window[accum]
+                    probability_weight = torch.tensor(
+                        float(effective_record["probability_weight"]),
+                        dtype=batch_losses[0].dtype,
+                        device=batch_losses[0].device,
+                    ).detach()
+                    loss = effective_batch_local_objective(
+                        batch_losses[0],
+                        probability_weight,
+                        effective_batch_size=effective_batch_size,
+                    )
+                    summary_metrics = {
+                        key: value
+                        for key, value in effective_batch_summary.items()
+                        if key != "global_records"
+                    }
+                    trajectory_metrics = {
+                        "trajectory_weighting_enabled": True,
+                        **summary_metrics,
+                        "trajectory_probability_weight": float(probability_weight.cpu()),
+                        "trajectory_effective_multiplier": float(
+                            probability_weight.cpu() * effective_batch_size
+                        ),
+                        "trajectory_ddp_accumulation_objective_scale": float(
+                            effective_batch_size
+                        ),
+                        "trajectory_weight_detached": not probability_weight.requires_grad,
+                    }
+                else:
+                    loss, trajectory_metrics = apply_distributed_trajectory_weighting(
+                        batch_losses,
+                        batch_metrics,
+                        cfg,
+                        distributed=distributed,
+                        rank=rank,
+                        world_size=world_size,
+                        curriculum_state=curriculum_state,
+                    )
                 metrics = aggregate_microbatch_metrics(batch_metrics)
+                metrics.update(trajectory_metrics)
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"Non-finite loss: {loss}")
                 sync_context = model.no_sync() if distributed and hasattr(model, "no_sync") and (accum + 1) < grad_accum else nullcontext()
@@ -1454,8 +5176,16 @@ def train(cfg: dict[str, Any]) -> Path:
                     (loss / grad_accum).backward()
                 accum += 1
                 ema_update_metrics: dict[str, Any] = {}
+                gradient_norm_value: float | None = None
                 if accum >= grad_accum:
+                    if method == "epic_official":
+                        max_grad_norm = float(get_nested(cfg, "training.max_grad_norm", 1.0))
+                        gradient_norm = torch.nn.utils.clip_grad_norm_(trainable, max_grad_norm)
+                        gradient_norm_value = float(gradient_norm.detach().cpu())
                     optimizer.step()
+                    if official_epic_scheduler is not None:
+                        official_epic_scheduler.step()
+                        official_epic_optimizer_steps_completed += 1
                     if ema_teacher_enabled and teacher_adapter_name:
                         update_ema_adapter(
                             model,
@@ -1505,13 +5235,14 @@ def train(cfg: dict[str, Any]) -> Path:
                     optimizer.zero_grad(set_to_none=True)
                     accum = 0
                 step += 1
-                global_step = min(max_steps, start_step + step * global_step_unit)
+                global_step = min(stop_at_step, start_step + step * global_step_unit)
                 row = {
                     "step": global_step,
                     "local_step": step,
                     "rank": rank,
                     "world_size": world_size,
                     "method": method,
+                    "pruning_method": pruning_method,
                     "prompt_mode": prompt_mode,
                     "generation_max_new_tokens": int(get_nested(cfg, "generation.max_new_tokens", 128)),
                     "generation_max_unparseable_new_tokens": get_nested(cfg, "generation.max_unparseable_new_tokens", None),
@@ -1519,10 +5250,24 @@ def train(cfg: dict[str, Any]) -> Path:
                     "micro_batch_size": micro_batch_size,
                     "sample_id": batch_samples[0].sample_id,
                     "sample_ids": [item.sample_id for item in batch_samples],
+                    "global_index": batch_global_indices[0],
+                    "global_indices": batch_global_indices,
                     "retention_ratio": batch_ratios[0],
                     "retention_ratios": batch_ratios,
+                    "rollout_seed": batch_rollout_seeds[0],
+                    "rollout_seeds": batch_rollout_seeds,
                     "retention_ratio_schedule": str(get_nested(cfg, "pruning.retention_ratio_schedule", "random") or "random"),
                     "loss": float(loss.detach().cpu()),
+                    "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                    "vision_learning_rate": (
+                        float(optimizer.param_groups[1]["lr"])
+                        if vision_learning_rate is not None and len(optimizer.param_groups) > 1
+                        else None
+                    ),
+                    "optimizer_steps_completed": (
+                        official_epic_optimizer_steps_completed if method == "epic_official" else None
+                    ),
+                    "gradient_norm": gradient_norm_value,
                     "micro_batch_losses": [float(item.detach().cpu()) for item in batch_losses],
                     "elapsed_seconds": time.time() - start,
                     **metrics,
@@ -1539,6 +5284,7 @@ def train(cfg: dict[str, Any]) -> Path:
                                 "rank": rank,
                                 "world_size": world_size,
                                 "method": method,
+                                "pruning_method": pruning_method,
                                 "prompt_mode": prompt_mode,
                                 "generation_max_new_tokens": int(get_nested(cfg, "generation.max_new_tokens", 128)),
                                 "generation_max_unparseable_new_tokens": get_nested(
@@ -1549,14 +5295,70 @@ def train(cfg: dict[str, Any]) -> Path:
                             },
                         )
                     print(json.dumps(row, ensure_ascii=False), flush=True)
-                    if save_every > 0 and global_step % save_every == 0:
+                    if not checkpointing_enabled and save_every > 0 and global_step % save_every == 0:
                         save_checkpoint(model, output_dir / f"step_{global_step}", ema_shadow=ema_shadow)
+                if bool(get_nested(cfg, "opsd.native_budget_weighting.enabled", False)):
+                    write_jsonl(output_dir / f"rank{rank}_native_budget_metrics.jsonl", row)
+                if bool(get_nested(cfg, "opsd.phase_ratio_scaling.enabled", False)):
+                    write_jsonl(output_dir / f"rank{rank}_phase_ratio_scaling.jsonl", row)
+                if bool(get_nested(cfg, "paired_sampling.enabled", False)):
+                    write_jsonl(
+                        paired_rank_log_path,
+                        {
+                            "step": global_step,
+                            "rank": rank,
+                            "global_indices": batch_global_indices,
+                            "sample_ids": [item.sample_id for item in batch_samples],
+                            "retention_ratios": batch_ratios,
+                            "rollout_seeds": batch_rollout_seeds,
+                        },
+                    )
+                if bool(get_nested(cfg, "checkpointing.log_sample_assignments", False)):
+                    write_jsonl(
+                        assignment_rank_log_path,
+                        {
+                            "step": global_step,
+                            "rank": rank,
+                            "global_indices": batch_global_indices,
+                            "sample_ids": [item.sample_id for item in batch_samples],
+                            "retention_ratios": batch_ratios,
+                            "rollout_seeds": batch_rollout_seeds,
+                        },
+                    )
+                if checkpointing_enabled and global_step % eval_snapshot_every == 0:
+                    if accum != 0:
+                        raise RuntimeError(f"Evaluation snapshot step {global_step} is not an optimizer boundary.")
+                    save_lora_evaluation_snapshot(
+                        model,
+                        output_dir,
+                        global_step=global_step,
+                        cfg=cfg,
+                        rank=rank,
+                        distributed=distributed,
+                    )
+                if checkpointing_enabled and global_step % resumable_every == 0:
+                    if accum != 0:
+                        raise RuntimeError(f"Resumable checkpoint step {global_step} is not an optimizer boundary.")
+                    save_full_resumable_checkpoint(
+                        model,
+                        optimizer,
+                        ema_shadow,
+                        rng,
+                        output_dir,
+                        global_step=global_step,
+                        cfg=cfg,
+                        rank=rank,
+                        world_size=world_size,
+                        distributed=distributed,
+                        curriculum_state=curriculum_state,
+                    )
             except Exception as exc:
                 row = {
                     "step": start_step + (step + 1) * world_size if distributed else start_step + step + 1,
                     "local_step": step + 1,
                     "rank": rank,
                     "method": method,
+                    "pruning_method": pruning_method,
                     "sample_id": sample.sample_id if sample is not None else "",
                     "retention_ratio": ratio,
                     "error": repr(exc),
@@ -1565,7 +5367,37 @@ def train(cfg: dict[str, Any]) -> Path:
                 if is_main_process(rank):
                     write_jsonl(log_path, row)
                 raise
-        if is_main_process(rank):
+        if checkpointing_enabled:
+            final_checkpoint = save_full_resumable_checkpoint(
+                model,
+                optimizer,
+                ema_shadow,
+                rng,
+                output_dir,
+                global_step=stop_at_step,
+                cfg=cfg,
+                rank=rank,
+                world_size=world_size,
+                distributed=distributed,
+                curriculum_state=curriculum_state,
+            )
+            if stop_at_step == max_steps:
+                point_final_checkpoint_at(output_dir, final_checkpoint, rank, distributed)
+            else:
+                distributed_barrier(distributed)
+                if is_main_process(rank):
+                    _atomic_write_json(
+                        output_dir / f"segment_complete_step_{stop_at_step:06d}.json",
+                        {
+                            "status": "segment_complete",
+                            "global_step": int(stop_at_step),
+                            "training_target_global_step": int(max_steps),
+                            "resume_checkpoint": str(final_checkpoint.resolve()),
+                            "config_contract_sha256": checkpoint_contract_sha256(cfg),
+                        },
+                    )
+                distributed_barrier(distributed)
+        elif is_main_process(rank):
             save_checkpoint(model, output_dir / "final", ema_shadow=ema_shadow)
     finally:
         cleanup_distributed(distributed)

@@ -1,0 +1,33 @@
+{
+  "experiment_id": "llm_only_opsd_checkpoint_kl_mmstar_metric_noocr_clean100_max1024_20260729",
+  "training_method": "opsd",
+  "method_display_name": "OPSD",
+  "base_model": "Qwen/Qwen2.5-VL-7B-Instruct",
+  "checkpoint_root": "/scratch/enmingzz/outputs/llm_only/checkpoints/llm_only_random_decontam_v1_20260713/opsd",
+  "samples": "/project/6101803/enmingzz/opsd/hypothesis_validate/manual_review/mmstar_metric_noocr_clean100_seed42/samples.jsonl",
+  "output_root": "/project/6101803/enmingzz/opsd/hypothesis_validate/opsd_checkpoint_kl_trajectory/outputs/llm_only_opsd_mmstar_metric_noocr_clean100_max1024",
+  "clean_transformers_src": "/project/6101803/enmingzz/ckpt_eval_trainenv/VLMEvalKit_armen51682/transformers/src",
+  "min_pixels": 1003520,
+  "max_pixels": 3211264,
+  "rollout_retention_ratio": 0.20,
+  "comparison_retention_ratio": 0.25,
+  "contextual_ratio": 0.05,
+  "max_new_tokens": 1024,
+  "seed": 42,
+  "bootstrap_resamples": 1000,
+  "equivalence_atol": 0.003,
+  "equivalence_rtol": 0.003,
+  "checkpoint_steps": [
+    {"label": "step_0", "step": 0, "adapter_path": "__BASE__"},
+    {"label": "step_1024", "step": 1024, "adapter_path": "step_1024"},
+    {"label": "step_2048", "step": 2048, "adapter_path": "step_2048"},
+    {"label": "step_3072", "step": 3072, "adapter_path": "step_3072"},
+    {"label": "step_4096", "step": 4096, "adapter_path": "step_4096"},
+    {"label": "step_5120", "step": 5120, "adapter_path": "step_5120"},
+    {"label": "step_6144", "step": 6144, "adapter_path": "step_6144"},
+    {"label": "step_7168", "step": 7168, "adapter_path": "step_7168"},
+    {"label": "step_8192", "step": 8192, "adapter_path": "step_8192"},
+    {"label": "step_9216", "step": 9216, "adapter_path": "step_9216"},
+    {"label": "step_9984", "step": 9984, "adapter_path": "final"}
+  ]
+}

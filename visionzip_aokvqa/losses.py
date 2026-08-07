@@ -37,6 +37,424 @@ def compute_forward_kl(
     return torch.stack(losses).sum() / float(sum(counts))
 
 
+def compute_per_token_kl(
+    source_logits: torch.Tensor,
+    reference_logits: torch.Tensor,
+    temperature: float = 1.0,
+    chunk_size: int = 32,
+) -> torch.Tensor:
+    """Return KL(source || reference) independently at each token position.
+
+    The vocabulary calculation is performed in FP32 and chunked over token
+    positions.  Passing full-token teacher logits as ``source_logits`` and
+    pruned-student logits as ``reference_logits`` matches the existing OPSD
+    direction used by :func:`compute_forward_kl`.
+    """
+
+    if source_logits.shape != reference_logits.shape:
+        raise ValueError(
+            "Source/reference logits must align by token index: "
+            f"{source_logits.shape} vs {reference_logits.shape}"
+        )
+    source_logits = _flatten_token_logits(source_logits)
+    reference_logits = _flatten_token_logits(reference_logits)
+    if int(source_logits.shape[0]) <= 0:
+        raise ValueError("Per-token KL requires at least one token position.")
+    temperature = float(temperature)
+    if temperature <= 0.0:
+        raise ValueError(f"KL temperature must be positive, got {temperature}.")
+    chunk_size = max(1, int(chunk_size))
+    token_losses: list[torch.Tensor] = []
+    for start in range(0, int(source_logits.shape[0]), chunk_size):
+        end = min(start + chunk_size, int(source_logits.shape[0]))
+        source_probs = F.softmax(source_logits[start:end].float() / temperature, dim=-1)
+        reference_log_probs = F.log_softmax(reference_logits[start:end].float() / temperature, dim=-1)
+        chunk = F.kl_div(reference_log_probs, source_probs, reduction="none").sum(dim=-1)
+        token_losses.append(chunk * (temperature**2))
+    return torch.cat(token_losses, dim=0)
+
+
+def compute_budget_gradient_alignment(
+    teacher_logits: torch.Tensor,
+    b_plus_logits: torch.Tensor,
+    student_logits: torch.Tensor,
+    *,
+    temperature: float = 1.0,
+    chunk_size: int = 16,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """Cosine alignment of full-teacher and adjacent-budget logit gradients.
+
+    For forward KL, the gradient with respect to the deployed student's
+    logits is proportional to ``p_b - q``.  The adjacent-budget bridge has
+    gradient ``p_b - p_b_plus``.  Positive cosine means that descending the
+    bridge objective is locally aligned with descending the original OPSD
+    objective.  The returned diagnostic is fully detached.
+    """
+
+    if teacher_logits.shape != b_plus_logits.shape or teacher_logits.shape != student_logits.shape:
+        raise ValueError(
+            "Teacher, b_plus, and student logits must align: "
+            f"{teacher_logits.shape}, {b_plus_logits.shape}, {student_logits.shape}."
+        )
+    teacher_logits = _flatten_token_logits(teacher_logits)
+    b_plus_logits = _flatten_token_logits(b_plus_logits)
+    student_logits = _flatten_token_logits(student_logits)
+    temperature = float(temperature)
+    if temperature <= 0.0:
+        raise ValueError(f"Alignment temperature must be positive, got {temperature}.")
+    if float(eps) <= 0.0:
+        raise ValueError(f"eps must be positive, got {eps}.")
+
+    alignments: list[torch.Tensor] = []
+    chunk_size = max(1, int(chunk_size))
+    with torch.no_grad():
+        for start in range(0, int(teacher_logits.shape[0]), chunk_size):
+            end = min(start + chunk_size, int(teacher_logits.shape[0]))
+            teacher_probs = F.softmax(teacher_logits[start:end].float() / temperature, dim=-1)
+            plus_probs = F.softmax(b_plus_logits[start:end].float() / temperature, dim=-1)
+            student_probs = F.softmax(student_logits[start:end].detach().float() / temperature, dim=-1)
+            teacher_gradient = student_probs - teacher_probs
+            bridge_gradient = student_probs - plus_probs
+            numerator = (teacher_gradient * bridge_gradient).sum(dim=-1)
+            denominator = (
+                teacher_gradient.square().sum(dim=-1).sqrt()
+                * bridge_gradient.square().sum(dim=-1).sqrt()
+            )
+            alignment = torch.where(
+                denominator > float(eps),
+                numerator / denominator.clamp_min(float(eps)),
+                torch.zeros_like(numerator),
+            )
+            alignments.append(alignment.clamp(-1.0, 1.0))
+    return torch.cat(alignments, dim=0).detach()
+
+
+def compute_budget_gradient_geometry(
+    teacher_logits: torch.Tensor,
+    b_plus_logits: torch.Tensor,
+    student_logits: torch.Tensor,
+    *,
+    temperature: float = 1.0,
+    chunk_size: int = 16,
+    eps: float = 1e-12,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Measure how much an adjacent-budget step explains the teacher gradient.
+
+    For forward KL, let ``g_full = p_b - q`` and
+    ``g_budget = p_b - p_b_plus``. The explained fraction is the positive
+    finite-step projection ``clip(<g_full, g_budget> / ||g_full||^2, 0, 1)``.
+    It is one when the native ``b_plus`` distribution closes the local
+    teacher residual, and zero when the budget direction is null, orthogonal,
+    or conflicting. The residual fraction is its complement. All outputs are
+    detached diagnostics used to construct detached token weights.
+    """
+
+    if teacher_logits.shape != b_plus_logits.shape or teacher_logits.shape != student_logits.shape:
+        raise ValueError(
+            "Teacher, b_plus, and student logits must align: "
+            f"{teacher_logits.shape}, {b_plus_logits.shape}, {student_logits.shape}."
+        )
+    teacher_logits = _flatten_token_logits(teacher_logits)
+    b_plus_logits = _flatten_token_logits(b_plus_logits)
+    student_logits = _flatten_token_logits(student_logits)
+    temperature = float(temperature)
+    if temperature <= 0.0:
+        raise ValueError(f"Geometry temperature must be positive, got {temperature}.")
+    if float(eps) <= 0.0:
+        raise ValueError(f"eps must be positive, got {eps}.")
+
+    alignments: list[torch.Tensor] = []
+    explained_fractions: list[torch.Tensor] = []
+    residual_fractions: list[torch.Tensor] = []
+    chunk_size = max(1, int(chunk_size))
+    with torch.no_grad():
+        for start in range(0, int(teacher_logits.shape[0]), chunk_size):
+            end = min(start + chunk_size, int(teacher_logits.shape[0]))
+            teacher_probs = F.softmax(teacher_logits[start:end].float() / temperature, dim=-1)
+            plus_probs = F.softmax(b_plus_logits[start:end].float() / temperature, dim=-1)
+            student_probs = F.softmax(student_logits[start:end].detach().float() / temperature, dim=-1)
+            teacher_gradient = student_probs - teacher_probs
+            budget_gradient = student_probs - plus_probs
+            dot = (teacher_gradient * budget_gradient).sum(dim=-1)
+            teacher_norm_sq = teacher_gradient.square().sum(dim=-1)
+            budget_norm_sq = budget_gradient.square().sum(dim=-1)
+            cosine_denom = (teacher_norm_sq * budget_norm_sq).sqrt()
+            alignment = torch.where(
+                cosine_denom > float(eps),
+                dot / cosine_denom.clamp_min(float(eps)),
+                torch.zeros_like(dot),
+            ).clamp(-1.0, 1.0)
+            explained = torch.where(
+                teacher_norm_sq > float(eps),
+                dot / teacher_norm_sq.clamp_min(float(eps)),
+                torch.zeros_like(dot),
+            ).clamp(0.0, 1.0)
+            alignments.append(alignment)
+            explained_fractions.append(explained)
+            residual_fractions.append(1.0 - explained)
+    return (
+        torch.cat(alignments, dim=0).detach(),
+        torch.cat(explained_fractions, dim=0).detach(),
+        torch.cat(residual_fractions, dim=0).detach(),
+    )
+
+
+def compute_budget_gradient_projection_geometry(
+    teacher_logits: torch.Tensor,
+    b_plus_logits: torch.Tensor,
+    student_logits: torch.Tensor,
+    *,
+    temperature: float = 1.0,
+    chunk_size: int = 16,
+    eps: float = 1e-12,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return detached geometry for projecting out the adjacent-budget direction.
+
+    For forward KL, ``g_full = p_b - q`` and
+    ``g_budget = p_b - p_b_plus`` are the logit-space gradients of the full
+    teacher and adjacent-budget bridge objectives. The unbounded projection
+    coefficient ``<g_full, g_budget> / ||g_budget||^2`` is the coefficient
+    required to remove the component of ``g_full`` parallel to
+    ``g_budget``. Clipping and causal gating are intentionally left to the
+    caller so this function remains a pure diagnostic.
+    """
+
+    if teacher_logits.shape != b_plus_logits.shape or teacher_logits.shape != student_logits.shape:
+        raise ValueError(
+            "Teacher, b_plus, and student logits must align: "
+            f"{teacher_logits.shape}, {b_plus_logits.shape}, {student_logits.shape}."
+        )
+    teacher_logits = _flatten_token_logits(teacher_logits)
+    b_plus_logits = _flatten_token_logits(b_plus_logits)
+    student_logits = _flatten_token_logits(student_logits)
+    temperature = float(temperature)
+    if temperature <= 0.0:
+        raise ValueError(f"Projection temperature must be positive, got {temperature}.")
+    if float(eps) <= 0.0:
+        raise ValueError(f"eps must be positive, got {eps}.")
+
+    alignments: list[torch.Tensor] = []
+    projection_coefficients: list[torch.Tensor] = []
+    teacher_norm_squares: list[torch.Tensor] = []
+    budget_norm_squares: list[torch.Tensor] = []
+    dot_products: list[torch.Tensor] = []
+    chunk_size = max(1, int(chunk_size))
+    with torch.no_grad():
+        for start in range(0, int(teacher_logits.shape[0]), chunk_size):
+            end = min(start + chunk_size, int(teacher_logits.shape[0]))
+            teacher_probs = F.softmax(teacher_logits[start:end].float() / temperature, dim=-1)
+            plus_probs = F.softmax(b_plus_logits[start:end].float() / temperature, dim=-1)
+            student_probs = F.softmax(student_logits[start:end].detach().float() / temperature, dim=-1)
+            teacher_gradient = student_probs - teacher_probs
+            budget_gradient = student_probs - plus_probs
+            dot = (teacher_gradient * budget_gradient).sum(dim=-1)
+            teacher_norm_sq = teacher_gradient.square().sum(dim=-1)
+            budget_norm_sq = budget_gradient.square().sum(dim=-1)
+            cosine_denom = (teacher_norm_sq * budget_norm_sq).sqrt()
+            alignment = torch.where(
+                cosine_denom > float(eps),
+                dot / cosine_denom.clamp_min(float(eps)),
+                torch.zeros_like(dot),
+            ).clamp(-1.0, 1.0)
+            projection = torch.where(
+                budget_norm_sq > float(eps),
+                dot / budget_norm_sq.clamp_min(float(eps)),
+                torch.zeros_like(dot),
+            )
+            alignments.append(alignment)
+            projection_coefficients.append(projection)
+            teacher_norm_squares.append(teacher_norm_sq)
+            budget_norm_squares.append(budget_norm_sq)
+            dot_products.append(dot)
+    return (
+        torch.cat(alignments, dim=0).detach(),
+        torch.cat(projection_coefficients, dim=0).detach(),
+        torch.cat(teacher_norm_squares, dim=0).detach(),
+        torch.cat(budget_norm_squares, dim=0).detach(),
+        torch.cat(dot_products, dim=0).detach(),
+    )
+
+
+def compute_teacher_gradient_budget_consensus(
+    teacher_logits: torch.Tensor,
+    b_plus_logits: torch.Tensor,
+    student_logits: torch.Tensor,
+    *,
+    temperature: float = 1.0,
+    chunk_size: int = 16,
+    eps: float = 1e-12,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Measure invariance of the full-teacher correction across two budgets.
+
+    The deployed and probe correction directions are ``p_b - q`` and
+    ``p_b_plus - q``. Their cosine tests directional agreement, while the
+    norm ratio penalizes a correction whose magnitude collapses under the
+    adjacent native VisionZip intervention. Both diagnostics are detached.
+    """
+
+    if teacher_logits.shape != b_plus_logits.shape or teacher_logits.shape != student_logits.shape:
+        raise ValueError(
+            "Teacher, b_plus, and student logits must align: "
+            f"{teacher_logits.shape}, {b_plus_logits.shape}, {student_logits.shape}."
+        )
+    teacher_logits = _flatten_token_logits(teacher_logits)
+    b_plus_logits = _flatten_token_logits(b_plus_logits)
+    student_logits = _flatten_token_logits(student_logits)
+    temperature = float(temperature)
+    if temperature <= 0.0:
+        raise ValueError(f"Consensus temperature must be positive, got {temperature}.")
+    if float(eps) <= 0.0:
+        raise ValueError(f"eps must be positive, got {eps}.")
+
+    cosines: list[torch.Tensor] = []
+    norm_ratios: list[torch.Tensor] = []
+    chunk_size = max(1, int(chunk_size))
+    with torch.no_grad():
+        for start in range(0, int(teacher_logits.shape[0]), chunk_size):
+            end = min(start + chunk_size, int(teacher_logits.shape[0]))
+            teacher_probs = F.softmax(teacher_logits[start:end].float() / temperature, dim=-1)
+            plus_probs = F.softmax(b_plus_logits[start:end].float() / temperature, dim=-1)
+            student_probs = F.softmax(student_logits[start:end].detach().float() / temperature, dim=-1)
+            deployed_gradient = student_probs - teacher_probs
+            probe_gradient = plus_probs - teacher_probs
+            deployed_norm = deployed_gradient.square().sum(dim=-1).sqrt()
+            probe_norm = probe_gradient.square().sum(dim=-1).sqrt()
+            denominator = deployed_norm * probe_norm
+            cosine = torch.where(
+                denominator > float(eps),
+                (deployed_gradient * probe_gradient).sum(dim=-1)
+                / denominator.clamp_min(float(eps)),
+                torch.zeros_like(denominator),
+            ).clamp(-1.0, 1.0)
+            norm_ratio = torch.where(
+                torch.maximum(deployed_norm, probe_norm) > float(eps),
+                torch.minimum(deployed_norm, probe_norm)
+                / torch.maximum(deployed_norm, probe_norm).clamp_min(float(eps)),
+                torch.ones_like(deployed_norm),
+            ).clamp(0.0, 1.0)
+            cosines.append(cosine)
+            norm_ratios.append(norm_ratio)
+    return torch.cat(cosines).detach(), torch.cat(norm_ratios).detach()
+
+
+def compute_teacher_mass_on_student_support(
+    teacher_logits: torch.Tensor,
+    student_logits: torch.Tensor,
+    *,
+    top_k: int = 32,
+    temperature: float = 1.0,
+    chunk_size: int = 16,
+) -> torch.Tensor:
+    """Teacher probability mass covered by the student's local top-k support."""
+
+    if teacher_logits.shape != student_logits.shape:
+        raise ValueError(
+            "Teacher/student logits must align: "
+            f"{teacher_logits.shape} vs {student_logits.shape}."
+        )
+    teacher_logits = _flatten_token_logits(teacher_logits)
+    student_logits = _flatten_token_logits(student_logits)
+    temperature = float(temperature)
+    if temperature <= 0.0:
+        raise ValueError(f"Support temperature must be positive, got {temperature}.")
+    top_k = int(top_k)
+    if top_k <= 0:
+        raise ValueError(f"top_k must be positive, got {top_k}.")
+    top_k = min(top_k, int(student_logits.shape[-1]))
+    chunk_size = max(1, int(chunk_size))
+    coverage: list[torch.Tensor] = []
+    with torch.no_grad():
+        for start in range(0, int(teacher_logits.shape[0]), chunk_size):
+            end = min(start + chunk_size, int(teacher_logits.shape[0]))
+            student_indices = torch.topk(
+                student_logits[start:end].detach().float(),
+                k=top_k,
+                dim=-1,
+            ).indices
+            teacher_probs = F.softmax(
+                teacher_logits[start:end].float() / temperature,
+                dim=-1,
+            )
+            coverage.append(torch.gather(teacher_probs, dim=-1, index=student_indices).sum(dim=-1))
+    return torch.cat(coverage, dim=0).clamp(0.0, 1.0).detach()
+
+
+def compute_budget_contrastive_per_token_kl(
+    teacher_logits: torch.Tensor,
+    b_plus_logits: torch.Tensor,
+    student_logits: torch.Tensor,
+    shaping_strength: torch.Tensor,
+    *,
+    advantage_clip: float = 2.0,
+    temperature: float = 1.0,
+    chunk_size: int = 16,
+    return_target_shift: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Distill a full teacher shaped by an adjacent-budget counterfactual.
+
+    The detached vocabulary advantage ``log p_b_plus - log p_b`` identifies
+    directions supported by adding native visual tokens. It is centered under
+    the full-teacher distribution, clipped, and applied only through the
+    detached per-position ``shaping_strength`` gate. Gradients flow solely
+    through ``student_logits``.
+    """
+
+    if teacher_logits.shape != b_plus_logits.shape or teacher_logits.shape != student_logits.shape:
+        raise ValueError(
+            "Teacher, b_plus, and student logits must align: "
+            f"{teacher_logits.shape}, {b_plus_logits.shape}, {student_logits.shape}."
+        )
+    teacher_logits = _flatten_token_logits(teacher_logits)
+    b_plus_logits = _flatten_token_logits(b_plus_logits)
+    student_logits = _flatten_token_logits(student_logits)
+    strength = shaping_strength.detach().float().reshape(-1)
+    if strength.shape[0] != teacher_logits.shape[0]:
+        raise ValueError(
+            f"Shaping strength must have one value per token: {strength.shape} vs {teacher_logits.shape}."
+        )
+    if not torch.isfinite(strength).all() or (strength < 0.0).any():
+        raise ValueError("Shaping strength must be finite and nonnegative.")
+    if float(advantage_clip) <= 0.0:
+        raise ValueError(f"advantage_clip must be positive, got {advantage_clip}.")
+    temperature = float(temperature)
+    if temperature <= 0.0:
+        raise ValueError(f"KL temperature must be positive, got {temperature}.")
+
+    token_losses: list[torch.Tensor] = []
+    target_shifts: list[torch.Tensor] = []
+    chunk_size = max(1, int(chunk_size))
+    for start in range(0, int(teacher_logits.shape[0]), chunk_size):
+        end = min(start + chunk_size, int(teacher_logits.shape[0]))
+        with torch.no_grad():
+            teacher_log_probs = F.log_softmax(teacher_logits[start:end].float() / temperature, dim=-1)
+            teacher_probs = teacher_log_probs.exp()
+            plus_log_probs = F.log_softmax(b_plus_logits[start:end].float() / temperature, dim=-1)
+            base_log_probs = F.log_softmax(student_logits[start:end].detach().float() / temperature, dim=-1)
+            advantage = plus_log_probs - base_log_probs
+            advantage = advantage - (teacher_probs * advantage).sum(dim=-1, keepdim=True)
+            advantage = advantage.clamp(min=-float(advantage_clip), max=float(advantage_clip))
+            shaped_logits = teacher_log_probs + strength[start:end, None] * advantage
+            shaped_probs = F.softmax(shaped_logits, dim=-1).detach()
+            if return_target_shift:
+                target_shifts.append(
+                    F.kl_div(
+                        teacher_log_probs,
+                        shaped_probs,
+                        reduction="none",
+                    ).sum(dim=-1)
+                    * (temperature**2)
+                )
+        student_log_probs = F.log_softmax(student_logits[start:end].float() / temperature, dim=-1)
+        token_losses.append(
+            F.kl_div(student_log_probs, shaped_probs, reduction="none").sum(dim=-1) * (temperature**2)
+        )
+    losses = torch.cat(token_losses, dim=0)
+    if not return_target_shift:
+        return losses
+    return losses, torch.cat(target_shifts, dim=0).detach()
+
+
 def _generalized_jsd_chunk(
     teacher_logits: torch.Tensor,
     student_logits: torch.Tensor,

@@ -1,5 +1,10 @@
 # OPSD VisionZip A-OKVQA Runbook
 
+> The current minimal research-code index is [CORE_RESEARCH.md](CORE_RESEARCH.md).
+> It covers pass@k, LLM-only SFT/OPSD/JSD-weighted training, JSD sensitivity,
+> and the four-benchmark merged-checkpoint evaluation path. Generated results
+> and model artifacts are intentionally excluded from the GitHub release.
+
 This repository contains the A-OKVQA training and VLMEvalKit evaluation code used for the Qwen2.5-VL + VisionZip OPSD experiments.
 
 The current public checkpoint bundle contains three PEFT LoRA adapters:

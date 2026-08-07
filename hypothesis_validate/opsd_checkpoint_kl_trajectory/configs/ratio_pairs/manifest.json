@@ -1,0 +1,82 @@
+[
+  {
+    "pair": "r015_r0175",
+    "low_retention_ratio": 0.15,
+    "high_retention_ratio": 0.175,
+    "method": "opsd",
+    "config": "/project/6101803/enmingzz/opsd/hypothesis_validate/opsd_checkpoint_kl_trajectory/configs/ratio_pairs/config_opsd_r015_r0175_max1024.json",
+    "checkpoint_root": "/scratch/enmingzz/outputs/llm_only/checkpoints/llm_only_random_decontam_v1_20260713/opsd",
+    "output_root": "/project/6101803/enmingzz/opsd/hypothesis_validate/opsd_checkpoint_kl_trajectory/outputs/ratio_pairs_mmstar_clean100_max1024/r015_r0175/opsd",
+    "checkpoint_count": 11
+  },
+  {
+    "pair": "r015_r0175",
+    "low_retention_ratio": 0.15,
+    "high_retention_ratio": 0.175,
+    "method": "sft",
+    "config": "/project/6101803/enmingzz/opsd/hypothesis_validate/opsd_checkpoint_kl_trajectory/configs/ratio_pairs/config_sft_r015_r0175_max1024.json",
+    "checkpoint_root": "/scratch/enmingzz/outputs/llm_only/checkpoints/llm_only_random_decontam_v1_20260713/sft",
+    "output_root": "/project/6101803/enmingzz/opsd/hypothesis_validate/opsd_checkpoint_kl_trajectory/outputs/ratio_pairs_mmstar_clean100_max1024/r015_r0175/sft",
+    "checkpoint_count": 11
+  },
+  {
+    "pair": "r015_r020",
+    "low_retention_ratio": 0.15,
+    "high_retention_ratio": 0.2,
+    "method": "opsd",
+    "config": "/project/6101803/enmingzz/opsd/hypothesis_validate/opsd_checkpoint_kl_trajectory/configs/ratio_pairs/config_opsd_r015_r020_max1024.json",
+    "checkpoint_root": "/scratch/enmingzz/outputs/llm_only/checkpoints/llm_only_random_decontam_v1_20260713/opsd",
+    "output_root": "/project/6101803/enmingzz/opsd/hypothesis_validate/opsd_checkpoint_kl_trajectory/outputs/ratio_pairs_mmstar_clean100_max1024/r015_r020/opsd",
+    "checkpoint_count": 11
+  },
+  {
+    "pair": "r015_r020",
+    "low_retention_ratio": 0.15,
+    "high_retention_ratio": 0.2,
+    "method": "sft",
+    "config": "/project/6101803/enmingzz/opsd/hypothesis_validate/opsd_checkpoint_kl_trajectory/configs/ratio_pairs/config_sft_r015_r020_max1024.json",
+    "checkpoint_root": "/scratch/enmingzz/outputs/llm_only/checkpoints/llm_only_random_decontam_v1_20260713/sft",
+    "output_root": "/project/6101803/enmingzz/opsd/hypothesis_validate/opsd_checkpoint_kl_trajectory/outputs/ratio_pairs_mmstar_clean100_max1024/r015_r020/sft",
+    "checkpoint_count": 11
+  },
+  {
+    "pair": "r0175_r020",
+    "low_retention_ratio": 0.175,
+    "high_retention_ratio": 0.2,
+    "method": "opsd",
+    "config": "/project/6101803/enmingzz/opsd/hypothesis_validate/opsd_checkpoint_kl_trajectory/configs/ratio_pairs/config_opsd_r0175_r020_max1024.json",
+    "checkpoint_root": "/scratch/enmingzz/outputs/llm_only/checkpoints/llm_only_random_decontam_v1_20260713/opsd",
+    "output_root": "/project/6101803/enmingzz/opsd/hypothesis_validate/opsd_checkpoint_kl_trajectory/outputs/ratio_pairs_mmstar_clean100_max1024/r0175_r020/opsd",
+    "checkpoint_count": 11
+  },
+  {
+    "pair": "r0175_r020",
+    "low_retention_ratio": 0.175,
+    "high_retention_ratio": 0.2,
+    "method": "sft",
+    "config": "/project/6101803/enmingzz/opsd/hypothesis_validate/opsd_checkpoint_kl_trajectory/configs/ratio_pairs/config_sft_r0175_r020_max1024.json",
+    "checkpoint_root": "/scratch/enmingzz/outputs/llm_only/checkpoints/llm_only_random_decontam_v1_20260713/sft",
+    "output_root": "/project/6101803/enmingzz/opsd/hypothesis_validate/opsd_checkpoint_kl_trajectory/outputs/ratio_pairs_mmstar_clean100_max1024/r0175_r020/sft",
+    "checkpoint_count": 11
+  },
+  {
+    "pair": "r020_r0225",
+    "low_retention_ratio": 0.2,
+    "high_retention_ratio": 0.225,
+    "method": "opsd",
+    "config": "/project/6101803/enmingzz/opsd/hypothesis_validate/opsd_checkpoint_kl_trajectory/configs/ratio_pairs/config_opsd_r020_r0225_max1024.json",
+    "checkpoint_root": "/scratch/enmingzz/outputs/llm_only/checkpoints/llm_only_random_decontam_v1_20260713/opsd",
+    "output_root": "/project/6101803/enmingzz/opsd/hypothesis_validate/opsd_checkpoint_kl_trajectory/outputs/ratio_pairs_mmstar_clean100_max1024/r020_r0225/opsd",
+    "checkpoint_count": 11
+  },
+  {
+    "pair": "r020_r0225",
+    "low_retention_ratio": 0.2,
+    "high_retention_ratio": 0.225,
+    "method": "sft",
+    "config": "/project/6101803/enmingzz/opsd/hypothesis_validate/opsd_checkpoint_kl_trajectory/configs/ratio_pairs/config_sft_r020_r0225_max1024.json",
+    "checkpoint_root": "/scratch/enmingzz/outputs/llm_only/checkpoints/llm_only_random_decontam_v1_20260713/sft",
+    "output_root": "/project/6101803/enmingzz/opsd/hypothesis_validate/opsd_checkpoint_kl_trajectory/outputs/ratio_pairs_mmstar_clean100_max1024/r020_r0225/sft",
+    "checkpoint_count": 11
+  }
+]

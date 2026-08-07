@@ -132,7 +132,21 @@ def test_opsd_teacher_prompt_contains_reference_solution():
     )
     assert "Reference Solution Begin" in prompt
     assert "Final answer: B" in prompt
-    assert "Do not copy or paraphrase it" in prompt
+    assert "do not copy or paraphrase it" in prompt.lower()
+
+
+def test_opsd_open_teacher_prompt_contains_reference_solution_without_options():
+    target = "<think>Count the three visible objects.</think>\n<answer>3</answer>"
+    prompt = build_opsd_teacher_prompt(
+        "How many objects are visible?",
+        [],
+        target,
+        prompt_mode="thinking",
+    )
+    assert target in prompt
+    assert "Options:" not in prompt
+    assert "First output the thinking process" in prompt
+    assert prompt.count("<image>") == 1
 
 
 def test_divprune_lite_synthetic_tokens_are_sorted_and_diverse():
