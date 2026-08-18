@@ -1,0 +1,145 @@
+{
+  "benchmark_decontamination": {
+    "benchmarks": [
+      {
+        "benchmark": "MME",
+        "file_sha256": "3b6c914445710ce582ffb51ef8c6c410783ea52e8c517b0a33dbdc26c64ed680",
+        "path": "/scratch/enmingzz/vlmevalkit_data/MME.tsv"
+      },
+      {
+        "benchmark": "MME_CoT_TEST",
+        "file_sha256": "9273899f469b830452cdfd8e73745309f23fb7599693a2e124821cdadada1cb3",
+        "path": "/scratch/enmingzz/vlmevalkit_data/MME_CoT_TEST.tsv"
+      },
+      {
+        "benchmark": "MMStar",
+        "file_sha256": "5b581d485fcfbb0f4c8fc0440fc4ecea17fb4ba1750c6446fd20833070552e95",
+        "path": "/scratch/enmingzz/vlmevalkit_data/MMStar.tsv"
+      },
+      {
+        "benchmark": "MathVista_MINI",
+        "file_sha256": "876bc02fce10e4d2a13c1cf4fc02226daf8c039599f85725c05c5ef4996dc455",
+        "path": "/scratch/enmingzz/vlmevalkit_data/MathVista_MINI.tsv"
+      },
+      {
+        "benchmark": "MathVerse_MINI",
+        "file_sha256": "c4bef863fdec7e196c4f7436075031c94994f2ee10f6d6a7c65761721942455a",
+        "path": "/scratch/enmingzz/vlmevalkit_data/MathVerse_MINI.tsv"
+      },
+      {
+        "benchmark": "MathVerse_MINI_Vision_Only",
+        "file_sha256": "e4280ca3f27563c3bc3559e6d27bc3af0586d690356318354c160346313e52ed",
+        "path": "/scratch/enmingzz/vlmevalkit_data/MathVerse_MINI_Vision_Only.tsv"
+      },
+      {
+        "benchmark": "MathVision_MINI",
+        "file_sha256": "b8ae07d465d1b8fa15190de5248b9a76d72dd4f6a4f79ff9a3e5caf60a87da8f",
+        "path": "/scratch/enmingzz/vlmevalkit_data/MathVision_MINI.tsv"
+      },
+      {
+        "benchmark": "MathVision_FULL",
+        "file_sha256": "9d8bdce8283730b8f22b36cac91e9d23fe375a38032d8d2f8566e6e9e9ace719",
+        "path": "/scratch/enmingzz/vlmevalkit_data/MathVision.tsv"
+      },
+      {
+        "benchmark": "POPE",
+        "file_sha256": "837c674037e0f0dfefe837918159820f8cb7b0abb171162c044b3affdc2f4d6d",
+        "path": "/scratch/enmingzz/vlmevalkit_data/POPE.tsv"
+      },
+      {
+        "benchmark": "POPE_local",
+        "file_sha256": "35c7ecce1fc7af2671ea00ff7436cb65b6896b21e55853454bba703b45ba7199",
+        "path": "/scratch/enmingzz/vlmevalkit_data/POPE_local.tsv"
+      },
+      {
+        "benchmark": "MMMU_Pro_4c",
+        "file_sha256": "211cc40d1144325b49a75f875e2477aaee8b15ecdb9bb4176cd147acf604803d",
+        "path": "/scratch/enmingzz/vlmevalkit_data/MMMU_Pro_4c.tsv"
+      },
+      {
+        "benchmark": "MMMU_Pro_10c_COT",
+        "file_sha256": "360e0f939ab3f7bf28bf5914e1dc5be3afe80fc74857fc289ebe1bf7c9bc907f",
+        "path": "/scratch/enmingzz/vlmevalkit_data/MMMU_Pro_10c_COT.tsv"
+      },
+      {
+        "benchmark": "MMMU_Pro_V_COT",
+        "file_sha256": "80dbb7fb75442d4c1d113ea4725127371a9553dc787466c4b3b39149f83dfb91",
+        "path": "/scratch/enmingzz/vlmevalkit_data/MMMU_Pro_V_COT.tsv"
+      },
+      {
+        "benchmark": "CV-Bench-2D",
+        "file_sha256": "4b1d4fdfef96e01ef85c743ff25ded6de0d8909c4b3c8f177d19d071e1a5e865",
+        "path": "/scratch/enmingzz/vlmevalkit_data/CV-Bench-2D.tsv"
+      },
+      {
+        "benchmark": "CV-Bench-3D",
+        "file_sha256": "11c7debda31275b382017e6cf287b995efe809b4246dbaabd6e4ac5496cead17",
+        "path": "/scratch/enmingzz/vlmevalkit_data/CV-Bench-3D.tsv"
+      }
+    ]
+  },
+  "caps": {
+    "max_pixels": 846720,
+    "max_prompt_image_tokens": 1152,
+    "max_qwen_target_tokens": 512,
+    "min_pixels": 846720
+  },
+  "independent_postbuild_audit": {
+    "benchmark_count": 15,
+    "decoded_pixel_matches": 0,
+    "duplicate_image_question_excess": 0,
+    "duplicate_sample_id_excess": 0,
+    "duplicate_source_id_excess": 0,
+    "encoded_image_matches": 0,
+    "file_sha256": "a198bee000dc506512dbb90960d865bfdf2c27c8a0272ed913ed5d52e36bc0f0",
+    "image_and_question_matches": 0,
+    "image_payload_errors": 0,
+    "missing_training_images": 0,
+    "path": "/project/6101803/enmingzz/opsd/analysis/data_audit/llava_cot_train20k_ordered_decontam_v1_seed42_20260803/data_audit_summary.json",
+    "perceptual_image_matches": 0,
+    "relaxed_question_matches": 0,
+    "status": "passed",
+    "strict_question_matches": 0
+  },
+  "output_jsonl": "/project/6101803/enmingzz/opsd/data/openmmreasoner_llava_cot_train20k_ordered_decontam_v1_seed42/train20k_old10k_then_additional10k_qwentok512_imgtok1152_seed42.jsonl",
+  "output_sha256": "3565ef45091b73b74b94008dd8646e1ef24bc52226632dbcc372d0cf6b92aeb6",
+  "qwen_processor_token_check": {
+    "checked_samples": 256,
+    "file_sha256": "7330ee8bcd8cbc7b0f8545d88319c0bd34033e0157a246cbabf0e5001ed207a8",
+    "max_actual_image_tokens": 1152,
+    "mismatch_count": 0,
+    "path": "/project/6101803/enmingzz/opsd/analysis/data_audit/llava_cot_train20k_ordered_decontam_v1_seed42_20260803/qwen_processor_token_check.json",
+    "status": "passed"
+  },
+  "qwen_prompt_image_tokens": {
+    "count": 20000,
+    "max": 1152,
+    "mean": 1107.51935,
+    "median": 1107.0,
+    "min": 1020
+  },
+  "qwen_target_token_len": {
+    "count": 20000,
+    "max": 512,
+    "mean": 155.372,
+    "median": 120.0,
+    "min": 32
+  },
+  "schema_version": "lcot_verified_training_subset_v1",
+  "selected_rows": 20000,
+  "source_counts": {
+    "CLEVR_v1.0": 518,
+    "ai2d": 3405,
+    "coco": 11050,
+    "geoqa+": 4055,
+    "gqa": 5,
+    "pisc": 141,
+    "sqa": 826
+  },
+  "source_dataset": "OpenMMReasoner/OpenMMReasoner-SFT-874K:llava_cot",
+  "source_dataset_revision": "c44cf46e41bd24351ae7e7771a44fcd2dbf75f0a",
+  "status": "passed",
+  "unique_image_question_pairs": 20000,
+  "unique_sample_ids": 20000,
+  "unique_source_ids": 20000
+}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import math
 from dataclasses import dataclass
 
@@ -102,6 +103,30 @@ class GroupedKLMassWeights:
     raw_weight: torch.Tensor
     loss_mass_scale: torch.Tensor
     weight: torch.Tensor
+    valid_mask: torch.Tensor
+
+
+@dataclass(frozen=True)
+class MaxKLFractionInverseJSDWeights:
+    teacher_gap: torch.Tensor
+    sensitivity: torch.Tensor
+    threshold: torch.Tensor
+    high_group_mask: torch.Tensor
+    raw_weight: torch.Tensor
+    weight: torch.Tensor
+    valid_mask: torch.Tensor
+
+
+@dataclass(frozen=True)
+class GroupBalancedMaxKLFractionWeights:
+    teacher_gap: torch.Tensor
+    sensitivity: torch.Tensor
+    threshold: torch.Tensor
+    high_group_mask: torch.Tensor
+    within_high_weight: torch.Tensor
+    balanced_unweighted_weight: torch.Tensor
+    weight: torch.Tensor
+    high_group_coefficient: float
     valid_mask: torch.Tensor
 
 
@@ -236,6 +261,44 @@ class LossMassNormalization:
     valid_mask: torch.Tensor
 
 
+@dataclass(frozen=True)
+class ProjectionFractionTokenPartition:
+    teacher_js: torch.Tensor
+    budget_js: torch.Tensor
+    teacher_plus_js: torch.Tensor
+    projection_mass: torch.Tensor
+    projection_fraction: torch.Tensor
+    eligible_mask: torch.Tensor
+    top_mask: torch.Tensor
+    selected_mask: torch.Tensor
+    valid_mask: torch.Tensor
+
+
+@dataclass(frozen=True)
+class RandomTokenDropPartition:
+    eligible_mask: torch.Tensor
+    dropped_mask: torch.Tensor
+    selected_mask: torch.Tensor
+    valid_mask: torch.Tensor
+
+
+@dataclass(frozen=True)
+class ProjectionMassGroupedWeights:
+    teacher_js: torch.Tensor
+    budget_js: torch.Tensor
+    teacher_plus_js: torch.Tensor
+    projection_mass: torch.Tensor
+    positive_projection_mass: torch.Tensor
+    high_mask: torch.Tensor
+    low_mask: torch.Tensor
+    raw_weight: torch.Tensor
+    loss_mass_scale: torch.Tensor
+    weight: torch.Tensor
+    valid_mask: torch.Tensor
+    high_group_lambda: float
+    degenerate: bool
+
+
 def counterfactual_cancellation_strength(
     base_strength: float,
     *,
@@ -275,6 +338,278 @@ def generated_token_valid_mask(generated_ids: torch.Tensor) -> torch.Tensor:
     if token_ids.numel() <= 0:
         raise ValueError("At least one generated token is required.")
     return torch.ones_like(token_ids, dtype=torch.bool)
+
+
+def projection_fraction_token_partition(
+    teacher_js: torch.Tensor,
+    budget_js: torch.Tensor,
+    teacher_plus_js: torch.Tensor,
+    ranking_kl: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    top_fraction: float = 0.2,
+    min_kl: float = 1e-5,
+    select: str = "top",
+    eps: float = 1e-8,
+) -> ProjectionFractionTokenPartition:
+    """Select a detached top-F token partition or its exact complement."""
+
+    with torch.no_grad():
+        tensors = [
+            value.detach().float().reshape(-1)
+            for value in (teacher_js, budget_js, teacher_plus_js, ranking_kl)
+        ]
+        teacher, budget, teacher_plus, kl = tensors
+        valid = valid_mask.detach().to(device=teacher.device, dtype=torch.bool).reshape(-1)
+        if not all(value.shape == teacher.shape for value in (*tensors[1:], valid)):
+            raise ValueError("Token projection inputs and valid mask must align.")
+        if not valid.any():
+            raise ValueError("Token projection partition requires a valid generated token.")
+        if not all(torch.isfinite(value[valid]).all() for value in tensors):
+            raise FloatingPointError("Token projection inputs must be finite on valid positions.")
+        if (
+            (teacher[valid] < 0).any()
+            or (budget[valid] < 0).any()
+            or (teacher_plus[valid] < 0).any()
+        ):
+            raise ValueError("JSD inputs must be nonnegative.")
+        fraction = float(top_fraction)
+        threshold = float(min_kl)
+        eps = float(eps)
+        if not math.isfinite(fraction) or not 0.0 < fraction < 1.0:
+            raise ValueError(f"top_fraction must be in (0, 1), got {top_fraction}.")
+        if not math.isfinite(threshold) or threshold < 0.0:
+            raise ValueError(f"min_kl must be finite and nonnegative, got {min_kl}.")
+        if not math.isfinite(eps) or eps <= 0.0:
+            raise ValueError(f"eps must be finite and positive, got {eps}.")
+        selection = str(select).strip().lower()
+        if selection not in {"top", "bottom"}:
+            raise ValueError(f"select must be 'top' or 'bottom', got {select!r}.")
+
+        projection = 0.5 * (teacher + budget - teacher_plus)
+        projection_fraction = projection / (teacher + eps)
+        eligible = valid & (kl >= threshold)
+        eligible_indices = torch.nonzero(eligible, as_tuple=False).reshape(-1)
+        eligible_count = int(eligible_indices.numel())
+        top_count = (
+            min(eligible_count, max(1, int(math.ceil(fraction * eligible_count))))
+            if eligible_count
+            else 0
+        )
+        top = torch.zeros_like(valid)
+        if top_count:
+            ranked_local = torch.argsort(
+                projection_fraction[eligible_indices],
+                descending=True,
+                stable=True,
+            )
+            top[eligible_indices[ranked_local[:top_count]]] = True
+        selected = top if selection == "top" else eligible & ~top
+
+    return ProjectionFractionTokenPartition(
+        teacher_js=teacher.detach(),
+        budget_js=budget.detach(),
+        teacher_plus_js=teacher_plus.detach(),
+        projection_mass=projection.detach(),
+        projection_fraction=projection_fraction.detach(),
+        eligible_mask=eligible.detach(),
+        top_mask=top.detach(),
+        selected_mask=selected.detach(),
+        valid_mask=valid.detach(),
+    )
+
+
+def deterministic_random_token_drop_partition(
+    ranking_kl: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    sample_key: str,
+    seed: int = 42,
+    drop_fraction: float = 0.2,
+    min_kl: float = 1e-5,
+) -> RandomTokenDropPartition:
+    """Drop an exact deterministic random fraction of eligible response tokens."""
+
+    with torch.no_grad():
+        kl = ranking_kl.detach().float().reshape(-1)
+        valid = valid_mask.detach().to(device=kl.device, dtype=torch.bool).reshape(-1)
+        if kl.shape != valid.shape:
+            raise ValueError("Token KL and valid mask must align.")
+        if not valid.any():
+            raise ValueError("Random token dropping requires a valid generated token.")
+        if not torch.isfinite(kl[valid]).all():
+            raise FloatingPointError("Token KL must be finite on valid positions.")
+        fraction = float(drop_fraction)
+        threshold = float(min_kl)
+        if not math.isfinite(fraction) or not 0.0 < fraction < 1.0:
+            raise ValueError(f"drop_fraction must be in (0, 1), got {drop_fraction}.")
+        if not math.isfinite(threshold) or threshold < 0.0:
+            raise ValueError(f"min_kl must be finite and nonnegative, got {min_kl}.")
+        key = str(sample_key)
+        if not key:
+            raise ValueError("sample_key must be nonempty.")
+
+        eligible = valid & (kl >= threshold)
+        eligible_indices = torch.nonzero(eligible, as_tuple=False).reshape(-1)
+        eligible_count = int(eligible_indices.numel())
+        drop_count = (
+            min(eligible_count, max(1, int(math.ceil(fraction * eligible_count))))
+            if eligible_count
+            else 0
+        )
+        dropped = torch.zeros_like(valid)
+        if drop_count:
+            indexed_scores = []
+            for index in eligible_indices.detach().cpu().tolist():
+                digest = hashlib.sha256(
+                    f"{int(seed)}:{key}:{int(index)}".encode("utf-8")
+                ).digest()
+                indexed_scores.append((int.from_bytes(digest[:8], "big"), int(index)))
+            indexed_scores.sort()
+            dropped_indices = torch.tensor(
+                [index for _, index in indexed_scores[:drop_count]],
+                dtype=torch.long,
+                device=kl.device,
+            )
+            dropped[dropped_indices] = True
+        selected = eligible & ~dropped
+
+    return RandomTokenDropPartition(
+        eligible_mask=eligible.detach(),
+        dropped_mask=dropped.detach(),
+        selected_mask=selected.detach(),
+        valid_mask=valid.detach(),
+    )
+
+
+def projection_mass_grouped_weights(
+    teacher_js: torch.Tensor,
+    budget_js: torch.Tensor,
+    teacher_plus_js: torch.Tensor,
+    per_token_loss: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    top_fraction: float = 0.10,
+    high_group_lambda: float = 0.30,
+    preserve_loss_mass: bool = False,
+    eps: float = 1e-8,
+) -> ProjectionMassGroupedWeights:
+    """Build VA-OPD-style grouped weights from positive projection mass.
+
+    Tokens are ranked by ``relu((A + B - C) / 2)`` within one rollout. The
+    raw weights exactly reconstruct ``lambda * mean(high) + (1-lambda) *
+    mean(low)`` when consumed by a mean over valid tokens. The primary objective
+    uses these raw weights directly. ``preserve_loss_mass`` is retained only as
+    an explicit ablation; it is not the VA-OPD-style grouped objective.
+    """
+
+    fraction = float(top_fraction)
+    coefficient = float(high_group_lambda)
+    eps = float(eps)
+    if not math.isfinite(fraction) or not 0.0 < fraction < 1.0:
+        raise ValueError(f"top_fraction must be in (0, 1), got {top_fraction}.")
+    if not math.isfinite(coefficient) or not 0.0 < coefficient < 1.0:
+        raise ValueError(
+            f"high_group_lambda must be in (0, 1), got {high_group_lambda}."
+        )
+    if not math.isfinite(eps) or eps <= 0.0:
+        raise ValueError(f"eps must be finite and positive, got {eps}.")
+
+    with torch.no_grad():
+        teacher, budget, teacher_plus, loss = [
+            value.detach().float().reshape(-1)
+            for value in (teacher_js, budget_js, teacher_plus_js, per_token_loss)
+        ]
+        valid = valid_mask.detach().to(device=teacher.device, dtype=torch.bool).reshape(-1)
+        if not all(value.shape == teacher.shape for value in (budget, teacher_plus, loss, valid)):
+            raise ValueError("Projection-mass grouped inputs and valid mask must align.")
+        if not valid.any():
+            raise ValueError("Projection-mass grouping requires a valid generated token.")
+        for name, values in (
+            ("teacher_js", teacher),
+            ("budget_js", budget),
+            ("teacher_plus_js", teacher_plus),
+            ("per_token_loss", loss),
+        ):
+            if not torch.isfinite(values[valid]).all():
+                raise ValueError(f"{name} must be finite on valid positions.")
+        if (
+            (teacher[valid] < -1e-6).any()
+            or (budget[valid] < -1e-6).any()
+            or (teacher_plus[valid] < -1e-6).any()
+            or (loss[valid] < -1e-6).any()
+        ):
+            raise ValueError("JSD and OPSD loss inputs must be nonnegative.")
+
+        projection = 0.5 * (teacher + budget - teacher_plus)
+        positive_projection = projection.clamp_min(0.0)
+        valid_indices = torch.nonzero(valid, as_tuple=False).reshape(-1)
+        valid_count = int(valid_indices.numel())
+        high_count = min(
+            valid_count - 1,
+            max(1, int(math.ceil(fraction * valid_count))),
+        ) if valid_count > 1 else valid_count
+        ranked = torch.argsort(
+            positive_projection[valid_indices], descending=True, stable=True
+        )
+        high = torch.zeros_like(valid)
+        high[valid_indices[ranked[:high_count]]] = True
+        low = valid & ~high
+        degenerate = bool(
+            valid_count < 2 or float(positive_projection[valid].max()) <= eps
+        )
+
+        raw_weight = torch.zeros_like(loss)
+        if degenerate:
+            raw_weight[valid] = 1.0
+        else:
+            low_count = valid_count - high_count
+            raw_weight[high] = coefficient * valid_count / high_count
+            raw_weight[low] = (1.0 - coefficient) * valid_count / low_count
+            if not torch.allclose(
+                raw_weight[valid].mean(),
+                torch.ones((), device=loss.device, dtype=torch.float32),
+                rtol=1e-6,
+                atol=1e-7,
+            ):
+                raise FloatingPointError("Grouped raw token weights must have mean one.")
+
+        reference_mass = loss[valid].sum()
+        grouped_mass = (raw_weight[valid] * loss[valid]).sum()
+        if preserve_loss_mass and float(reference_mass) > eps:
+            if not torch.isfinite(grouped_mass) or float(grouped_mass) <= 0.0:
+                raise FloatingPointError(f"Invalid grouped OPSD loss mass: {float(grouped_mass)}")
+            loss_mass_scale = reference_mass / grouped_mass
+        else:
+            loss_mass_scale = torch.ones((), device=loss.device, dtype=torch.float32)
+        weight = torch.zeros_like(loss)
+        weight[valid] = raw_weight[valid] * loss_mass_scale
+
+        if preserve_loss_mass:
+            normalized_mass = (weight[valid] * loss[valid]).sum()
+            if not torch.allclose(
+                normalized_mass, reference_mass, rtol=2e-6, atol=2e-7
+            ):
+                raise FloatingPointError(
+                    "Projection-mass grouped loss normalization failed: "
+                    f"weighted={float(normalized_mass)}, reference={float(reference_mass)}."
+                )
+
+    return ProjectionMassGroupedWeights(
+        teacher_js=teacher.detach(),
+        budget_js=budget.detach(),
+        teacher_plus_js=teacher_plus.detach(),
+        projection_mass=projection.detach(),
+        positive_projection_mass=positive_projection.detach(),
+        high_mask=high.detach(),
+        low_mask=low.detach(),
+        raw_weight=raw_weight.detach(),
+        loss_mass_scale=loss_mass_scale.detach(),
+        weight=weight.detach(),
+        valid_mask=valid.detach(),
+        high_group_lambda=coefficient,
+        degenerate=degenerate,
+    )
 
 
 def native_budget_robustness_weights(
@@ -825,6 +1160,202 @@ def grouped_kl_mass_weights(
         raw_weight=raw_weight.detach(),
         loss_mass_scale=normalized.loss_mass_scale.detach(),
         weight=normalized.weight.detach(),
+        valid_mask=valid.detach(),
+    )
+
+
+def max_kl_fraction_inverse_jsd_weights(
+    teacher_gap: torch.Tensor,
+    sensitivity: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    max_kl_fraction: float = 0.10,
+    eps: float = 1e-8,
+) -> MaxKLFractionInverseJSDWeights:
+    """Apply mean-one inverse-JSD weights inside a high teacher-KL group.
+
+    The high group contains valid tokens whose forward OPSD KL is strictly
+    greater than ``max_kl_fraction`` times the trajectory maximum. Tokens
+    outside the group retain unit weight. Inverse-JSD weights are normalized
+    to mean one inside the group, which also makes the complete trajectory's
+    valid-token mean weight one.
+    """
+
+    fraction = float(max_kl_fraction)
+    if not 0.0 < fraction < 1.0:
+        raise ValueError(f"max_kl_fraction must be in (0, 1); got {fraction}.")
+    eps = float(eps)
+    if not math.isfinite(eps) or eps <= 0.0:
+        raise ValueError(f"eps must be finite and positive; got {eps}.")
+
+    with torch.no_grad():
+        gap = teacher_gap.detach().float().reshape(-1)
+        jsd = sensitivity.detach().float().reshape(-1)
+        valid = valid_mask.detach().to(device=gap.device, dtype=torch.bool).reshape(-1)
+        if gap.shape != jsd.shape or gap.shape != valid.shape:
+            raise ValueError(
+                "Teacher gap, sensitivity, and valid mask must align: "
+                f"{gap.shape}, {jsd.shape}, {valid.shape}."
+            )
+        if not valid.any():
+            raise ValueError("At least one valid generated-token position is required.")
+        if not torch.isfinite(gap[valid]).all() or not torch.isfinite(jsd[valid]).all():
+            raise ValueError("Teacher KL and JSD must be finite on valid positions.")
+        if (gap[valid] < -1e-6).any() or (jsd[valid] < -1e-6).any():
+            raise ValueError("Teacher KL and JSD must be nonnegative.")
+
+        gap = gap.clamp_min(0.0)
+        jsd = jsd.clamp_min(0.0)
+        threshold = gap[valid].max() * fraction
+        high = valid & (gap > threshold)
+
+        raw_weight = torch.zeros_like(gap)
+        weight = torch.zeros_like(gap)
+        raw_weight[valid] = 1.0
+        weight[valid] = 1.0
+        if high.any():
+            inverse = (jsd[high] + eps).reciprocal()
+            raw_weight[high] = inverse
+            weight[high] = inverse / inverse.mean().clamp_min(eps)
+            # Remove only floating-point accumulation drift; this is exactly
+            # one in real arithmetic because both groups have mean-one weight.
+            weight[valid] = weight[valid] / weight[valid].mean().clamp_min(eps)
+
+    return MaxKLFractionInverseJSDWeights(
+        teacher_gap=gap.detach(),
+        sensitivity=jsd.detach(),
+        threshold=threshold.detach(),
+        high_group_mask=high.detach(),
+        raw_weight=raw_weight.detach(),
+        weight=weight.detach(),
+        valid_mask=valid.detach(),
+    )
+
+
+def max_kl_fraction_softmax_inverse_jsd_weights(
+    teacher_gap: torch.Tensor,
+    sensitivity: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    max_kl_fraction: float = 0.10,
+    temperature: float = 0.05,
+) -> MaxKLFractionInverseJSDWeights:
+    """Apply mean-one softmax inverse-JSD weights inside a high-KL group."""
+
+    fraction = float(max_kl_fraction)
+    if not 0.0 < fraction < 1.0:
+        raise ValueError(f"max_kl_fraction must be in (0, 1); got {fraction}.")
+    temperature = float(temperature)
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError(f"temperature must be finite and positive; got {temperature}.")
+
+    with torch.no_grad():
+        gap = teacher_gap.detach().float().reshape(-1)
+        jsd = sensitivity.detach().float().reshape(-1)
+        valid = valid_mask.detach().to(device=gap.device, dtype=torch.bool).reshape(-1)
+        if gap.shape != jsd.shape or gap.shape != valid.shape:
+            raise ValueError(
+                "Teacher gap, sensitivity, and valid mask must align: "
+                f"{gap.shape}, {jsd.shape}, {valid.shape}."
+            )
+        if not valid.any():
+            raise ValueError("At least one valid generated-token position is required.")
+        if not torch.isfinite(gap[valid]).all() or not torch.isfinite(jsd[valid]).all():
+            raise ValueError("Teacher KL and JSD must be finite on valid positions.")
+        if (gap[valid] < -1e-6).any() or (jsd[valid] < -1e-6).any():
+            raise ValueError("Teacher KL and JSD must be nonnegative.")
+
+        gap = gap.clamp_min(0.0)
+        jsd = jsd.clamp_min(0.0)
+        threshold = gap[valid].max() * fraction
+        high = valid & (gap > threshold)
+
+        raw_weight = torch.zeros_like(gap)
+        weight = torch.zeros_like(gap)
+        raw_weight[valid] = 1.0
+        weight[valid] = 1.0
+        if high.any():
+            logits = -jsd[high] / temperature
+            shifted = logits - logits.max()
+            softmax_raw = shifted.exp()
+            raw_weight[high] = softmax_raw
+            weight[high] = softmax_raw / softmax_raw.mean()
+            weight[valid] = weight[valid] / weight[valid].mean()
+
+    return MaxKLFractionInverseJSDWeights(
+        teacher_gap=gap.detach(),
+        sensitivity=jsd.detach(),
+        threshold=threshold.detach(),
+        high_group_mask=high.detach(),
+        raw_weight=raw_weight.detach(),
+        weight=weight.detach(),
+        valid_mask=valid.detach(),
+    )
+
+
+def max_kl_fraction_softmax_inverse_jsd_group_balanced_weights(
+    teacher_gap: torch.Tensor,
+    sensitivity: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    max_kl_fraction: float = 0.10,
+    temperature: float = 0.05,
+    high_group_coefficient: float = 0.10,
+) -> GroupBalancedMaxKLFractionWeights:
+    """Build a detached high/low group objective with inverse-JSD ordering.
+
+    The returned weights satisfy
+
+    ``mean(weight * loss) = lambda * mean_H(w_jsd * loss)
+                            + (1-lambda) * mean_L(loss)``.
+
+    Both the JSD-weighted and unweighted group-balanced weight vectors have
+    mean one over valid positions. Degenerate one-group trajectories fall back
+    to vanilla token averaging.
+    """
+
+    coefficient = float(high_group_coefficient)
+    if not math.isfinite(coefficient) or not 0.0 < coefficient < 1.0:
+        raise ValueError(
+            "high_group_coefficient must be finite and in (0, 1); "
+            f"got {high_group_coefficient}."
+        )
+    internal = max_kl_fraction_softmax_inverse_jsd_weights(
+        teacher_gap,
+        sensitivity,
+        valid_mask,
+        max_kl_fraction=max_kl_fraction,
+        temperature=temperature,
+    )
+    with torch.no_grad():
+        valid = internal.valid_mask
+        high = internal.high_group_mask
+        low = valid & ~high
+        balanced = torch.zeros_like(internal.weight)
+        weighted = torch.zeros_like(internal.weight)
+        if high.any() and low.any():
+            n_valid = float(valid.sum())
+            n_high = float(high.sum())
+            n_low = float(low.sum())
+            high_scale = coefficient * n_valid / n_high
+            low_scale = (1.0 - coefficient) * n_valid / n_low
+            balanced[high] = high_scale
+            balanced[low] = low_scale
+            weighted[high] = high_scale * internal.weight[high]
+            weighted[low] = low_scale
+        else:
+            balanced[valid] = 1.0
+            weighted[valid] = 1.0
+
+    return GroupBalancedMaxKLFractionWeights(
+        teacher_gap=internal.teacher_gap,
+        sensitivity=internal.sensitivity,
+        threshold=internal.threshold,
+        high_group_mask=high.detach(),
+        within_high_weight=internal.weight.detach(),
+        balanced_unweighted_weight=balanced.detach(),
+        weight=weighted.detach(),
+        high_group_coefficient=coefficient,
         valid_mask=valid.detach(),
     )
 

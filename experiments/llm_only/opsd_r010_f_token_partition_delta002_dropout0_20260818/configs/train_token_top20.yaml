@@ -1,0 +1,138 @@
+base_model: Qwen/Qwen2.5-VL-7B-Instruct
+experiment:
+  name: opsd_r010_token_top20_delta002_dropout0_10240
+  family: r010_f_token_partition_delta002_dropout0
+  comparison_id: r010_f_token_partition_delta002_20260818
+  objective: mean_opsd_over_per_trajectory_top20pct_token_F_after_kl_floor
+  parameter_scope: language_decoder_only
+  vision_encoder_lora: false
+  init_model: Qwen/Qwen2.5-VL-7B-Instruct
+  legacy_adapter_initialization_allowed: false
+  output_root: /scratch/enmingzz/outputs/llm_only/opsd_r010_f_token_partition_delta002_dropout0_20260818
+  dataset_tag: openmmreasoner_llava_cot_exact_resume_order20k_decontam_v1_seed42_first10240
+  clean_env_alignment: armen51682_vlmevalkit_transformers
+  excluded_from_legacy_main_table: true
+  center_check_reference_path: /scratch/enmingzz/outputs/llm_only/opsd_r010_global_f_r0175_dropout0_20260816/calibration256/normalization_stats.json
+  center_check_reference_sha256: 69ed54bdee35fb90b80afc0e0123216feea6027a02da815e2eb40e9f8d5544a8
+  variant: token_top20
+  intervention_ablation_parent_config: experiments/llm_only/opsd_r010_f_partition_ablation_dropout0_20260817/configs/train_token_top20.yaml
+  budget_intervention: r010_to_r012
+dataset:
+  name: /project/6101803/enmingzz/opsd/data/openmmreasoner_llava_cot_train20k_ordered_decontam_v1_seed42/train20k_exact_resume_order_qwentok512_imgtok1152_seed42.jsonl
+  decontamination_manifest: /project/6101803/enmingzz/opsd/data/openmmreasoner_llava_cot_train20k_ordered_decontam_v1_seed42/train20k_exact_resume_training_manifest.json
+  expected_rows: 20000
+  shuffle: false
+  use_splits:
+  - train
+  image_root: /scratch/enmingzz/openmmreasoner_llava_cot_image_root
+  limit: 0
+  min_pixels: 846720
+  max_pixels: 846720
+prompt:
+  enable_thinking: true
+training:
+  method: opsd_nogt
+  max_steps: 10240
+  start_step: 0
+  seed: 42
+  bf16: true
+  attn_implementation: flash_attention_2
+  device_map: auto
+  use_lora: true
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.0
+  lora_layers_to_transform:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  - 12
+  - 13
+  - 14
+  - 15
+  - 16
+  - 17
+  - 18
+  - 19
+  - 20
+  - 21
+  - 22
+  - 23
+  - 24
+  - 25
+  - 26
+  - 27
+  lora_layers_pattern: layers
+  target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+  expected_trainable_tensors: 392
+  expected_trainable_parameters: 40370176
+  learning_rate: 2.0e-05
+  weight_decay: 0.0
+  save_every: 0
+  gradient_accumulation_steps: 8
+  micro_batch_size: 1
+  max_sample_retries: 0
+generation:
+  max_new_tokens: 512
+  max_unparseable_new_tokens: 0
+  stop_on_parse: false
+  temperature: 0.0
+  top_p: 0.9
+  top_k: 0
+  manual_pruned_generate: false
+  require_kv_cache: true
+pruning:
+  method: visionzip
+  retention_ratio_schedule: paired_deterministic_uniform
+  train_retention_ratios:
+  - 0.1
+  allow_embedding_fallback: false
+paired_sampling:
+  enabled: true
+  allow_custom_retention_ratios: true
+  namespace: opsd_random_r015_r025_r035_dropout0_20260808_v1
+  ratio_seed: 42
+  rollout_seed: 42
+opsd:
+  teacher_strategy: ema
+  use_ema_teacher: true
+  ema_decay: 0.9999
+  ema_lazy_init: true
+  teacher_ground_truth_access: false
+  temperature: 1.0
+  native_budget_weighting:
+    enabled: true
+    mode: token_projection_fraction_top20
+    budget_delta_mode: absolute
+    budget_delta: 0.02
+    sensitivity_temperature: 1.0
+    kl_chunk_size: 32
+    eps: 1.0e-08
+    top_fraction: 0.2
+    min_teacher_kl: 1.0e-05
+  trajectory_weighting:
+    enabled: false
+checkpointing:
+  enabled: true
+  eval_snapshot_every: 256
+  resumable_every: 1024
+  save_step_zero: true
+  save_final_full: true
+  log_sample_assignments: true
+  resume_from: ''

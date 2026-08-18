@@ -34,7 +34,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--benchmark",
-        choices=("MMStar", "MMStar_OpenEnded", "MathVista_MINI"),
+        choices=(
+            "MMStar",
+            "MMStar_OpenEnded",
+            "MathVista_MINI",
+            "OpenMMReasoner_LLaVA_CoT_holdout1k",
+        ),
         required=True,
     )
     parser.add_argument("--decode-mode", choices=("greedy", "sample"), required=True)
@@ -49,6 +54,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-pixels", type=int)
     parser.add_argument("--max-pixels", type=int)
     parser.add_argument("--base-model")
+    parser.add_argument(
+        "--adapter-path",
+        type=Path,
+        help="Optional PEFT adapter to merge in memory before inference.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--start-index",
@@ -125,6 +135,11 @@ def main() -> int:
         raise ValueError("No-pruning requires retention_ratio=1.0.")
 
     config = json.loads(args.config.expanduser().resolve().read_text(encoding="utf-8"))
+    adapter_path = args.adapter_path.expanduser().resolve() if args.adapter_path else None
+    if adapter_path is not None:
+        for required in ("adapter_config.json", "adapter_model.safetensors"):
+            if not (adapter_path / required).is_file():
+                raise FileNotFoundError(adapter_path / required)
     samples_path = args.samples.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
     output_path = output_dir / "raw_outputs.jsonl"
@@ -167,6 +182,7 @@ def main() -> int:
     import torch
     import transformers
     from opsd.visionzip_aokvqa.qwen_wrapper import (
+        apply_lora,
         import_qwen25_modules,
         last_visionzip_pruned_inputs,
         official_visionzip_metadata,
@@ -191,7 +207,14 @@ def main() -> int:
         torch_dtype=torch.bfloat16,
         device_map="auto",
         attn_implementation="flash_attention_2",
-    ).eval()
+    )
+    if adapter_path is not None:
+        model = apply_lora(model, adapter_path=str(adapter_path))
+        if not hasattr(model, "merge_and_unload"):
+            raise RuntimeError("Loaded adapter does not expose merge_and_unload().")
+        model = model.merge_and_unload(safe_merge=True)
+    model.requires_grad_(False)
+    model.eval()
     if model.__class__.__name__ != "Qwen2_5_VLForConditionalGeneration":
         raise RuntimeError(f"Unexpected model class: {model.__class__.__name__}")
     device = primary_device(model)
@@ -225,6 +248,14 @@ def main() -> int:
         "sample_count": len(samples),
         "sample_ids_sha256": canonical_hash([str(row["sample_id"]) for row in samples]),
         "base_model": base_model,
+        "adapter_path": str(adapter_path) if adapter_path else None,
+        "adapter_config_sha256": (
+            sha256_file(adapter_path / "adapter_config.json") if adapter_path else None
+        ),
+        "adapter_weights_sha256": (
+            sha256_file(adapter_path / "adapter_model.safetensors") if adapter_path else None
+        ),
+        "lora_merged_in_memory": bool(adapter_path),
         "model_class": model.__class__.__name__,
         "dtype": str(next(model.parameters()).dtype),
         "attention_implementation": "flash_attention_2",
@@ -309,6 +340,8 @@ def main() -> int:
             "source_metadata": source_metadata,
             "source_row_sha256": canonical_hash(source),
             "model": base_model,
+            "adapter_path": str(adapter_path) if adapter_path else None,
+            "lora_merged_in_memory": bool(adapter_path),
             "pruning": args.pruning,
             "target_retention_ratio": args.retention_ratio,
             "decode_mode": args.decode_mode,

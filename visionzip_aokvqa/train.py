@@ -45,10 +45,13 @@ from opsd.visionzip_aokvqa.losses import (
     compute_budget_contrastive_per_token_kl,
     compute_forward_kl,
     compute_generalized_jsd,
+    compute_per_token_generalized_jsd,
     compute_per_token_kl,
     compute_sequence_logprob,
     compute_token_ce,
     grpo_policy_loss,
+    keep_mask_after_topk_exclusion,
+    resolve_token_outlier_top_k,
 )
 from opsd.visionzip_aokvqa.native_budget_weighting import (
     budget_gradient_aligned_bridge_gate,
@@ -65,10 +68,16 @@ from opsd.visionzip_aokvqa.native_budget_weighting import (
     counterfactual_teachability_mixture_weights,
     counterfactual_teachability_modulation_weights,
     conditional_rescue_residual_weights,
+    deterministic_random_token_drop_partition,
     generated_token_valid_mask,
     grouped_kl_mass_weights,
+    max_kl_fraction_inverse_jsd_weights,
+    max_kl_fraction_softmax_inverse_jsd_group_balanced_weights,
+    max_kl_fraction_softmax_inverse_jsd_weights,
     native_budget_robustness_weights,
     normalize_candidate_loss_mass,
+    projection_fraction_token_partition,
+    projection_mass_grouped_weights,
     symmetric_teacher_gap_stability_weights,
     teacher_gap_persistence_weights,
 )
@@ -82,20 +91,31 @@ from opsd.visionzip_aokvqa.phase_ratio_scaling import (
     validate_phase_ratio_scaling_config,
 )
 from opsd.visionzip_aokvqa.trajectory_weighting import (
+    AdaptiveBudgetFrontierState,
+    ProgressAdaptiveFrontierState,
     RobustnessGatedCurriculumState,
     SensitivityFrontierState,
+    competence_frontier_probability_weights,
     direct_inverse_sensitivity_probability_weights,
     effective_batch_local_objective,
+    global_f_curriculum_trajectory_weights,
+    globally_calibrated_trajectory_weights,
+    hard_trajectory_partition_weights,
     inverse_sensitivity_probability_weights,
+    ratio_group_angle_probability_weights,
+    ratio_group_angle_sample_probability_weights,
     ratio_group_fraction_probability_weights,
+    ratio_group_projection_probability_weights,
     residualized_budget_sensitivity,
     robustness_gated_curriculum_weights,
     sensitivity_frontier_weights,
     softmax_inverse_sensitivity_probability_weights,
+    softmax_trajectory_signal_probability_weights,
     teacher_gap_mass_robustness,
     trajectory_priority_downweights,
     trajectory_rank_downweights,
     trajectory_sigmoid_downweights,
+    uniform_trajectory_probability_weights,
 )
 from opsd.visionzip_aokvqa.prompting import build_opsd_teacher_prompt, normalize_prompt_mode, parse_final_answer
 from opsd.visionzip_aokvqa.qwen_wrapper import (
@@ -134,12 +154,44 @@ DEFAULT_TEACHER_ADAPTER_NAME = "teacher"
 STUDENT_TEXT_LOG_KEY = "_student_text_log"
 ROLLOUT_CACHE_KEY = "_effective_batch_rollout_cache"
 EFFECTIVE_BATCH_PROBABILITY_MODES = {
+    "global_calibrated_counterfactual_teachability_batch",
+    "global_f_intermediate_curriculum_batch",
     "jsd_over_current_kl_batch",
     "jsd_over_current_kl_direct_inverse_batch",
     "jsd_over_current_kl_softmax_batch",
     "jsd_over_step0_kl_batch",
     "ratio_group_counterfactual_teachability_batch",
+    "trajectory_counterfactual_teachability_softmax_batch",
+    "trajectory_projection_fraction_top20_batch",
+    "trajectory_projection_fraction_bottom80_batch",
+    "progress_adaptive_robust_frontier_batch",
 }
+COUNTERFACTUAL_TEACHABILITY_MODES = {
+    "global_calibrated_counterfactual_teachability_batch",
+    "global_f_intermediate_curriculum_batch",
+    "ratio_group_counterfactual_teachability_batch",
+    "trajectory_counterfactual_teachability_softmax_batch",
+    "trajectory_projection_fraction_top20_batch",
+    "trajectory_projection_fraction_bottom80_batch",
+    "progress_adaptive_robust_frontier_batch",
+    "adaptive_budget_frontier_sampler_batch",
+}
+RAW_TRAJECTORY_F_MODES = {
+    "global_calibrated_counterfactual_teachability_batch",
+    "global_f_intermediate_curriculum_batch",
+    "trajectory_projection_fraction_top20_batch",
+    "trajectory_projection_fraction_bottom80_batch",
+}
+DIRECT_GLOBAL_F_MODES = {
+    "global_calibrated_counterfactual_teachability_batch",
+    "global_f_intermediate_curriculum_batch",
+}
+TOKEN_PROJECTION_PARTITION_MODES = {
+    "token_projection_fraction_top20",
+    "token_projection_fraction_bottom80",
+}
+TOKEN_RANDOM_DROP_MODE = "token_random_drop20"
+TOKEN_PROJECTION_MASS_GROUPED_MODE = "token_projection_mass_grouped"
 
 
 def load_yaml(path: str | Path) -> dict[str, Any]:
@@ -1225,7 +1277,23 @@ def opsd_nogt_step(
                 int(b_plus_metadata["student_prompt_len"]),
                 int(gen_ids.numel()),
             ).detach().clone()
+        random_b_subset_b_plus: bool | None = None
+        if normalize_pruning_method() == "random":
+            b_indices = pruned.get("random_keep_indices")
+            b_plus_indices = b_plus_pruned.get("random_keep_indices")
+            if b_indices is None or b_plus_indices is None:
+                raise RuntimeError("RandomPruner native-budget probe did not expose retained indices.")
+            b_set = {int(index) for index in b_indices.tolist()}
+            b_plus_set = {int(index) for index in b_plus_indices.tolist()}
+            random_b_subset_b_plus = b_set.issubset(b_plus_set)
+            if not random_b_subset_b_plus:
+                raise RuntimeError(
+                    "RandomPruner native-budget masks must be nested for the same sample: "
+                    f"b={retention_ratio}, b_plus={b_plus_ratio}."
+                )
         del b_plus_outputs
+    else:
+        random_b_subset_b_plus = None
     weighting_metrics: dict[str, Any] = {
         "native_budget_weighting_enabled": native_weighting_enabled,
         "native_budget_weighting_mode": weighting_mode if native_weighting_enabled else None,
@@ -1236,6 +1304,26 @@ def opsd_nogt_step(
         ),
         "sampled_b": float(retention_ratio),
         "sampled_b_plus": b_plus_ratio,
+        "native_b_num_full_visual_tokens": int(
+            pruned["metadata"].get("num_full_visual_tokens", 0)
+        ),
+        "native_b_num_kept_visual_tokens": int(
+            pruned["metadata"].get("num_kept_visual_tokens", 0)
+        ),
+        "native_b_plus_num_full_visual_tokens": (
+            int(b_plus_metadata.get("num_full_visual_tokens", 0))
+            if native_weighting_enabled
+            else None
+        ),
+        "native_b_plus_num_kept_visual_tokens": (
+            int(b_plus_metadata.get("num_kept_visual_tokens", 0))
+            if native_weighting_enabled
+            else None
+        ),
+        "native_b_plus_random_mask_hash": (
+            b_plus_metadata.get("random_mask_hash") if native_weighting_enabled else None
+        ),
+        "native_random_b_subset_b_plus": random_b_subset_b_plus,
     }
     if native_weighting_enabled:
         if b_plus_logits is None:
@@ -1247,6 +1335,9 @@ def opsd_nogt_step(
             chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
         )
         per_token_bridge: torch.Tensor | None = None
+        token_projection_partition = None
+        token_random_drop_partition = None
+        token_projection_mass_group = None
         if weighting_mode in {
             "counterfactual_budget_bridge",
             "budget_gradient_aligned_bridge",
@@ -1259,14 +1350,47 @@ def opsd_nogt_step(
                 chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
             )
         with torch.no_grad():
-            sensitivity = compute_per_token_kl(
-                b_plus_logits,
-                student_logits.detach(),
-                temperature=float(
-                    get_nested(cfg, "opsd.native_budget_weighting.sensitivity_temperature", 1.0)
-                ),
-                chunk_size=int(get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)),
-            )
+            if weighting_mode in {
+                "max_kl_fraction_inverse_jsd",
+                "max_kl_fraction_softmax_inverse_jsd",
+                "max_kl_fraction_softmax_inverse_jsd_group_balanced",
+                *TOKEN_PROJECTION_PARTITION_MODES,
+                TOKEN_RANDOM_DROP_MODE,
+                TOKEN_PROJECTION_MASS_GROUPED_MODE,
+            }:
+                sensitivity = compute_per_token_generalized_jsd(
+                    b_plus_logits,
+                    student_logits.detach(),
+                    beta=0.5,
+                    temperature=float(
+                        get_nested(
+                            cfg,
+                            "opsd.native_budget_weighting.sensitivity_temperature",
+                            1.0,
+                        )
+                    ),
+                    top_k=None,
+                    token_clip=None,
+                    clip_mode="token",
+                    chunk_size=int(
+                        get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)
+                    ),
+                )
+            else:
+                sensitivity = compute_per_token_kl(
+                    b_plus_logits,
+                    student_logits.detach(),
+                    temperature=float(
+                        get_nested(
+                            cfg,
+                            "opsd.native_budget_weighting.sensitivity_temperature",
+                            1.0,
+                        )
+                    ),
+                    chunk_size=int(
+                        get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)
+                    ),
+                )
             valid_mask = generated_token_valid_mask(gen_ids)
             eps = float(get_nested(cfg, "opsd.native_budget_weighting.eps", 1e-8))
             if weighting_mode == "inverse_student_gap":
@@ -1282,6 +1406,394 @@ def opsd_nogt_step(
                     "native_robustness_mean": float(weights.robustness[valid].mean().cpu()),
                 }
                 loss_type = "opsd_nogt_native_budget_weighted_forward_kl"
+            elif weighting_mode in {
+                "max_kl_fraction_inverse_jsd",
+                "max_kl_fraction_softmax_inverse_jsd",
+                "max_kl_fraction_softmax_inverse_jsd_group_balanced",
+            }:
+                max_kl_fraction = float(
+                    get_nested(
+                        cfg,
+                        "opsd.native_budget_weighting.max_kl_fraction",
+                        0.10,
+                    )
+                )
+                if weighting_mode == "max_kl_fraction_inverse_jsd":
+                    weights = max_kl_fraction_inverse_jsd_weights(
+                        per_token_opsd,
+                        sensitivity,
+                        valid_mask,
+                        max_kl_fraction=max_kl_fraction,
+                        eps=eps,
+                    )
+                    weight_transform = "direct_inverse"
+                    softmax_temperature = None
+                    high_group_coefficient = None
+                    balanced_unweighted_kl = None
+                elif weighting_mode == "max_kl_fraction_softmax_inverse_jsd":
+                    softmax_temperature = float(
+                        get_nested(
+                            cfg,
+                            "opsd.native_budget_weighting.softmax_temperature",
+                            0.05,
+                        )
+                    )
+                    weights = max_kl_fraction_softmax_inverse_jsd_weights(
+                        per_token_opsd,
+                        sensitivity,
+                        valid_mask,
+                        max_kl_fraction=max_kl_fraction,
+                        temperature=softmax_temperature,
+                    )
+                    weight_transform = "softmax_inverse"
+                    high_group_coefficient = None
+                    balanced_unweighted_kl = None
+                else:
+                    softmax_temperature = float(
+                        get_nested(
+                            cfg,
+                            "opsd.native_budget_weighting.softmax_temperature",
+                            0.05,
+                        )
+                    )
+                    high_group_coefficient = float(
+                        get_nested(
+                            cfg,
+                            "opsd.native_budget_weighting.high_group_coefficient",
+                            0.10,
+                        )
+                    )
+                    weights = max_kl_fraction_softmax_inverse_jsd_group_balanced_weights(
+                        per_token_opsd,
+                        sensitivity,
+                        valid_mask,
+                        max_kl_fraction=max_kl_fraction,
+                        temperature=softmax_temperature,
+                        high_group_coefficient=high_group_coefficient,
+                    )
+                    balanced_unweighted_kl = (
+                        weights.balanced_unweighted_weight[weights.valid_mask]
+                        * per_token_opsd[weights.valid_mask]
+                    ).mean()
+                    weight_transform = "group_balanced_softmax_inverse"
+                valid = weights.valid_mask
+                high = weights.high_group_mask
+                token_weight = weights.weight
+                high_jsd = weights.sensitivity[high]
+                high_weight = weights.weight[high]
+                mode_metrics = {
+                    "native_sensitivity_definition": "per_token_symmetric_jsd_student_b_plus_student_b",
+                    "native_max_kl_fraction": max_kl_fraction,
+                    "native_group_weight_transform": weight_transform,
+                    "native_group_softmax_temperature": softmax_temperature,
+                    "native_high_group_coefficient": high_group_coefficient,
+                    "native_low_group_coefficient": (
+                        1.0 - high_group_coefficient
+                        if high_group_coefficient is not None
+                        else None
+                    ),
+                    "native_group_balanced_unweighted_loss": (
+                        float(balanced_unweighted_kl.detach().cpu())
+                        if balanced_unweighted_kl is not None
+                        else None
+                    ),
+                    "native_group_batch_normalization": False,
+                    "native_high_group_kl_threshold": float(weights.threshold.cpu()),
+                    "native_high_group_tokens": int(high.sum().cpu()),
+                    "native_high_group_fraction": float(high.float().sum().cpu() / valid.sum().cpu()),
+                    "native_high_group_jsd_min": (
+                        float(high_jsd.min().cpu()) if high.any() else None
+                    ),
+                    "native_high_group_jsd_mean": (
+                        float(high_jsd.mean().cpu()) if high.any() else None
+                    ),
+                    "native_high_group_jsd_max": (
+                        float(high_jsd.max().cpu()) if high.any() else None
+                    ),
+                    "native_high_group_weight_mean": (
+                        float(high_weight.mean().cpu()) if high.any() else None
+                    ),
+                    "native_high_group_weight_max": (
+                        float(high_weight.max().cpu()) if high.any() else None
+                    ),
+                    "native_trajectory_weight_mean": float(token_weight[valid].mean().cpu()),
+                    "native_loss_mass_scale": 1.0,
+                }
+                loss_type = (
+                    "opsd_nogt_max10_group_inverse_jsd_d25_forward_kl"
+                    if weighting_mode == "max_kl_fraction_inverse_jsd"
+                    else "opsd_nogt_max10_group_softmax_inverse_jsd_d25_forward_kl"
+                    if weighting_mode == "max_kl_fraction_softmax_inverse_jsd"
+                    else "opsd_nogt_max10_group_lambda_softmax_inverse_jsd_d25_forward_kl"
+                )
+            elif weighting_mode in {*TOKEN_PROJECTION_PARTITION_MODES, TOKEN_RANDOM_DROP_MODE}:
+                teacher_js_tokens = compute_per_token_generalized_jsd(
+                    teacher_logits,
+                    student_logits.detach(),
+                    beta=0.5,
+                    temperature=float(
+                        get_nested(
+                            cfg,
+                            "opsd.native_budget_weighting.sensitivity_temperature",
+                            1.0,
+                        )
+                    ),
+                    top_k=None,
+                    token_clip=None,
+                    clip_mode="token",
+                    chunk_size=int(
+                        get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)
+                    ),
+                ).detach().float()
+                teacher_plus_js_tokens = compute_per_token_generalized_jsd(
+                    teacher_logits,
+                    b_plus_logits,
+                    beta=0.5,
+                    temperature=float(
+                        get_nested(
+                            cfg,
+                            "opsd.native_budget_weighting.sensitivity_temperature",
+                            1.0,
+                        )
+                    ),
+                    top_k=None,
+                    token_clip=None,
+                    clip_mode="token",
+                    chunk_size=int(
+                        get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)
+                    ),
+                ).detach().float()
+                top_fraction = float(
+                    get_nested(cfg, "opsd.native_budget_weighting.top_fraction", 0.2)
+                )
+                min_teacher_kl = float(
+                    get_nested(cfg, "opsd.native_budget_weighting.min_teacher_kl", 1e-5)
+                )
+                if weighting_mode == TOKEN_RANDOM_DROP_MODE:
+                    token_random_drop_partition = deterministic_random_token_drop_partition(
+                        per_token_opsd,
+                        valid_mask,
+                        sample_key=f"{sample.sample_id}:{rollout_seed}",
+                        seed=int(
+                            get_nested(cfg, "opsd.native_budget_weighting.random_drop_seed", 42)
+                        ),
+                        drop_fraction=top_fraction,
+                        min_kl=min_teacher_kl,
+                    )
+                    eligible = token_random_drop_partition.eligible_mask
+                    top = token_random_drop_partition.dropped_mask
+                    valid = token_random_drop_partition.selected_mask
+                    projection_mass = 0.5 * (
+                        teacher_js_tokens + sensitivity - teacher_plus_js_tokens
+                    )
+                    projection_fraction = projection_mass / (teacher_js_tokens + eps)
+                    partition_name = "random_drop20"
+                else:
+                    token_projection_partition = projection_fraction_token_partition(
+                        teacher_js_tokens,
+                        sensitivity,
+                        teacher_plus_js_tokens,
+                        per_token_opsd,
+                        valid_mask,
+                        top_fraction=top_fraction,
+                        min_kl=min_teacher_kl,
+                        select=(
+                            "top"
+                            if weighting_mode == "token_projection_fraction_top20"
+                            else "bottom"
+                        ),
+                        eps=eps,
+                    )
+                    eligible = token_projection_partition.eligible_mask
+                    top = token_projection_partition.top_mask
+                    valid = token_projection_partition.selected_mask
+                    projection_fraction = token_projection_partition.projection_fraction
+                    projection_mass = token_projection_partition.projection_mass
+                    partition_name = (
+                        "top20" if weighting_mode.endswith("top20") else "bottom80"
+                    )
+                token_weight = torch.zeros_like(per_token_opsd.detach().float())
+                token_weight[valid] = 1.0
+                eligible_count = int(eligible.sum().cpu())
+                selected_count = int(valid.sum().cpu())
+                eligible_projection_fraction = projection_fraction[eligible]
+                mode_metrics = {
+                    "native_token_partition": partition_name,
+                    "native_token_partition_top_fraction": top_fraction,
+                    "native_token_partition_min_teacher_kl": min_teacher_kl,
+                    "native_token_partition_random_seed": (
+                        int(get_nested(cfg, "opsd.native_budget_weighting.random_drop_seed", 42))
+                        if weighting_mode == TOKEN_RANDOM_DROP_MODE
+                        else None
+                    ),
+                    "native_token_partition_valid_tokens": int(valid_mask.sum().cpu()),
+                    "native_token_partition_eligible_tokens": eligible_count,
+                    "native_token_partition_excluded_low_kl_tokens": int(
+                        (valid_mask & ~eligible).sum().cpu()
+                    ),
+                    "native_token_partition_top_tokens": int(top.sum().cpu()),
+                    "native_token_partition_random_dropped_tokens": (
+                        int(top.sum().cpu())
+                        if weighting_mode == TOKEN_RANDOM_DROP_MODE
+                        else None
+                    ),
+                    "native_token_partition_selected_tokens": selected_count,
+                    "native_token_partition_selected_fraction_of_eligible": (
+                        float(selected_count / eligible_count) if eligible_count else 0.0
+                    ),
+                    "native_token_partition_degenerate_eligible": eligible_count < 2,
+                    "native_token_partition_empty_selected": selected_count == 0,
+                    "native_token_projection_fraction_min": (
+                        float(eligible_projection_fraction.min().cpu())
+                        if eligible_count
+                        else None
+                    ),
+                    "native_token_projection_fraction_mean": (
+                        float(eligible_projection_fraction.mean().cpu())
+                        if eligible_count
+                        else None
+                    ),
+                    "native_token_projection_fraction_max": (
+                        float(eligible_projection_fraction.max().cpu())
+                        if eligible_count
+                        else None
+                    ),
+                    "native_trajectory_budget_projection_mass": float(
+                        projection_mass[valid_mask].sum().cpu()
+                    ),
+                    "native_trajectory_teacher_js_mass": float(
+                        teacher_js_tokens[valid_mask].sum().cpu()
+                    ),
+                    "native_trajectory_raw_projection_fraction": float(
+                        projection_mass[valid_mask]
+                        .sum()
+                        .div(teacher_js_tokens[valid_mask].sum().clamp_min(eps))
+                        .cpu()
+                    ),
+                    "native_loss_mass_scale": 1.0,
+                }
+                loss_type = f"opsd_nogt_{weighting_mode}_forward_kl"
+            elif weighting_mode == TOKEN_PROJECTION_MASS_GROUPED_MODE:
+                teacher_js_tokens = compute_per_token_generalized_jsd(
+                    teacher_logits,
+                    student_logits.detach(),
+                    beta=0.5,
+                    temperature=float(
+                        get_nested(
+                            cfg,
+                            "opsd.native_budget_weighting.sensitivity_temperature",
+                            1.0,
+                        )
+                    ),
+                    top_k=None,
+                    token_clip=None,
+                    clip_mode="token",
+                    chunk_size=int(
+                        get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)
+                    ),
+                ).detach().float()
+                teacher_plus_js_tokens = compute_per_token_generalized_jsd(
+                    teacher_logits,
+                    b_plus_logits,
+                    beta=0.5,
+                    temperature=float(
+                        get_nested(
+                            cfg,
+                            "opsd.native_budget_weighting.sensitivity_temperature",
+                            1.0,
+                        )
+                    ),
+                    top_k=None,
+                    token_clip=None,
+                    clip_mode="token",
+                    chunk_size=int(
+                        get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)
+                    ),
+                ).detach().float()
+                top_fraction = float(
+                    get_nested(cfg, "opsd.native_budget_weighting.top_fraction", 0.10)
+                )
+                high_group_lambda = float(
+                    get_nested(cfg, "opsd.native_budget_weighting.high_group_lambda", 0.30)
+                )
+                preserve_loss_mass = bool(
+                    get_nested(cfg, "opsd.native_budget_weighting.preserve_loss_mass", False)
+                )
+                token_projection_mass_group = projection_mass_grouped_weights(
+                    teacher_js_tokens,
+                    sensitivity,
+                    teacher_plus_js_tokens,
+                    per_token_opsd,
+                    valid_mask,
+                    top_fraction=top_fraction,
+                    high_group_lambda=high_group_lambda,
+                    preserve_loss_mass=preserve_loss_mass,
+                    eps=eps,
+                )
+                weights = token_projection_mass_group
+                valid = weights.valid_mask
+                token_weight = weights.weight
+                high = weights.high_mask
+                low = weights.low_mask
+                positive_total = weights.positive_projection_mass[valid].sum()
+                high_positive = weights.positive_projection_mass[high].sum()
+                signed_total = weights.projection_mass[valid].sum()
+                high_signed = weights.projection_mass[high].sum()
+                raw_grouped_kl = (
+                    weights.raw_weight[valid] * per_token_opsd[valid]
+                ).mean()
+                mode_metrics = {
+                    "native_projection_metric": "relu((A+B-C)/2)",
+                    "native_group_objective": "lambda_high_mean_plus_one_minus_lambda_low_mean",
+                    "native_top_fraction": top_fraction,
+                    "native_high_group_lambda": high_group_lambda,
+                    "native_low_group_lambda": 1.0 - high_group_lambda,
+                    "native_preserve_loss_mass": preserve_loss_mass,
+                    "native_high_group_tokens": int(high.sum().cpu()),
+                    "native_low_group_tokens": int(low.sum().cpu()),
+                    "native_high_group_fraction": float(high.sum().cpu() / valid.sum().cpu()),
+                    "native_projection_positive_token_fraction": float(
+                        (weights.projection_mass[valid] > 0).float().mean().cpu()
+                    ),
+                    "native_high_group_positive_projection_mass_share": (
+                        float((high_positive / positive_total).cpu())
+                        if float(positive_total) > eps
+                        else 0.0
+                    ),
+                    "native_high_group_signed_projection_mass_share": (
+                        float((high_signed / signed_total).cpu())
+                        if abs(float(signed_total)) > eps
+                        else None
+                    ),
+                    "native_projection_mass_min": float(
+                        weights.projection_mass[valid].min().cpu()
+                    ),
+                    "native_projection_mass_mean": float(
+                        weights.projection_mass[valid].mean().cpu()
+                    ),
+                    "native_projection_mass_max": float(
+                        weights.projection_mass[valid].max().cpu()
+                    ),
+                    "native_high_group_opsd_kl_mean": float(
+                        per_token_opsd[high].detach().mean().cpu()
+                    ),
+                    "native_low_group_opsd_kl_mean": float(
+                        per_token_opsd[low].detach().mean().cpu()
+                    ),
+                    "native_raw_grouped_kl": float(raw_grouped_kl.detach().cpu()),
+                    "native_raw_token_weight_min": float(
+                        weights.raw_weight[valid].min().cpu()
+                    ),
+                    "native_raw_token_weight_mean": float(
+                        weights.raw_weight[valid].mean().cpu()
+                    ),
+                    "native_raw_token_weight_max": float(
+                        weights.raw_weight[valid].max().cpu()
+                    ),
+                    "native_loss_mass_scale": float(weights.loss_mass_scale.cpu()),
+                    "native_projection_group_degenerate": weights.degenerate,
+                }
+                loss_type = "opsd_nogt_token_projection_mass_grouped_forward_kl"
             elif weighting_mode == "trajectory_probe":
                 student_budget_jsd = compute_generalized_jsd(
                     b_plus_logits,
@@ -1301,7 +1813,7 @@ def opsd_nogt_step(
                     get_nested(cfg, "opsd.trajectory_weighting.mode", "")
                 ).strip().lower()
                 teachability_metrics: dict[str, float] = {}
-                if trajectory_mode == "ratio_group_counterfactual_teachability_batch":
+                if trajectory_mode in COUNTERFACTUAL_TEACHABILITY_MODES:
                     teacher_student_jsd_b = compute_generalized_jsd(
                         teacher_logits,
                         student_logits.detach(),
@@ -2327,6 +2839,15 @@ def opsd_nogt_step(
             unweighted_kl = trajectory_scalar_kl
             if weighting_mode == "trajectory_probe":
                 kl = trajectory_scalar_kl
+        elif weighting_mode in {*TOKEN_PROJECTION_PARTITION_MODES, TOKEN_RANDOM_DROP_MODE}:
+            if weighting_mode == TOKEN_RANDOM_DROP_MODE:
+                if token_random_drop_partition is None:
+                    raise AssertionError("Random token drop partition was not computed.")
+                unweighted_kl = per_token_opsd[token_random_drop_partition.valid_mask].mean()
+            else:
+                if token_projection_partition is None:
+                    raise AssertionError("Token projection partition was not computed.")
+                unweighted_kl = per_token_opsd[token_projection_partition.valid_mask].mean()
         else:
             unweighted_kl = per_token_opsd[valid].mean()
         if weighting_mode == "trajectory_probe":
@@ -2335,6 +2856,14 @@ def opsd_nogt_step(
             weighted_token_kl = (token_weight[valid] * per_token_opsd[valid]).mean()
             unweighted_token_kl = per_token_opsd[valid].mean()
             kl = trajectory_scalar_kl + weighted_token_kl - unweighted_token_kl
+        elif weighting_mode in {*TOKEN_PROJECTION_PARTITION_MODES, TOKEN_RANDOM_DROP_MODE}:
+            # Keep a graph-connected zero for a legitimately empty partition.
+            # This preserves strict top/complement semantics without a vanilla-loss fallback.
+            kl = (
+                per_token_opsd[valid].mean()
+                if valid.any()
+                else per_token_opsd.sum() * 0.0
+            )
         elif weighting_mode == "counterfactual_budget_bridge":
             if per_token_bridge is None:
                 raise AssertionError("Counterfactual budget bridge KL was not computed.")
@@ -2351,11 +2880,45 @@ def opsd_nogt_step(
             )
         elif weighting_mode in {"budget_contrastive_target", "dual_budget_decomposition"}:
             kl = (token_weight[valid] * per_token_contrastive[valid]).mean()
+        elif weighting_mode == "max_kl_fraction_softmax_inverse_jsd_group_balanced":
+            high = weights.high_group_mask
+            low = valid & ~high
+            if high.any() and low.any():
+                high_group_kl = (
+                    weights.within_high_weight[high] * per_token_opsd[high]
+                ).mean()
+                low_group_kl = per_token_opsd[low].mean()
+                coefficient = float(weights.high_group_coefficient)
+                kl = coefficient * high_group_kl + (1.0 - coefficient) * low_group_kl
+                equivalent_token_weight_kl = (
+                    token_weight[valid] * per_token_opsd[valid]
+                ).mean()
+                mode_metrics.update(
+                    {
+                        "native_group_objective": "lambda_high_mean_plus_one_minus_lambda_low_mean",
+                        "native_high_group_weighted_kl": float(high_group_kl.detach().cpu()),
+                        "native_low_group_unweighted_kl": float(low_group_kl.detach().cpu()),
+                        "native_direct_lambda_reconstruction_error": float(
+                            (kl.detach() - equivalent_token_weight_kl.detach()).abs().cpu()
+                        ),
+                    }
+                )
+            else:
+                kl = per_token_opsd[valid].mean()
+                mode_metrics.update(
+                    {
+                        "native_group_objective": "vanilla_fallback_for_degenerate_group",
+                        "native_high_group_weighted_kl": None,
+                        "native_low_group_unweighted_kl": None,
+                        "native_direct_lambda_reconstruction_error": 0.0,
+                    }
+                )
         else:
             kl = (token_weight[valid] * per_token_opsd[valid]).mean()
         sensitivity_valid = sensitivity.detach().float()[valid]
         weight_valid = token_weight[valid]
         kl_mass_ratio = kl.detach().float() / unweighted_kl.detach().float().clamp_min(1e-8)
+        has_weighted_tokens = bool(valid.any())
         weighting_metrics.update(
             {
                 "loss_type": loss_type,
@@ -2366,13 +2929,29 @@ def opsd_nogt_step(
                 "native_b_num_kept_visual_tokens": int(pruned["metadata"].get("num_kept_visual_tokens", 0)),
                 "native_b_plus_num_full_visual_tokens": int(b_plus_metadata.get("num_full_visual_tokens", 0)),
                 "native_b_plus_num_kept_visual_tokens": int(b_plus_metadata.get("num_kept_visual_tokens", 0)),
-                "native_sensitivity_min": float(sensitivity_valid.min().cpu()),
-                "native_sensitivity_mean": float(sensitivity_valid.mean().cpu()),
-                "native_sensitivity_median": float(torch.quantile(sensitivity_valid, 0.5).cpu()),
-                "native_sensitivity_max": float(sensitivity_valid.max().cpu()),
-                "native_token_weight_min": float(weight_valid.min().cpu()),
-                "native_token_weight_mean": float(weight_valid.mean().cpu()),
-                "native_token_weight_max": float(weight_valid.max().cpu()),
+                "native_sensitivity_min": (
+                    float(sensitivity_valid.min().cpu()) if has_weighted_tokens else None
+                ),
+                "native_sensitivity_mean": (
+                    float(sensitivity_valid.mean().cpu()) if has_weighted_tokens else None
+                ),
+                "native_sensitivity_median": (
+                    float(torch.quantile(sensitivity_valid, 0.5).cpu())
+                    if has_weighted_tokens
+                    else None
+                ),
+                "native_sensitivity_max": (
+                    float(sensitivity_valid.max().cpu()) if has_weighted_tokens else None
+                ),
+                "native_token_weight_min": (
+                    float(weight_valid.min().cpu()) if has_weighted_tokens else None
+                ),
+                "native_token_weight_mean": (
+                    float(weight_valid.mean().cpu()) if has_weighted_tokens else None
+                ),
+                "native_token_weight_max": (
+                    float(weight_valid.max().cpu()) if has_weighted_tokens else None
+                ),
                 "native_valid_generated_tokens": int(valid.sum().cpu()),
                 "native_weight_detached": not token_weight.requires_grad,
                 "native_probe_grad_enabled": False,
@@ -2381,14 +2960,87 @@ def opsd_nogt_step(
         )
         del b_plus_logits
     else:
-        kl = compute_forward_kl(teacher_logits, student_logits, temperature=opsd_temperature)
-        weighting_metrics.update(
-            {
-                "loss_type": "opsd_gt_prompt_forward_kl" if teacher_uses_ground_truth else "opsd_nogt_forward_kl",
-                "unweighted_kl_loss": float(kl.detach().cpu()),
-                "weighted_kl_loss": None,
-            }
+        outlier_exclusion_enabled = bool(
+            get_nested(cfg, "opsd.token_outlier_exclusion.enabled", False)
         )
+        if outlier_exclusion_enabled:
+            requested_top_k = resolve_token_outlier_top_k(
+                int(get_nested(cfg, "opsd.token_outlier_exclusion.top_k", 0) or 0),
+                get_nested(cfg, "opsd.token_outlier_exclusion.top_k_by_ratio", None),
+                retention_ratio,
+            )
+            valid = generated_token_valid_mask(gen_ids)
+            forward_per_token_kl = compute_per_token_kl(
+                teacher_logits,
+                student_logits,
+                temperature=opsd_temperature,
+                chunk_size=int(
+                    get_nested(cfg, "opsd.token_outlier_exclusion.kl_chunk_size", 32)
+                ),
+            )
+            keep_mask, removed_indices = keep_mask_after_topk_exclusion(
+                forward_per_token_kl.detach(),
+                valid,
+                requested_top_k,
+            )
+            unfiltered_forward_kl = forward_per_token_kl[valid].mean()
+            kl = forward_per_token_kl[keep_mask].mean()
+            removed_forward = forward_per_token_kl.detach().float()[removed_indices]
+            flat_generated_ids = gen_ids.detach().reshape(-1)
+            valid_forward_sum = forward_per_token_kl.detach().float()[valid].sum()
+            removed_forward_sum = removed_forward.sum()
+            removed_mass_fraction = removed_forward_sum / valid_forward_sum.clamp_min(1e-8)
+            if removed_indices.numel() > 0:
+                removed_forward_min = float(removed_forward.min().cpu())
+                removed_forward_mean = float(removed_forward.mean().cpu())
+                removed_forward_max = float(removed_forward.max().cpu())
+            else:
+                removed_forward_min = None
+                removed_forward_mean = None
+                removed_forward_max = None
+            weighting_metrics.update(
+                {
+                    "loss_type": (
+                        "opsd_nogt_forward_kl_topk_excluded"
+                        if not teacher_uses_ground_truth
+                        else "opsd_gt_prompt_forward_kl_topk_excluded"
+                    ),
+                    "unweighted_kl_loss": float(unfiltered_forward_kl.detach().cpu()),
+                    "weighted_kl_loss": float(kl.detach().cpu()),
+                    "token_outlier_ranking_kl_direction": "KL(teacher || student)",
+                    "token_outlier_training_kl_direction": "KL(teacher || student)",
+                    "token_outlier_requested_top_k": requested_top_k,
+                    "token_outlier_effective_top_k": int(removed_indices.numel()),
+                    "token_outlier_valid_tokens": int(valid.sum().cpu()),
+                    "token_outlier_kept_tokens": int(keep_mask.sum().cpu()),
+                    "token_outlier_remaining_mean_normalized": True,
+                    "token_outlier_removed_forward_kl_min": removed_forward_min,
+                    "token_outlier_removed_forward_kl_mean": removed_forward_mean,
+                    "token_outlier_removed_forward_kl_max": removed_forward_max,
+                    "token_outlier_removed_forward_kl_mass_fraction": float(
+                        removed_mass_fraction.cpu()
+                    ),
+                    "token_outlier_removed_positions": [
+                        int(value) for value in removed_indices.cpu().tolist()
+                    ],
+                    "token_outlier_removed_token_ids": [
+                        int(flat_generated_ids[int(value)].cpu().item())
+                        for value in removed_indices.cpu().tolist()
+                    ],
+                    "token_outlier_removed_forward_kl_values": [
+                        float(value) for value in removed_forward.cpu().tolist()
+                    ],
+                }
+            )
+        else:
+            kl = compute_forward_kl(teacher_logits, student_logits, temperature=opsd_temperature)
+            weighting_metrics.update(
+                {
+                    "loss_type": "opsd_gt_prompt_forward_kl" if teacher_uses_ground_truth else "opsd_nogt_forward_kl",
+                    "unweighted_kl_loss": float(kl.detach().cpu()),
+                    "weighted_kl_loss": None,
+                }
+            )
     parsed = parse_final_answer(gen_text)
     output_metrics = {
         "loss_type": weighting_metrics.pop("loss_type"),
@@ -2746,6 +3398,79 @@ def trajectory_probability_mode(cfg: dict[str, Any]) -> str | None:
     return mode if mode in EFFECTIVE_BATCH_PROBABILITY_MODES else None
 
 
+def ratio_group_weight_transform(cfg: dict[str, Any]) -> tuple[str, float | None]:
+    transform = str(
+        get_nested(cfg, "opsd.trajectory_weighting.group_transform", "linear")
+    ).strip().lower()
+    if transform not in {"linear", "softmax"}:
+        raise ValueError(
+            f"Unknown ratio-group transform {transform!r}; expected 'linear' or 'softmax'."
+        )
+    if transform == "linear":
+        return transform, None
+    temperature = float(
+        get_nested(cfg, "opsd.trajectory_weighting.temperature", float("nan"))
+    )
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError(
+            "Ratio-group softmax projection weighting requires a finite positive temperature."
+        )
+    return transform, temperature
+
+
+def ratio_group_statistic(cfg: dict[str, Any]) -> str:
+    statistic = str(
+        get_nested(
+            cfg,
+            "opsd.trajectory_weighting.group_statistic",
+            "teacher_directed_projection_mass_over_teacher_js_mass",
+        )
+    ).strip().lower()
+    supported = {
+        "teacher_directed_projection_mass_over_teacher_js_mass",
+        "teacher_directed_projection_cosine",
+        "teacher_directed_projection_cosine_sample_normalized",
+        "teacher_directed_projection_fraction_exact",
+    }
+    if statistic not in supported:
+        raise ValueError(
+            f"Unknown ratio-group statistic {statistic!r}; expected one of {sorted(supported)}."
+        )
+    return statistic
+
+
+def global_trajectory_calibration(cfg: dict[str, Any]) -> dict[str, float]:
+    calibration = get_nested(cfg, "opsd.trajectory_weighting.calibration", None)
+    if not isinstance(calibration, dict):
+        raise ValueError(
+            "global_calibrated_counterfactual_teachability_batch requires a frozen "
+            "trajectory_weighting.calibration mapping."
+        )
+    values = {
+        "q05": float(calibration.get("q05", float("nan"))),
+        "q95": float(calibration.get("q95", float("nan"))),
+        "normalized_mean": float(
+            calibration.get("normalized_mean", float("nan"))
+        ),
+        "coefficient": float(
+            get_nested(cfg, "opsd.trajectory_weighting.coefficient", 1.0)
+        ),
+    }
+    if not all(math.isfinite(value) for value in values.values()):
+        raise ValueError(f"Global trajectory calibration must be finite: {values}.")
+    if values["q95"] <= values["q05"]:
+        raise ValueError("Global trajectory calibration requires q95 > q05.")
+    if not 0.0 <= values["normalized_mean"] <= 1.0:
+        raise ValueError("Global trajectory normalized_mean must be in [0, 1].")
+    if values["coefficient"] < 0.0:
+        raise ValueError("Global trajectory coefficient must be nonnegative.")
+    if 1.0 - values["coefficient"] * values["normalized_mean"] <= 0.0:
+        raise ValueError(
+            "Global trajectory coefficient makes the minimum possible weight nonpositive."
+        )
+    return values
+
+
 def trajectory_sensitivity_signal(
     metrics: dict[str, Any],
     cfg: dict[str, Any],
@@ -2777,7 +3502,43 @@ def trajectory_sensitivity_signal(
             raise ValueError(
                 f"Invalid step-0 teacher KL calibration for ratio {key}: {denominator}."
             )
-    elif mode == "ratio_group_counterfactual_teachability_batch":
+    elif mode in {
+        "progress_adaptive_robust_frontier_batch",
+        "adaptive_budget_frontier_sampler_batch",
+    }:
+        explained = float(metrics["native_trajectory_budget_explained_fraction"])
+        teacher_gap = float(metrics["native_teacher_gap_b_mean"])
+        if not math.isfinite(explained) or not 0.0 <= explained <= 1.0:
+            raise FloatingPointError(
+                f"Invalid budget-explained fraction: {explained}."
+            )
+        if not math.isfinite(teacher_gap) or teacher_gap < 0.0:
+            raise FloatingPointError(f"Invalid teacher gap: {teacher_gap}.")
+        if mode == "adaptive_budget_frontier_sampler_batch":
+            sampler_metric = str(
+                get_nested(
+                    cfg,
+                    "opsd.trajectory_weighting.sampler_metric",
+                    "robust_need",
+                )
+            ).strip().lower()
+            if sampler_metric == "teacher_kl":
+                return teacher_gap
+            if sampler_metric != "robust_need":
+                raise ValueError(
+                    f"Unsupported adaptive sampler metric: {sampler_metric!r}."
+                )
+        return teacher_gap * (1.0 - explained)
+    elif mode in RAW_TRAJECTORY_F_MODES:
+        projection = float(metrics["native_trajectory_budget_projection_mass"])
+        teacher_js = float(metrics["native_trajectory_teacher_js_mass"])
+        signal = projection / max(teacher_js, eps)
+        if not math.isfinite(signal):
+            raise FloatingPointError(
+                f"Invalid raw budget-explained fraction: {signal}."
+            )
+        return signal
+    elif mode in COUNTERFACTUAL_TEACHABILITY_MODES:
         signal = float(metrics["native_trajectory_budget_explained_fraction"])
         if not math.isfinite(signal) or not 0.0 <= signal <= 1.0:
             raise FloatingPointError(
@@ -2809,6 +3570,14 @@ def prepare_effective_batch_probability_window(
     distributed: bool,
     rank: int,
     world_size: int,
+    curriculum_state: (
+        AdaptiveBudgetFrontierState
+        |
+        ProgressAdaptiveFrontierState
+        | RobustnessGatedCurriculumState
+        | SensitivityFrontierState
+        | None
+    ) = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Probe one complete effective batch, then assign 32-way weights.
 
@@ -2826,13 +3595,20 @@ def prepare_effective_batch_probability_window(
         local_step = int(local_step_start) + offset
         global_index = int(start_step) + local_step * global_step_unit + (rank if distributed else 0)
         sample = dataset[global_index % len(dataset)]
-        ratio = sample_retention_ratio(
-            cfg,
-            rng,
-            progress_step=global_index,
-            total_steps=max_steps,
-            sample_id=sample.sample_id,
-        )
+        if mode == "adaptive_budget_frontier_sampler_batch":
+            if not isinstance(curriculum_state, AdaptiveBudgetFrontierState):
+                raise AssertionError(
+                    "Adaptive budget sampling requires synchronized sampler state."
+                )
+            ratio = curriculum_state.select_ratio(global_index, sample.sample_id)
+        else:
+            ratio = sample_retention_ratio(
+                cfg,
+                rng,
+                progress_step=global_index,
+                total_steps=max_steps,
+                sample_id=sample.sample_id,
+            )
         rollout_seed = paired_rollout_seed(
             seed=int(
                 get_nested(
@@ -2874,6 +3650,11 @@ def prepare_effective_batch_probability_window(
                 "rollout_seed": int(rollout_seed),
                 "probe_loss": float(probe_loss.detach().float().cpu()),
                 "signal": signal,
+                "budget_explained_fraction": float(
+                    probe_metrics.get(
+                        "native_trajectory_budget_explained_fraction", 0.0
+                    )
+                ),
                 "projection_mass": float(
                     probe_metrics.get("native_trajectory_budget_projection_mass", 0.0)
                 ),
@@ -2889,6 +3670,13 @@ def prepare_effective_batch_probability_window(
                 "b_visual_tokens": int(probe_metrics["native_b_num_kept_visual_tokens"]),
                 "b_plus_visual_tokens": int(
                     probe_metrics["native_b_plus_num_kept_visual_tokens"]
+                ),
+                "b_random_mask_hash": probe_metrics.get("random_mask_hash"),
+                "b_plus_random_mask_hash": probe_metrics.get(
+                    "native_b_plus_random_mask_hash"
+                ),
+                "random_b_subset_b_plus": probe_metrics.get(
+                    "native_random_b_subset_b_plus"
                 ),
                 "rollout": rollout_cache,
             }
@@ -2931,7 +3719,14 @@ def prepare_effective_batch_probability_window(
         ]
 
     eps = float(get_nested(cfg, "opsd.trajectory_weighting.eps", 1e-8))
-    if mode == "ratio_group_counterfactual_teachability_batch":
+    weight_transform = "median_inverse"
+    weight_temperature: float | None = None
+    frontier_state_metrics: dict[str, Any] = {}
+    global_ratios: torch.Tensor | None = None
+    global_projection_mass: torch.Tensor | None = None
+    global_teacher_js_mass: torch.Tensor | None = None
+    global_budget_js_mass: torch.Tensor | None = None
+    if mode in COUNTERFACTUAL_TEACHABILITY_MODES:
         global_ratios = torch.tensor(
             [float(record["ratio"]) for record in global_records],
             dtype=torch.float32,
@@ -2947,18 +3742,291 @@ def prepare_effective_batch_probability_window(
             dtype=torch.float32,
             device=global_signals.device,
         )
-        weights = ratio_group_fraction_probability_weights(
-            global_projection_mass,
-            global_teacher_js_mass,
-            global_ratios,
+        global_budget_js_mass = torch.tensor(
+            [float(record["jsd"]) for record in global_records],
+            dtype=torch.float32,
+            device=global_signals.device,
+        )
+    if mode == "global_calibrated_counterfactual_teachability_batch":
+        calibration = global_trajectory_calibration(cfg)
+        weights = globally_calibrated_trajectory_weights(
+            global_signals,
+            q05=calibration["q05"],
+            q95=calibration["q95"],
+            calibration_mean=calibration["normalized_mean"],
+            coefficient=calibration["coefficient"],
             eps=eps,
         )
+        group_signal = global_signals
+        batch_tau = None
+        weight_transform = "fixed_global_robust_affine"
+        frontier_state_metrics = {
+            "trajectory_global_calibration_q05": calibration["q05"],
+            "trajectory_global_calibration_q95": calibration["q95"],
+            "trajectory_global_calibration_normalized_mean": calibration[
+                "normalized_mean"
+            ],
+            "trajectory_global_calibration_coefficient": calibration[
+                "coefficient"
+            ],
+            "trajectory_global_normalized_signal_min": float(
+                weights.normalized_signal.min().cpu()
+            ),
+            "trajectory_global_normalized_signal_mean": float(
+                weights.normalized_signal.mean().cpu()
+            ),
+            "trajectory_global_normalized_signal_max": float(
+                weights.normalized_signal.max().cpu()
+            ),
+            "trajectory_global_objective_weight_min": float(
+                weights.objective_weight.min().cpu()
+            ),
+            "trajectory_global_objective_weight_mean": float(
+                weights.objective_weight.mean().cpu()
+            ),
+            "trajectory_global_objective_weight_max": float(
+                weights.objective_weight.max().cpu()
+            ),
+            "trajectory_global_batch_renormalized": False,
+        }
+    elif mode == "global_f_intermediate_curriculum_batch":
+        gamma = float(get_nested(cfg, "opsd.trajectory_weighting.gamma", 4.0))
+        weights = global_f_curriculum_trajectory_weights(
+            global_signals,
+            gamma=gamma,
+        )
+        group_signal = global_signals
+        batch_tau = None
+        weight_transform = "fixed_global_gamma_f_one_minus_f"
+        frontier_state_metrics = {
+            "trajectory_global_curriculum_gamma": gamma,
+            "trajectory_global_clipped_signal_min": float(
+                weights.clipped_signal.min().cpu()
+            ),
+            "trajectory_global_clipped_signal_mean": float(
+                weights.clipped_signal.mean().cpu()
+            ),
+            "trajectory_global_clipped_signal_max": float(
+                weights.clipped_signal.max().cpu()
+            ),
+            "trajectory_global_objective_weight_min": float(
+                weights.objective_weight.min().cpu()
+            ),
+            "trajectory_global_objective_weight_mean": float(
+                weights.objective_weight.mean().cpu()
+            ),
+            "trajectory_global_objective_weight_max": float(
+                weights.objective_weight.max().cpu()
+            ),
+            "trajectory_global_batch_renormalized": False,
+        }
+    elif mode in {
+        "trajectory_projection_fraction_top20_batch",
+        "trajectory_projection_fraction_bottom80_batch",
+    }:
+        global_indices = [int(record["global_index"]) for record in global_records]
+        batch_ordinal = min(global_indices) // len(global_indices)
+        selection = (
+            "top"
+            if mode == "trajectory_projection_fraction_top20_batch"
+            else "bottom"
+        )
+        weights = hard_trajectory_partition_weights(
+            global_signals,
+            top_fraction=float(
+                get_nested(cfg, "opsd.trajectory_weighting.top_fraction", 0.2)
+            ),
+            batch_ordinal=batch_ordinal,
+            select=selection,
+        )
+        group_signal = global_signals
+        batch_tau = None
+        weight_transform = f"hard_projection_fraction_{selection}_partition"
+        frontier_state_metrics = {
+            "trajectory_partition_selection": selection,
+            "trajectory_partition_top_fraction": float(
+                get_nested(cfg, "opsd.trajectory_weighting.top_fraction", 0.2)
+            ),
+            "trajectory_partition_batch_ordinal": batch_ordinal,
+            "trajectory_partition_top_count": int(weights.top_count),
+            "trajectory_partition_selected_count": int(weights.selected_mask.sum().cpu()),
+            "trajectory_partition_selected_fraction": float(
+                weights.selected_mask.float().mean().cpu()
+            ),
+            "trajectory_global_batch_renormalized": True,
+        }
+    elif mode == "progress_adaptive_robust_frontier_batch":
+        if not isinstance(curriculum_state, ProgressAdaptiveFrontierState):
+            raise AssertionError(
+                "Progress-adaptive robust frontier requires its synchronized state."
+            )
+        batch_tau = curriculum_state.tau
+        weights = competence_frontier_probability_weights(
+            global_losses,
+            global_signals,
+            tau=batch_tau,
+            eps=eps,
+        )
+        group_signal = global_signals
+        weight_transform = "progress_adaptive_robust_competence_frontier"
+        state_update = curriculum_state.update(
+            float(global_signals.mean().cpu()),
+            int(global_signals.numel()),
+        )
+        frontier_state_metrics = {
+            "trajectory_frontier_initial_tau": float(curriculum_state.initial_tau),
+            "trajectory_frontier_initial_robust_need_mean": float(
+                curriculum_state.initial_robust_need_mean
+            ),
+            "trajectory_frontier_tau": float(batch_tau),
+            "trajectory_frontier_tau_after_update": float(state_update["tau_after"]),
+            "trajectory_frontier_progress_after_update": float(
+                state_update["progress_after"]
+            ),
+            "trajectory_frontier_ema_robust_need": float(
+                state_update["ema_robust_need_mean"]
+            ),
+            "trajectory_frontier_ema_decay": float(state_update["ema_decay"]),
+            "trajectory_frontier_updates": int(state_update["updates"]),
+            "trajectory_frontier_trajectories_seen": int(
+                state_update["trajectories_seen"]
+            ),
+            "trajectory_frontier_loss_mass_scale": float(
+                weights.loss_mass_scale.cpu()
+            ),
+        }
+    elif mode == "adaptive_budget_frontier_sampler_batch":
+        if not isinstance(curriculum_state, AdaptiveBudgetFrontierState):
+            raise AssertionError(
+                "Adaptive budget sampling requires synchronized sampler state."
+            )
+        probabilities_before = curriculum_state.probabilities()
+        tau_before = curriculum_state.tau
+        weights = uniform_trajectory_probability_weights(
+            int(global_signals.numel()), device=global_signals.device
+        )
+        group_signal = global_signals
+        batch_tau = tau_before
+        weight_transform = "adaptive_budget_frontier_sampling_with_vanilla_opsd_loss"
+        state_update = curriculum_state.update(
+            [float(record["ratio"]) for record in global_records],
+            [float(record["signal"]) for record in global_records],
+        )
+        frontier_state_metrics = {
+            "budget_sampler_metric": str(
+                get_nested(
+                    cfg,
+                    "opsd.trajectory_weighting.sampler_metric",
+                    "robust_need",
+                )
+            ).strip().lower(),
+            "budget_sampler_ready_before": bool(state_update["ready_before"]),
+            "budget_sampler_ready_after": bool(state_update["ready_after"]),
+            "budget_sampler_tau": tau_before,
+            "budget_sampler_tau_after_update": state_update["tau_after"],
+            "budget_sampler_initial_tau": state_update["initial_tau"],
+            "budget_sampler_initial_metric_mean": state_update[
+                "initial_metric_mean"
+            ],
+            "budget_sampler_probabilities_before": {
+                f"r{int(round(ratio * 100)):03d}": float(probability)
+                for ratio, probability in zip(
+                    curriculum_state.retention_ratios, probabilities_before
+                )
+            },
+            "budget_sampler_probabilities_after": {
+                f"r{int(round(ratio * 100)):03d}": float(probability)
+                for ratio, probability in zip(
+                    curriculum_state.retention_ratios,
+                    state_update["probabilities_after"],
+                )
+            },
+            "budget_sampler_initial_group_metric": state_update[
+                "initial_group_metric"
+            ],
+            "budget_sampler_ema_group_metric": state_update["ema_group_metric"],
+            "budget_sampler_calibration_counts": state_update[
+                "calibration_counts"
+            ],
+            "budget_sampler_calibration_complete_at_trajectory": state_update[
+                "calibration_complete_at_trajectory"
+            ],
+            "budget_sampler_updates": int(state_update["updates"]),
+            "budget_sampler_trajectories_seen": int(
+                state_update["trajectories_seen"]
+            ),
+            "budget_sampler_loss_is_vanilla_mean": True,
+            "budget_sampler_state_update_scope": "synchronized_microbatch",
+        }
+    elif mode == "ratio_group_counterfactual_teachability_batch":
+        group_transform, group_temperature = ratio_group_weight_transform(cfg)
+        group_statistic = ratio_group_statistic(cfg)
+        if group_statistic == "teacher_directed_projection_cosine":
+            if group_transform != "softmax" or group_temperature is None:
+                raise ValueError("Ratio-group angle weighting requires softmax.")
+            weights = ratio_group_angle_probability_weights(
+                global_projection_mass,
+                global_teacher_js_mass,
+                global_budget_js_mass,
+                global_ratios,
+                temperature=group_temperature,
+                eps=eps,
+            )
+            weight_transform = "ratio_group_softmax_angle"
+        elif group_statistic == "teacher_directed_projection_cosine_sample_normalized":
+            if group_transform != "softmax" or group_temperature is None:
+                raise ValueError(
+                    "Sample-normalized ratio-group angle weighting requires softmax."
+                )
+            weights = ratio_group_angle_sample_probability_weights(
+                global_projection_mass,
+                global_teacher_js_mass,
+                global_budget_js_mass,
+                global_ratios,
+                temperature=group_temperature,
+                eps=eps,
+            )
+            weight_transform = "ratio_group_softmax_angle_sample_normalized"
+        elif group_statistic == "teacher_directed_projection_fraction_exact":
+            if group_transform != "softmax" or group_temperature is None:
+                raise ValueError("Exact ratio-group projection weighting requires softmax.")
+            weights = ratio_group_projection_probability_weights(
+                global_projection_mass,
+                global_teacher_js_mass,
+                global_ratios,
+                temperature=group_temperature,
+                eps=eps,
+            )
+            weight_transform = "ratio_group_softmax_projection_exact"
+        else:
+            weights = ratio_group_fraction_probability_weights(
+                global_projection_mass,
+                global_teacher_js_mass,
+                global_ratios,
+                transform=group_transform,
+                temperature=group_temperature,
+                eps=eps,
+            )
+            weight_transform = f"ratio_group_{group_transform}_projection"
         batch_tau: float | None = None
         group_signal = weights.group_signal
+        weight_temperature = group_temperature
+    elif mode == "trajectory_counterfactual_teachability_softmax_batch":
+        weight_temperature = float(
+            get_nested(cfg, "opsd.trajectory_weighting.temperature")
+        )
+        weights = softmax_trajectory_signal_probability_weights(
+            global_signals,
+            temperature=weight_temperature,
+        )
+        batch_tau = None
+        group_signal = global_signals
+        weight_transform = "trajectory_softmax_projection"
     elif mode == "jsd_over_current_kl_direct_inverse_batch":
         weights = direct_inverse_sensitivity_probability_weights(global_signals, eps=eps)
         batch_tau = None
         group_signal = global_signals
+        weight_transform = "direct_inverse"
     elif mode == "jsd_over_current_kl_softmax_batch":
         weights = softmax_inverse_sensitivity_probability_weights(
             global_signals,
@@ -2968,6 +4036,10 @@ def prepare_effective_batch_probability_window(
         )
         batch_tau = None
         group_signal = global_signals
+        weight_transform = "softmax_negative_sensitivity"
+        weight_temperature = float(
+            get_nested(cfg, "opsd.trajectory_weighting.temperature")
+        )
     else:
         weights = inverse_sensitivity_probability_weights(global_signals, eps=eps)
         batch_tau = float(weights.tau.cpu())
@@ -2985,17 +4057,92 @@ def prepare_effective_batch_probability_window(
     ):
         record["probability_weight"] = float(probability_weight.cpu())
         record["ratio_group_signal"] = float(current_group_signal.cpu())
+        record["weight_signal"] = float(current_group_signal.cpu())
     for record, probability_weight, current_group_signal in zip(
         global_records, weights.probability_weight, group_signal
     ):
         record["probability_weight"] = float(probability_weight.cpu())
         record["ratio_group_signal"] = float(current_group_signal.cpu())
+        record["weight_signal"] = float(current_group_signal.cpu())
 
     weighted_kl = (weights.probability_weight * global_losses).sum()
     unweighted_kl = global_losses.mean()
+    effective_multiplier = weights.probability_weight * expected_size
+    effective_sample_size = weights.probability_weight.sum().square().div(
+        weights.probability_weight.square().sum().clamp_min(eps)
+    )
+    ratio_group_stats: dict[str, dict[str, float | int]] = {}
+    if mode in COUNTERFACTUAL_TEACHABILITY_MODES:
+        if (
+            global_ratios is None
+            or global_projection_mass is None
+            or global_teacher_js_mass is None
+            or global_budget_js_mass is None
+        ):
+            raise AssertionError("Counterfactual teachability tensors are unavailable.")
+        for ratio in torch.unique(global_ratios, sorted=True):
+            members = torch.isclose(global_ratios, ratio, rtol=0.0, atol=1e-6)
+            group_probability = weights.probability_weight[members]
+            group_losses = global_losses[members]
+            weighted_contribution = (group_probability * group_losses).sum()
+            ratio_group_stats[f"r{int(round(float(ratio.cpu()) * 100)):03d}"] = {
+                "retention_ratio": float(ratio.cpu()),
+                "count": int(members.sum().cpu()),
+                "projection_mass_sum": float(global_projection_mass[members].sum().cpu()),
+                "teacher_js_mass_sum": float(global_teacher_js_mass[members].sum().cpu()),
+                "budget_js_mass_sum": float(global_budget_js_mass[members].sum().cpu()),
+                "projection_fraction": float(
+                    global_projection_mass[members]
+                    .sum()
+                    .div(global_teacher_js_mass[members].sum().clamp_min(eps))
+                    .clamp(0.0, 1.0)
+                    .cpu()
+                ),
+                "projection_cosine": float(
+                    global_projection_mass[members]
+                    .sum()
+                    .div(
+                        (
+                            global_teacher_js_mass[members].sum()
+                            * global_budget_js_mass[members].sum()
+                        )
+                        .clamp_min(0.0)
+                        .sqrt()
+                        .clamp_min(eps)
+                    )
+                    .clamp(-1.0, 1.0)
+                    .cpu()
+                ),
+                "trajectory_signal_min": float(global_signals[members].min().cpu()),
+                "trajectory_signal_mean": float(global_signals[members].mean().cpu()),
+                "trajectory_signal_max": float(global_signals[members].max().cpu()),
+                "probability_mass": float(group_probability.sum().cpu()),
+                "mean_probability_weight": float(group_probability.mean().cpu()),
+                "mean_multiplier": float(effective_multiplier[members].mean().cpu()),
+                "unweighted_kl_mean": float(group_losses.mean().cpu()),
+                "unweighted_kl_contribution_fraction": float(
+                    group_losses.sum().div(global_losses.sum().clamp_min(eps)).cpu()
+                ),
+                "weighted_kl_contribution": float(weighted_contribution.cpu()),
+                "weighted_kl_contribution_fraction": float(
+                    weighted_contribution.div(weighted_kl.clamp_min(eps)).cpu()
+                ),
+            }
     summary = {
         "trajectory_weighting_mode": mode,
-        "trajectory_normalization": "effective_batch_probability_sum_one",
+        "trajectory_normalization": (
+            "fixed_global_calibration_no_batch_renormalization"
+            if mode == "global_calibrated_counterfactual_teachability_batch"
+            else "fixed_global_f_curriculum_no_batch_renormalization"
+            if mode == "global_f_intermediate_curriculum_batch"
+            else "effective_batch_kl_mass_preserving"
+            if mode == "progress_adaptive_robust_frontier_batch"
+            else (
+                "vanilla_mean_after_adaptive_ratio_sampling"
+                if mode == "adaptive_budget_frontier_sampler_batch"
+                else "effective_batch_probability_sum_one"
+            )
+        ),
         "trajectory_effective_batch_size": expected_size,
         "trajectory_probability_weight_sum": float(weights.probability_weight.sum().cpu()),
         "trajectory_probability_weight_min": float(weights.probability_weight.min().cpu()),
@@ -3007,23 +4154,14 @@ def prepare_effective_batch_probability_window(
             (weights.probability_weight * expected_size).max().cpu()
         ),
         "trajectory_batch_tau": batch_tau,
-        "trajectory_weight_transform": (
-            "direct_inverse"
-            if mode == "jsd_over_current_kl_direct_inverse_batch"
-            else (
-                "softmax_negative_sensitivity"
-                if mode == "jsd_over_current_kl_softmax_batch"
-                else "median_inverse"
-            )
-        ),
-        "trajectory_weight_temperature": (
-            float(get_nested(cfg, "opsd.trajectory_weighting.temperature"))
-            if mode == "jsd_over_current_kl_softmax_batch"
-            else None
-        ),
+        "trajectory_weight_transform": weight_transform,
+        "trajectory_weight_temperature": weight_temperature,
         "trajectory_ratio_group_signal_min": float(group_signal.min().cpu()),
         "trajectory_ratio_group_signal_mean": float(group_signal.mean().cpu()),
         "trajectory_ratio_group_signal_max": float(group_signal.max().cpu()),
+        "trajectory_weight_signal_min": float(group_signal.min().cpu()),
+        "trajectory_weight_signal_mean": float(group_signal.mean().cpu()),
+        "trajectory_weight_signal_max": float(group_signal.max().cpu()),
         "trajectory_signal_min": float(global_signals.min().cpu()),
         "trajectory_signal_mean": float(global_signals.mean().cpu()),
         "trajectory_signal_max": float(global_signals.max().cpu()),
@@ -3033,18 +4171,87 @@ def prepare_effective_batch_probability_window(
         "trajectory_loss_scale_ratio": float(
             (weighted_kl / unweighted_kl.clamp_min(eps)).cpu()
         ),
+        "trajectory_effective_sample_size": float(effective_sample_size.cpu()),
+        "trajectory_effective_sample_size_fraction": float(
+            effective_sample_size.div(expected_size).cpu()
+        ),
+        "trajectory_ratio_groups": ratio_group_stats,
         "trajectory_weight_detached": not weights.probability_weight.requires_grad,
         "global_records": global_records,
+        **frontier_state_metrics,
     }
     return local_records, summary
 
 
 def initialize_trajectory_curriculum_state(
     cfg: dict[str, Any],
-) -> RobustnessGatedCurriculumState | SensitivityFrontierState | None:
+) -> (
+    AdaptiveBudgetFrontierState
+    |
+    ProgressAdaptiveFrontierState
+    | RobustnessGatedCurriculumState
+    | SensitivityFrontierState
+    | None
+):
     if not bool(get_nested(cfg, "opsd.trajectory_weighting.enabled", False)):
         return None
     mode = str(get_nested(cfg, "opsd.trajectory_weighting.mode", "")).strip().lower()
+    if mode == "adaptive_budget_frontier_sampler_batch":
+        ratios = tuple(
+            float(value)
+            for value in get_nested(
+                cfg, "pruning.train_retention_ratios", [0.1, 0.2, 0.3, 0.4]
+            )
+        )
+        return AdaptiveBudgetFrontierState(
+            retention_ratios=ratios,
+            calibration_target_per_ratio=int(
+                get_nested(
+                    cfg,
+                    "opsd.trajectory_weighting.calibration_target_per_ratio",
+                    64,
+                )
+            ),
+            ema_half_life_per_ratio=float(
+                get_nested(
+                    cfg,
+                    "opsd.trajectory_weighting.ema_half_life_per_ratio",
+                    64.0,
+                )
+            ),
+            seed=int(
+                get_nested(
+                    cfg,
+                    "paired_sampling.ratio_seed",
+                    get_nested(cfg, "training.seed", 42),
+                )
+            ),
+            namespace=str(
+                get_nested(cfg, "paired_sampling.namespace", "opsd_pair_v1")
+            )
+            + ":adaptive_budget_frontier",
+            eps=float(get_nested(cfg, "opsd.trajectory_weighting.eps", 1e-8)),
+        )
+    if mode == "progress_adaptive_robust_frontier_batch":
+        calibration = get_nested(cfg, "opsd.trajectory_weighting.calibration", None)
+        if not isinstance(calibration, dict):
+            raise ValueError(
+                "progress_adaptive_robust_frontier_batch requires frozen calibration."
+            )
+        initial_tau = float(calibration["initial_tau"])
+        initial_mean = float(calibration["initial_robust_need_mean"])
+        return ProgressAdaptiveFrontierState(
+            initial_tau=initial_tau,
+            initial_robust_need_mean=initial_mean,
+            ema_robust_need_mean=initial_mean,
+            ema_half_life_trajectories=float(
+                get_nested(
+                    cfg,
+                    "opsd.trajectory_weighting.ema_half_life_trajectories",
+                    256.0,
+                )
+            ),
+        )
     if mode == "sensitivity_frontier":
         return SensitivityFrontierState(
             calibration_target_per_ratio=int(
@@ -3086,7 +4293,14 @@ def apply_distributed_trajectory_weighting(
     distributed: bool,
     rank: int,
     world_size: int,
-    curriculum_state: RobustnessGatedCurriculumState | SensitivityFrontierState | None = None,
+    curriculum_state: (
+        AdaptiveBudgetFrontierState
+        |
+        ProgressAdaptiveFrontierState
+        | RobustnessGatedCurriculumState
+        | SensitivityFrontierState
+        | None
+    ) = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Redistribute whole-trajectory OPSD gradients across a synchronized DDP block."""
 
@@ -3096,11 +4310,16 @@ def apply_distributed_trajectory_weighting(
         return vanilla, {"trajectory_weighting_enabled": False}
     mode = str(get_nested(cfg, "opsd.trajectory_weighting.mode", "closure_rank")).strip().lower()
     probability_modes = {
+        "global_calibrated_counterfactual_teachability_batch",
+        "global_f_intermediate_curriculum_batch",
         "jsd_over_current_kl_batch",
         "jsd_over_current_kl_direct_inverse_batch",
         "jsd_over_current_kl_softmax_batch",
         "jsd_over_step0_kl_batch",
         "ratio_group_counterfactual_teachability_batch",
+        "trajectory_counterfactual_teachability_softmax_batch",
+        "progress_adaptive_robust_frontier_batch",
+        "adaptive_budget_frontier_sampler_batch",
     }
     if mode not in probability_modes and (
         not distributed or not dist.is_initialized() or world_size < 2
@@ -3130,6 +4349,26 @@ def apply_distributed_trajectory_weighting(
             "native_trajectory_budget_explained_fraction",
             True,
         ),
+        "global_calibrated_counterfactual_teachability_batch": (
+            "native_trajectory_budget_explained_fraction",
+            True,
+        ),
+        "global_f_intermediate_curriculum_batch": (
+            "native_trajectory_budget_explained_fraction",
+            True,
+        ),
+        "trajectory_counterfactual_teachability_softmax_batch": (
+            "native_trajectory_budget_explained_fraction",
+            True,
+        ),
+        "progress_adaptive_robust_frontier_batch": (
+            "derived_progress_adaptive_robust_need",
+            True,
+        ),
+        "adaptive_budget_frontier_sampler_batch": (
+            "derived_adaptive_budget_frontier_signal",
+            True,
+        ),
     }
     if mode not in signal_spec:
         raise ValueError(
@@ -3138,8 +4377,24 @@ def apply_distributed_trajectory_weighting(
     signal_key, higher_is_better = signal_spec[mode]
     if len(batch_losses) != len(batch_metrics):
         raise AssertionError("Every trajectory loss must have one metrics record.")
+    device = batch_losses[0].device
     required_keys = {signal_key}
-    if mode in {
+    if mode == "progress_adaptive_robust_frontier_batch":
+        required_keys = {
+            "native_teacher_gap_b_mean",
+            "native_trajectory_budget_explained_fraction",
+        }
+    elif mode == "adaptive_budget_frontier_sampler_batch":
+        if not isinstance(curriculum_state, AdaptiveBudgetFrontierState):
+            raise ValueError(
+                "adaptive_budget_frontier_sampler_batch requires initialized state."
+            )
+        required_keys = {
+            "native_teacher_gap_b_mean",
+            "native_trajectory_budget_explained_fraction",
+            "sampled_b",
+        }
+    elif mode in {
         "relative_robustness_rank",
         "residual_robustness_rank",
         "residual_robustness_soft",
@@ -3147,7 +4402,12 @@ def apply_distributed_trajectory_weighting(
         required_keys = {"native_sensitivity_mean", "native_teacher_gap_b_mean"}
     if mode in {"residual_robustness_rank", "residual_robustness_soft"}:
         required_keys.add("sampled_b")
-    if mode == "robustness_gated_curriculum":
+    if mode == "progress_adaptive_robust_frontier_batch":
+        if not isinstance(curriculum_state, ProgressAdaptiveFrontierState):
+            raise ValueError(
+                "progress_adaptive_robust_frontier_batch requires initialized state."
+            )
+    elif mode == "robustness_gated_curriculum":
         required_keys = {
             "native_trajectory_mass_robustness",
             "native_teacher_gap_b_mean",
@@ -3171,13 +4431,22 @@ def apply_distributed_trajectory_weighting(
             "native_student_budget_jsd_mean",
             "sampled_b",
         }
-    if mode == "ratio_group_counterfactual_teachability_batch":
+    if mode in {
+        "ratio_group_counterfactual_teachability_batch",
+        "global_calibrated_counterfactual_teachability_batch",
+        "global_f_intermediate_curriculum_batch",
+    }:
         required_keys = {
             "native_trajectory_budget_explained_fraction",
             "native_trajectory_budget_projection_mass",
             "native_trajectory_teacher_js_mass",
             "sampled_b",
         }
+        if ratio_group_statistic(cfg) in {
+            "teacher_directed_projection_cosine",
+            "teacher_directed_projection_cosine_sample_normalized",
+        }:
+            required_keys.add("native_student_budget_jsd_mean")
     for required_key in sorted(required_keys):
         missing = [index for index, item in enumerate(batch_metrics) if required_key not in item]
         if missing:
@@ -3185,13 +4454,80 @@ def apply_distributed_trajectory_weighting(
                 f"Trajectory signal input {required_key!r} missing for local items {missing}."
             )
 
-    device = batch_losses[0].device
     local_losses = torch.stack([item.detach().float() for item in batch_losses])
     local_teacher_gaps: torch.Tensor | None = None
     local_ratios: torch.Tensor | None = None
     local_projection_mass: torch.Tensor | None = None
     local_teacher_js_mass: torch.Tensor | None = None
-    if mode == "robustness_gated_curriculum":
+    local_budget_js_mass: torch.Tensor | None = None
+    if mode == "progress_adaptive_robust_frontier_batch":
+        local_signals = torch.tensor(
+            [
+                float(item["native_teacher_gap_b_mean"])
+                * (
+                    1.0
+                    - min(
+                        max(
+                            float(
+                                item[
+                                    "native_trajectory_budget_explained_fraction"
+                                ]
+                            ),
+                            0.0,
+                        ),
+                        1.0,
+                    )
+                )
+                for item in batch_metrics
+            ],
+            dtype=torch.float32,
+            device=device,
+        )
+    elif mode == "adaptive_budget_frontier_sampler_batch":
+        sampler_metric = str(
+            get_nested(
+                cfg,
+                "opsd.trajectory_weighting.sampler_metric",
+                "robust_need",
+            )
+        ).strip().lower()
+        if sampler_metric == "robust_need":
+            local_signals = torch.tensor(
+                [
+                    float(item["native_teacher_gap_b_mean"])
+                    * (
+                        1.0
+                        - min(
+                            max(
+                                float(
+                                    item[
+                                        "native_trajectory_budget_explained_fraction"
+                                    ]
+                                ),
+                                0.0,
+                            ),
+                            1.0,
+                        )
+                    )
+                    for item in batch_metrics
+                ],
+                dtype=torch.float32,
+                device=device,
+            )
+        elif sampler_metric == "teacher_kl":
+            local_signals = torch.tensor(
+                [float(item["native_teacher_gap_b_mean"]) for item in batch_metrics],
+                dtype=torch.float32,
+                device=device,
+            )
+        else:
+            raise ValueError(f"Unsupported adaptive sampler metric: {sampler_metric!r}.")
+        local_ratios = torch.tensor(
+            [float(item["sampled_b"]) for item in batch_metrics],
+            dtype=torch.float32,
+            device=device,
+        )
+    elif mode == "robustness_gated_curriculum":
         if curriculum_state is None:
             raise ValueError("robustness_gated_curriculum requires initialized curriculum state.")
         local_signals = torch.tensor(
@@ -3217,15 +4553,30 @@ def apply_distributed_trajectory_weighting(
             dtype=torch.float32,
             device=device,
         )
-    elif mode == "ratio_group_counterfactual_teachability_batch":
-        local_signals = torch.tensor(
-            [
-                float(item["native_trajectory_budget_explained_fraction"])
-                for item in batch_metrics
-            ],
-            dtype=torch.float32,
-            device=device,
-        )
+    elif mode in {
+        "ratio_group_counterfactual_teachability_batch",
+        "global_calibrated_counterfactual_teachability_batch",
+        "global_f_intermediate_curriculum_batch",
+    }:
+        if mode in DIRECT_GLOBAL_F_MODES:
+            local_signals = torch.tensor(
+                [
+                    float(item["native_trajectory_budget_projection_mass"])
+                    / max(float(item["native_trajectory_teacher_js_mass"]), 1e-8)
+                    for item in batch_metrics
+                ],
+                dtype=torch.float32,
+                device=device,
+            )
+        else:
+            local_signals = torch.tensor(
+                [
+                    float(item["native_trajectory_budget_explained_fraction"])
+                    for item in batch_metrics
+                ],
+                dtype=torch.float32,
+                device=device,
+            )
         local_ratios = torch.tensor(
             [float(item["sampled_b"]) for item in batch_metrics],
             dtype=torch.float32,
@@ -3241,6 +4592,11 @@ def apply_distributed_trajectory_weighting(
         )
         local_teacher_js_mass = torch.tensor(
             [float(item["native_trajectory_teacher_js_mass"]) for item in batch_metrics],
+            dtype=torch.float32,
+            device=device,
+        )
+        local_budget_js_mass = torch.tensor(
+            [float(item.get("native_student_budget_jsd_mean", 0.0)) for item in batch_metrics],
             dtype=torch.float32,
             device=device,
         )
@@ -3360,7 +4716,12 @@ def apply_distributed_trajectory_weighting(
             global_ratios = local_ratios
     global_projection_mass: torch.Tensor | None = None
     global_teacher_js_mass: torch.Tensor | None = None
-    if local_projection_mass is not None and local_teacher_js_mass is not None:
+    global_budget_js_mass: torch.Tensor | None = None
+    if (
+        local_projection_mass is not None
+        and local_teacher_js_mass is not None
+        and local_budget_js_mass is not None
+    ):
         if use_distributed_gather:
             gathered_projection_mass = [
                 torch.empty_like(local_projection_mass) for _ in range(world_size)
@@ -3368,42 +4729,274 @@ def apply_distributed_trajectory_weighting(
             gathered_teacher_js_mass = [
                 torch.empty_like(local_teacher_js_mass) for _ in range(world_size)
             ]
+            gathered_budget_js_mass = [
+                torch.empty_like(local_budget_js_mass) for _ in range(world_size)
+            ]
             dist.all_gather(gathered_projection_mass, local_projection_mass)
             dist.all_gather(gathered_teacher_js_mass, local_teacher_js_mass)
+            dist.all_gather(gathered_budget_js_mass, local_budget_js_mass)
             global_projection_mass = torch.cat(gathered_projection_mass)
             global_teacher_js_mass = torch.cat(gathered_teacher_js_mass)
+            global_budget_js_mass = torch.cat(gathered_budget_js_mass)
         else:
             global_projection_mass = local_projection_mass
             global_teacher_js_mass = local_teacher_js_mass
+            global_budget_js_mass = local_budget_js_mass
     strength = float(get_nested(cfg, "opsd.trajectory_weighting.downweight_strength", 0.25))
     eps = float(get_nested(cfg, "opsd.trajectory_weighting.eps", 1e-8))
     curriculum_metrics: dict[str, Any] = {}
     frontier_ratio_gate: torch.Tensor | None = None
     frontier_local_robustness: torch.Tensor | None = None
     if mode in probability_modes:
-        if mode == "ratio_group_counterfactual_teachability_batch":
+        weight_transform = "median_inverse"
+        weight_temperature: float | None = None
+        if mode == "global_calibrated_counterfactual_teachability_batch":
+            calibration = global_trajectory_calibration(cfg)
+            probability = globally_calibrated_trajectory_weights(
+                global_signals,
+                q05=calibration["q05"],
+                q95=calibration["q95"],
+                calibration_mean=calibration["normalized_mean"],
+                coefficient=calibration["coefficient"],
+                eps=eps,
+            )
+            batch_tau = None
+            group_signal = global_signals
+            weight_transform = "fixed_global_robust_affine"
+            curriculum_metrics = {
+                "trajectory_global_calibration_q05": calibration["q05"],
+                "trajectory_global_calibration_q95": calibration["q95"],
+                "trajectory_global_calibration_normalized_mean": calibration[
+                    "normalized_mean"
+                ],
+                "trajectory_global_calibration_coefficient": calibration[
+                    "coefficient"
+                ],
+                "trajectory_global_normalized_signal_min": float(
+                    probability.normalized_signal.min().cpu()
+                ),
+                "trajectory_global_normalized_signal_mean": float(
+                    probability.normalized_signal.mean().cpu()
+                ),
+                "trajectory_global_normalized_signal_max": float(
+                    probability.normalized_signal.max().cpu()
+                ),
+                "trajectory_global_objective_weight_min": float(
+                    probability.objective_weight.min().cpu()
+                ),
+                "trajectory_global_objective_weight_mean": float(
+                    probability.objective_weight.mean().cpu()
+                ),
+                "trajectory_global_objective_weight_max": float(
+                    probability.objective_weight.max().cpu()
+                ),
+                "trajectory_global_batch_renormalized": False,
+            }
+        elif mode == "global_f_intermediate_curriculum_batch":
+            gamma = float(get_nested(cfg, "opsd.trajectory_weighting.gamma", 4.0))
+            probability = global_f_curriculum_trajectory_weights(
+                global_signals,
+                gamma=gamma,
+            )
+            batch_tau = None
+            group_signal = global_signals
+            weight_transform = "fixed_global_gamma_f_one_minus_f"
+            curriculum_metrics = {
+                "trajectory_global_curriculum_gamma": gamma,
+                "trajectory_global_clipped_signal_min": float(
+                    probability.clipped_signal.min().cpu()
+                ),
+                "trajectory_global_clipped_signal_mean": float(
+                    probability.clipped_signal.mean().cpu()
+                ),
+                "trajectory_global_clipped_signal_max": float(
+                    probability.clipped_signal.max().cpu()
+                ),
+                "trajectory_global_objective_weight_min": float(
+                    probability.objective_weight.min().cpu()
+                ),
+                "trajectory_global_objective_weight_mean": float(
+                    probability.objective_weight.mean().cpu()
+                ),
+                "trajectory_global_objective_weight_max": float(
+                    probability.objective_weight.max().cpu()
+                ),
+                "trajectory_global_batch_renormalized": False,
+            }
+        elif mode == "progress_adaptive_robust_frontier_batch":
+            if not isinstance(curriculum_state, ProgressAdaptiveFrontierState):
+                raise AssertionError(
+                    "Progress-adaptive robust frontier requires its state."
+                )
+            batch_tau = curriculum_state.tau
+            probability = competence_frontier_probability_weights(
+                global_losses,
+                global_signals,
+                tau=batch_tau,
+                eps=eps,
+            )
+            group_signal = global_signals
+            weight_transform = "progress_adaptive_robust_competence_frontier"
+            state_update = curriculum_state.update(
+                float(global_signals.mean().cpu()), int(global_signals.numel())
+            )
+            curriculum_metrics = {
+                "trajectory_frontier_tau": float(batch_tau),
+                "trajectory_frontier_tau_after_update": float(
+                    state_update["tau_after"]
+                ),
+                "trajectory_frontier_ema_robust_need": float(
+                    state_update["ema_robust_need_mean"]
+                ),
+                "trajectory_frontier_loss_mass_scale": float(
+                    probability.loss_mass_scale.cpu()
+                ),
+            }
+        elif mode == "adaptive_budget_frontier_sampler_batch":
+            if not isinstance(curriculum_state, AdaptiveBudgetFrontierState):
+                raise AssertionError("Adaptive budget sampler state is unavailable.")
+            if global_ratios is None:
+                raise AssertionError("Adaptive budget sampler ratios are unavailable.")
+            probabilities_before = curriculum_state.probabilities()
+            tau_before = curriculum_state.tau
+            probability = uniform_trajectory_probability_weights(
+                int(global_signals.numel()), device=device
+            )
+            state_update = curriculum_state.update(
+                [float(value) for value in global_ratios.detach().cpu().tolist()],
+                [float(value) for value in global_signals.detach().cpu().tolist()],
+            )
+            batch_tau = tau_before
+            group_signal = global_signals
+            weight_transform = "adaptive_budget_frontier_sampling_with_vanilla_opsd_loss"
+            curriculum_metrics = {
+                "budget_sampler_metric": str(
+                    get_nested(
+                        cfg,
+                        "opsd.trajectory_weighting.sampler_metric",
+                        "robust_need",
+                    )
+                ).strip().lower(),
+                "budget_sampler_ready_before": bool(state_update["ready_before"]),
+                "budget_sampler_ready_after": bool(state_update["ready_after"]),
+                "budget_sampler_tau": tau_before,
+                "budget_sampler_tau_after_update": state_update["tau_after"],
+                "budget_sampler_initial_tau": state_update["initial_tau"],
+                "budget_sampler_initial_metric_mean": state_update[
+                    "initial_metric_mean"
+                ],
+                "budget_sampler_probabilities_before": {
+                    f"r{int(round(ratio * 100)):03d}": float(value)
+                    for ratio, value in zip(
+                        curriculum_state.retention_ratios, probabilities_before
+                    )
+                },
+                "budget_sampler_probabilities_after": {
+                    f"r{int(round(ratio * 100)):03d}": float(value)
+                    for ratio, value in zip(
+                        curriculum_state.retention_ratios,
+                        state_update["probabilities_after"],
+                    )
+                },
+                "budget_sampler_initial_group_metric": state_update[
+                    "initial_group_metric"
+                ],
+                "budget_sampler_ema_group_metric": state_update[
+                    "ema_group_metric"
+                ],
+                "budget_sampler_calibration_counts": state_update[
+                    "calibration_counts"
+                ],
+                "budget_sampler_calibration_complete_at_trajectory": state_update[
+                    "calibration_complete_at_trajectory"
+                ],
+                "budget_sampler_updates": int(state_update["updates"]),
+                "budget_sampler_trajectories_seen": int(
+                    state_update["trajectories_seen"]
+                ),
+                "budget_sampler_loss_is_vanilla_mean": True,
+                "budget_sampler_state_update_scope": "synchronized_microbatch",
+            }
+        elif mode == "ratio_group_counterfactual_teachability_batch":
             if (
                 global_ratios is None
                 or global_projection_mass is None
                 or global_teacher_js_mass is None
+                or global_budget_js_mass is None
             ):
                 raise AssertionError(
                     "Ratio-group teachability requires synchronized ratios and geometry masses."
                 )
-            probability = ratio_group_fraction_probability_weights(
-                global_projection_mass,
-                global_teacher_js_mass,
-                global_ratios,
-                eps=eps,
-            )
+            group_transform, group_temperature = ratio_group_weight_transform(cfg)
+            group_statistic = ratio_group_statistic(cfg)
+            if group_statistic == "teacher_directed_projection_cosine":
+                if group_transform != "softmax" or group_temperature is None:
+                    raise ValueError("Ratio-group angle weighting requires softmax.")
+                probability = ratio_group_angle_probability_weights(
+                    global_projection_mass,
+                    global_teacher_js_mass,
+                    global_budget_js_mass,
+                    global_ratios,
+                    temperature=group_temperature,
+                    eps=eps,
+                )
+                weight_transform = "ratio_group_softmax_angle"
+            elif group_statistic == "teacher_directed_projection_cosine_sample_normalized":
+                if group_transform != "softmax" or group_temperature is None:
+                    raise ValueError(
+                        "Sample-normalized ratio-group angle weighting requires softmax."
+                    )
+                probability = ratio_group_angle_sample_probability_weights(
+                    global_projection_mass,
+                    global_teacher_js_mass,
+                    global_budget_js_mass,
+                    global_ratios,
+                    temperature=group_temperature,
+                    eps=eps,
+                )
+                weight_transform = "ratio_group_softmax_angle_sample_normalized"
+            elif group_statistic == "teacher_directed_projection_fraction_exact":
+                if group_transform != "softmax" or group_temperature is None:
+                    raise ValueError("Exact ratio-group projection weighting requires softmax.")
+                probability = ratio_group_projection_probability_weights(
+                    global_projection_mass,
+                    global_teacher_js_mass,
+                    global_ratios,
+                    temperature=group_temperature,
+                    eps=eps,
+                )
+                weight_transform = "ratio_group_softmax_projection_exact"
+            else:
+                probability = ratio_group_fraction_probability_weights(
+                    global_projection_mass,
+                    global_teacher_js_mass,
+                    global_ratios,
+                    transform=group_transform,
+                    temperature=group_temperature,
+                    eps=eps,
+                )
+                weight_transform = f"ratio_group_{group_transform}_projection"
             batch_tau: float | None = None
             group_signal = probability.group_signal
+            weight_temperature = group_temperature
+        elif mode == "trajectory_counterfactual_teachability_softmax_batch":
+            weight_temperature = float(
+                get_nested(cfg, "opsd.trajectory_weighting.temperature")
+            )
+            probability = softmax_trajectory_signal_probability_weights(
+                global_signals,
+                temperature=weight_temperature,
+            )
+            batch_tau = None
+            group_signal = global_signals
+            weight_transform = "trajectory_softmax_projection"
         elif mode == "jsd_over_current_kl_direct_inverse_batch":
             probability = direct_inverse_sensitivity_probability_weights(
                 global_signals, eps=eps
             )
             batch_tau = None
             group_signal = global_signals
+            weight_transform = "direct_inverse"
         elif mode == "jsd_over_current_kl_softmax_batch":
             probability = softmax_inverse_sensitivity_probability_weights(
                 global_signals,
@@ -3413,6 +5006,10 @@ def apply_distributed_trajectory_weighting(
             )
             batch_tau = None
             group_signal = global_signals
+            weight_transform = "softmax_negative_sensitivity"
+            weight_temperature = float(
+                get_nested(cfg, "opsd.trajectory_weighting.temperature")
+            )
         else:
             probability = inverse_sensitivity_probability_weights(global_signals, eps=eps)
             batch_tau = float(probability.tau.cpu())
@@ -3437,20 +5034,8 @@ def apply_distributed_trajectory_weighting(
             "trajectory_signal_mean": float(global_signals.mean().cpu()),
             "trajectory_signal_max": float(global_signals.max().cpu()),
             "trajectory_batch_tau": batch_tau,
-            "trajectory_weight_transform": (
-                "direct_inverse"
-                if mode == "jsd_over_current_kl_direct_inverse_batch"
-                else (
-                    "softmax_negative_sensitivity"
-                    if mode == "jsd_over_current_kl_softmax_batch"
-                    else "median_inverse"
-                )
-            ),
-            "trajectory_weight_temperature": (
-                float(get_nested(cfg, "opsd.trajectory_weighting.temperature"))
-                if mode == "jsd_over_current_kl_softmax_batch"
-                else None
-            ),
+            "trajectory_weight_transform": weight_transform,
+            "trajectory_weight_temperature": weight_temperature,
             "trajectory_ratio_group_signal": float(
                 group_signal[start:end].mean().cpu()
             ),
@@ -3471,9 +5056,20 @@ def apply_distributed_trajectory_weighting(
                 (global_weighted_kl / global_unweighted_kl.clamp_min(eps)).cpu()
             ),
             "trajectory_rank_block_size": int(global_losses.numel()),
-            "trajectory_normalization": "synchronized_probability_sum_one",
+            "trajectory_normalization": (
+                "fixed_global_calibration_no_batch_renormalization"
+                if mode == "global_calibrated_counterfactual_teachability_batch"
+                else "fixed_global_f_curriculum_no_batch_renormalization"
+                if mode == "global_f_intermediate_curriculum_batch"
+                else "synchronized_kl_mass_preserving"
+                if mode == "progress_adaptive_robust_frontier_batch"
+                else "vanilla_mean_after_adaptive_ratio_sampling"
+                if mode == "adaptive_budget_frontier_sampler_batch"
+                else "synchronized_probability_sum_one"
+            ),
             "trajectory_ddp_objective_scale": ddp_scale,
             "trajectory_weight_detached": not local_probability.requires_grad,
+            **curriculum_metrics,
         }
     if mode == "robustness_gated_curriculum":
         if curriculum_state is None or global_teacher_gaps is None:
@@ -3693,17 +5289,42 @@ def validate_paired_native_budget_config(
         raise ValueError("Paired native-budget training is implemented only for training.method=opsd_nogt.")
     if parameter_scope != "language_decoder_only":
         raise ValueError("Paired native-budget training requires LLM-only LoRA scope.")
-    if pruning_method != "visionzip":
-        raise ValueError("Native budget sensitivity requires the native VisionZip backend.")
+    if pruning_method not in {"visionzip", "random"}:
+        raise ValueError(
+            "Native budget sensitivity requires the native VisionZip or RandomPruner backend."
+        )
     if float(get_nested(cfg, "training.lora_dropout", -1.0)) != 0.0:
         raise ValueError("Paired native-budget training requires training.lora_dropout=0.")
-    if str(get_nested(cfg, "pruning.retention_ratio_schedule", "")).strip().lower() != "paired_deterministic_uniform":
+    ratio_schedule = str(
+        get_nested(cfg, "pruning.retention_ratio_schedule", "")
+    ).strip().lower()
+    trajectory_mode = str(
+        get_nested(cfg, "opsd.trajectory_weighting.mode", "")
+    ).strip().lower()
+    adaptive_sampler = (
+        trajectory_mode == "adaptive_budget_frontier_sampler_batch"
+        and ratio_schedule == "adaptive_budget_frontier"
+    )
+    if ratio_schedule != "paired_deterministic_uniform" and not adaptive_sampler:
         raise ValueError(
-            "Paired runs require pruning.retention_ratio_schedule=paired_deterministic_uniform."
+            "Paired runs require pruning.retention_ratio_schedule="
+            "paired_deterministic_uniform, except the explicit adaptive budget sampler."
         )
     ratios = [float(value) for value in get_nested(cfg, "pruning.train_retention_ratios", [])]
-    if ratios != [0.1, 0.2, 0.3, 0.4]:
+    allow_custom_ratios = bool(
+        get_nested(cfg, "paired_sampling.allow_custom_retention_ratios", False)
+    )
+    if ratios != [0.1, 0.2, 0.3, 0.4] and not allow_custom_ratios:
         raise ValueError(f"Paired runs require ratios [0.1, 0.2, 0.3, 0.4]; got {ratios}.")
+    if allow_custom_ratios and (
+        not ratios
+        or len(ratios) != len(set(ratios))
+        or any(not math.isfinite(ratio) or ratio <= 0.0 or ratio >= 1.0 for ratio in ratios)
+    ):
+        raise ValueError(
+            "Custom paired retention ratios must be unique finite values strictly between 0 and 1; "
+            f"got {ratios}."
+        )
     if int(get_nested(cfg, "training.max_sample_retries", 0) or 0) != 0:
         raise ValueError("Paired runs require max_sample_retries=0 so corresponding sample order cannot diverge.")
     if weighted:
@@ -3714,7 +5335,7 @@ def validate_paired_native_budget_config(
             delta = float(
                 get_nested(cfg, "opsd.native_budget_weighting.budget_delta", float("nan"))
             )
-            allowed_deltas = (0.03, 0.05, 0.10)
+            allowed_deltas = (0.02, 0.03, 0.05, 0.075, 0.10)
             if not any(
                 math.isclose(delta, allowed, rel_tol=0.0, abs_tol=1e-12)
                 for allowed in allowed_deltas
@@ -3745,6 +5366,9 @@ def validate_paired_native_budget_config(
             "trajectory_probe",
             "symmetric_teacher_gap_stability",
             "inverse_student_gap",
+            "max_kl_fraction_inverse_jsd",
+            "max_kl_fraction_softmax_inverse_jsd",
+            "max_kl_fraction_softmax_inverse_jsd_group_balanced",
             "teacher_gap_persistence",
             "counterfactual_rescue_amplification",
             "native_budget_rescue_grouped",
@@ -3763,12 +5387,105 @@ def validate_paired_native_budget_config(
             "budget_counterfactual_teachability",
             "budget_contrastive_target",
             "dual_budget_decomposition",
+            "token_projection_fraction_top20",
+            "token_projection_fraction_bottom80",
+            TOKEN_RANDOM_DROP_MODE,
+            TOKEN_PROJECTION_MASS_GROUPED_MODE,
         }
         if weighting_mode not in allowed_modes:
             raise ValueError(
                 f"Native budget weighting mode must be one of {sorted(allowed_modes)}; "
                 f"got {weighting_mode!r}."
             )
+        if weighting_mode in {
+            "max_kl_fraction_inverse_jsd",
+            "max_kl_fraction_softmax_inverse_jsd",
+            "max_kl_fraction_softmax_inverse_jsd_group_balanced",
+        }:
+            max_kl_fraction = float(
+                get_nested(
+                    cfg,
+                    "opsd.native_budget_weighting.max_kl_fraction",
+                    float("nan"),
+                )
+            )
+            if not math.isfinite(max_kl_fraction) or not 0.0 < max_kl_fraction < 1.0:
+                raise ValueError(
+                    "Max-KL-fraction JSD weighting requires max_kl_fraction in (0, 1)."
+                )
+        if weighting_mode in {*TOKEN_PROJECTION_PARTITION_MODES, TOKEN_RANDOM_DROP_MODE}:
+            top_fraction = float(
+                get_nested(
+                    cfg,
+                    "opsd.native_budget_weighting.top_fraction",
+                    float("nan"),
+                )
+            )
+            min_teacher_kl = float(
+                get_nested(
+                    cfg,
+                    "opsd.native_budget_weighting.min_teacher_kl",
+                    float("nan"),
+                )
+            )
+            if not math.isfinite(top_fraction) or not 0.0 < top_fraction < 1.0:
+                raise ValueError("Token projection partition requires top_fraction in (0, 1).")
+            if not math.isfinite(min_teacher_kl) or min_teacher_kl < 0.0:
+                raise ValueError(
+                    "Token projection partition requires finite nonnegative min_teacher_kl."
+                )
+        if weighting_mode == TOKEN_PROJECTION_MASS_GROUPED_MODE:
+            top_fraction = float(
+                get_nested(
+                    cfg,
+                    "opsd.native_budget_weighting.top_fraction",
+                    float("nan"),
+                )
+            )
+            high_group_lambda = float(
+                get_nested(
+                    cfg,
+                    "opsd.native_budget_weighting.high_group_lambda",
+                    float("nan"),
+                )
+            )
+            if not math.isfinite(top_fraction) or not 0.0 < top_fraction < 1.0:
+                raise ValueError("Projection-mass grouping requires top_fraction in (0, 1).")
+            if not math.isfinite(high_group_lambda) or not 0.0 < high_group_lambda < 1.0:
+                raise ValueError(
+                    "Projection-mass grouping requires high_group_lambda in (0, 1)."
+                )
+        if weighting_mode in {
+            "max_kl_fraction_softmax_inverse_jsd",
+            "max_kl_fraction_softmax_inverse_jsd_group_balanced",
+        }:
+            softmax_temperature = float(
+                get_nested(
+                    cfg,
+                    "opsd.native_budget_weighting.softmax_temperature",
+                    float("nan"),
+                )
+            )
+            if not math.isfinite(softmax_temperature) or softmax_temperature <= 0.0:
+                raise ValueError(
+                    "Softmax max-KL-fraction JSD weighting requires a positive finite "
+                    "softmax_temperature."
+                )
+        if weighting_mode == "max_kl_fraction_softmax_inverse_jsd_group_balanced":
+            high_group_coefficient = float(
+                get_nested(
+                    cfg,
+                    "opsd.native_budget_weighting.high_group_coefficient",
+                    float("nan"),
+                )
+            )
+            if (
+                not math.isfinite(high_group_coefficient)
+                or not 0.0 < high_group_coefficient < 1.0
+            ):
+                raise ValueError(
+                    "Group-balanced max-KL weighting requires high_group_coefficient in (0, 1)."
+                )
         trajectory_enabled = bool(get_nested(cfg, "opsd.trajectory_weighting.enabled", False))
         if trajectory_enabled:
             if weighting_mode != "trajectory_probe":
@@ -3793,6 +5510,13 @@ def validate_paired_native_budget_config(
                 "jsd_over_current_kl_softmax_batch",
                 "jsd_over_step0_kl_batch",
                 "ratio_group_counterfactual_teachability_batch",
+                "global_calibrated_counterfactual_teachability_batch",
+                "trajectory_counterfactual_teachability_softmax_batch",
+                "trajectory_projection_fraction_top20_batch",
+                "trajectory_projection_fraction_bottom80_batch",
+                "global_f_intermediate_curriculum_batch",
+                "progress_adaptive_robust_frontier_batch",
+                "adaptive_budget_frontier_sampler_batch",
             }:
                 raise ValueError(f"Unsupported trajectory weighting mode: {trajectory_mode!r}.")
             if trajectory_mode == "jsd_over_step0_kl_batch":
@@ -3820,7 +5544,190 @@ def validate_paired_native_budget_config(
                     raise ValueError(
                         "jsd_over_current_kl_softmax_batch requires a finite positive temperature."
                     )
-            if trajectory_mode in EFFECTIVE_BATCH_PROBABILITY_MODES:
+            if trajectory_mode == "ratio_group_counterfactual_teachability_batch":
+                ratio_group_weight_transform(cfg)
+                statistic = ratio_group_statistic(cfg)
+                if (
+                    statistic
+                    in {
+                        "teacher_directed_projection_cosine",
+                        "teacher_directed_projection_cosine_sample_normalized",
+                    }
+                    and str(
+                        get_nested(
+                            cfg,
+                            "opsd.trajectory_weighting.group_transform",
+                            "linear",
+                        )
+                    ).strip().lower()
+                    != "softmax"
+                ):
+                    raise ValueError(
+                        "Ratio-group cosine statistics require group_transform=softmax."
+                    )
+            if trajectory_mode == "trajectory_counterfactual_teachability_softmax_batch":
+                temperature = float(
+                    get_nested(cfg, "opsd.trajectory_weighting.temperature", float("nan"))
+                )
+                if not math.isfinite(temperature) or temperature <= 0.0:
+                    raise ValueError(
+                        "trajectory_counterfactual_teachability_softmax_batch requires "
+                        "a finite positive temperature."
+                    )
+            if trajectory_mode == "global_calibrated_counterfactual_teachability_batch":
+                global_trajectory_calibration(cfg)
+                normalization = str(
+                    get_nested(cfg, "opsd.trajectory_weighting.normalization", "")
+                ).strip().lower()
+                normalization_scope = str(
+                    get_nested(
+                        cfg,
+                        "opsd.trajectory_weighting.normalization_scope",
+                        "",
+                    )
+                ).strip().lower()
+                if normalization != "fixed_global_centered_scale":
+                    raise ValueError(
+                        "Global F weighting requires normalization=fixed_global_centered_scale."
+                    )
+                if normalization_scope != "frozen_training_calibration":
+                    raise ValueError(
+                        "Global F weighting requires "
+                        "normalization_scope=frozen_training_calibration."
+                    )
+            if trajectory_mode in {
+                "trajectory_projection_fraction_top20_batch",
+                "trajectory_projection_fraction_bottom80_batch",
+            }:
+                top_fraction = float(
+                    get_nested(
+                        cfg,
+                        "opsd.trajectory_weighting.top_fraction",
+                        float("nan"),
+                    )
+                )
+                if not math.isfinite(top_fraction) or not 0.0 < top_fraction < 1.0:
+                    raise ValueError(
+                        "Trajectory projection partition requires top_fraction in (0, 1)."
+                    )
+            if trajectory_mode == "global_f_intermediate_curriculum_batch":
+                gamma = float(
+                    get_nested(cfg, "opsd.trajectory_weighting.gamma", float("nan"))
+                )
+                if not math.isfinite(gamma) or gamma <= 0.0:
+                    raise ValueError(
+                        "Global F intermediate curriculum requires finite positive gamma."
+                    )
+                normalization = str(
+                    get_nested(cfg, "opsd.trajectory_weighting.normalization", "")
+                ).strip().lower()
+                normalization_scope = str(
+                    get_nested(cfg, "opsd.trajectory_weighting.normalization_scope", "")
+                ).strip().lower()
+                if normalization != "fixed_global_gate_no_batch_renormalization":
+                    raise ValueError(
+                        "Global F intermediate curriculum requires "
+                        "normalization=fixed_global_gate_no_batch_renormalization."
+                    )
+                if normalization_scope != "global_formula":
+                    raise ValueError(
+                        "Global F intermediate curriculum requires "
+                        "normalization_scope=global_formula."
+                    )
+            if trajectory_mode == "progress_adaptive_robust_frontier_batch":
+                calibration = get_nested(
+                    cfg, "opsd.trajectory_weighting.calibration", None
+                )
+                if not isinstance(calibration, dict):
+                    raise ValueError(
+                        "progress_adaptive_robust_frontier_batch requires a frozen "
+                        "calibration mapping."
+                    )
+                for key in ("initial_tau", "initial_robust_need_mean"):
+                    value = float(calibration.get(key, float("nan")))
+                    if not math.isfinite(value) or value <= 0.0:
+                        raise ValueError(
+                            f"Progress-adaptive frontier calibration {key} must be "
+                            f"finite and positive; got {value}."
+                        )
+                half_life = float(
+                    get_nested(
+                        cfg,
+                        "opsd.trajectory_weighting.ema_half_life_trajectories",
+                        256.0,
+                    )
+                )
+                if not math.isfinite(half_life) or half_life <= 0.0:
+                    raise ValueError(
+                        "Progress-adaptive frontier EMA half-life must be finite and positive."
+                    )
+                normalization = str(
+                    get_nested(cfg, "opsd.trajectory_weighting.normalization", "")
+                ).strip().lower()
+                if normalization != "kl_mass_preserving":
+                    raise ValueError(
+                        "Progress-adaptive frontier requires normalization=kl_mass_preserving."
+                    )
+            elif trajectory_mode == "adaptive_budget_frontier_sampler_batch":
+                if ratio_schedule != "adaptive_budget_frontier":
+                    raise ValueError(
+                        "Adaptive budget sampling requires "
+                        "pruning.retention_ratio_schedule=adaptive_budget_frontier."
+                    )
+                sampler_metric = str(
+                    get_nested(
+                        cfg,
+                        "opsd.trajectory_weighting.sampler_metric",
+                        "robust_need",
+                    )
+                ).strip().lower()
+                if sampler_metric not in {"robust_need", "teacher_kl"}:
+                    raise ValueError(
+                        "Adaptive budget sampler_metric must be robust_need or teacher_kl."
+                    )
+                if int(
+                    get_nested(
+                        cfg,
+                        "opsd.trajectory_weighting.calibration_target_per_ratio",
+                        64,
+                    )
+                ) <= 0:
+                    raise ValueError(
+                        "Adaptive budget calibration target must be positive."
+                    )
+                half_life = float(
+                    get_nested(
+                        cfg,
+                        "opsd.trajectory_weighting.ema_half_life_per_ratio",
+                        64.0,
+                    )
+                )
+                if not math.isfinite(half_life) or half_life <= 0.0:
+                    raise ValueError(
+                        "Adaptive budget EMA half-life must be finite and positive."
+                    )
+                normalization = str(
+                    get_nested(cfg, "opsd.trajectory_weighting.normalization", "")
+                ).strip().lower()
+                normalization_scope = str(
+                    get_nested(
+                        cfg,
+                        "opsd.trajectory_weighting.normalization_scope",
+                        "",
+                    )
+                ).strip().lower()
+                if normalization != "probability_sum_one":
+                    raise ValueError(
+                        "Adaptive budget sampling requires normalization=probability_sum_one."
+                    )
+                if normalization_scope != "effective_batch":
+                    raise ValueError(
+                        "Adaptive budget sampling requires normalization_scope=effective_batch."
+                    )
+            elif (
+                trajectory_mode in EFFECTIVE_BATCH_PROBABILITY_MODES
+                and trajectory_mode not in DIRECT_GLOBAL_F_MODES
+            ):
                 normalization = str(
                     get_nested(cfg, "opsd.trajectory_weighting.normalization", "")
                 ).strip().lower()
@@ -4195,7 +6102,13 @@ def distributed_barrier(distributed: bool) -> None:
 def capture_rank_rng_state(
     ratio_rng: random.Random,
     global_step: int,
-    curriculum_state: RobustnessGatedCurriculumState | SensitivityFrontierState | None = None,
+    curriculum_state: (
+        AdaptiveBudgetFrontierState
+        | ProgressAdaptiveFrontierState
+        | RobustnessGatedCurriculumState
+        | SensitivityFrontierState
+        | None
+    ) = None,
 ) -> dict[str, Any]:
     state: dict[str, Any] = {
         "global_step": int(global_step),
@@ -4300,7 +6213,13 @@ def save_full_resumable_checkpoint(
     rank: int,
     world_size: int,
     distributed: bool,
-    curriculum_state: RobustnessGatedCurriculumState | SensitivityFrontierState | None = None,
+    curriculum_state: (
+        AdaptiveBudgetFrontierState
+        | ProgressAdaptiveFrontierState
+        | RobustnessGatedCurriculumState
+        | SensitivityFrontierState
+        | None
+    ) = None,
 ) -> Path:
     target = output_dir / "resume_checkpoints" / f"step_{int(global_step):06d}"
     temporary = target.with_name(f".{target.name}.tmp")
@@ -4375,6 +6294,69 @@ def train(cfg: dict[str, Any]) -> Path:
     prompt_mode = prompt_mode_from_config(cfg)
     if method not in METHODS:
         raise ValueError(f"Unknown method {method!r}.")
+    token_outlier_exclusion_enabled = bool(
+        get_nested(cfg, "opsd.token_outlier_exclusion.enabled", False)
+    )
+    if token_outlier_exclusion_enabled:
+        if method != "opsd_nogt":
+            raise ValueError("Token outlier exclusion is restricted to training.method=opsd_nogt.")
+        top_k = int(get_nested(cfg, "opsd.token_outlier_exclusion.top_k", 0) or 0)
+        top_k_by_ratio = get_nested(
+            cfg, "opsd.token_outlier_exclusion.top_k_by_ratio", None
+        )
+        if top_k_by_ratio is None and top_k <= 0:
+            raise ValueError(
+                "opsd.token_outlier_exclusion.top_k must be positive when exclusion is enabled."
+            )
+        if top_k_by_ratio is not None:
+            train_ratios = get_nested(cfg, "pruning.train_retention_ratios", [])
+            resolved_top_k = [
+                resolve_token_outlier_top_k(top_k, top_k_by_ratio, float(ratio))
+                for ratio in train_ratios
+            ]
+            if not resolved_top_k or not any(value > 0 for value in resolved_top_k):
+                raise ValueError(
+                    "Ratio-specific token outlier exclusion requires at least one positive top_k."
+                )
+        ranking_direction = str(
+            get_nested(
+                cfg,
+                "opsd.token_outlier_exclusion.ranking_kl_direction",
+                "teacher_to_student",
+            )
+        ).strip().lower()
+        if ranking_direction != "teacher_to_student":
+            raise ValueError(
+                "Token outlier exclusion must rank the same forward KL as OPSD and requires "
+                "ranking_kl_direction=teacher_to_student."
+            )
+        training_direction = str(
+            get_nested(
+                cfg,
+                "opsd.token_outlier_exclusion.training_kl_direction",
+                "teacher_to_student",
+            )
+        ).strip().lower()
+        if training_direction != "teacher_to_student":
+            raise ValueError(
+                "Token outlier exclusion preserves OPSD and requires "
+                "training_kl_direction=teacher_to_student."
+            )
+        kl_chunk_size = int(
+            get_nested(cfg, "opsd.token_outlier_exclusion.kl_chunk_size", 32)
+        )
+        if kl_chunk_size <= 0:
+            raise ValueError("opsd.token_outlier_exclusion.kl_chunk_size must be positive.")
+        if not bool(
+            get_nested(cfg, "opsd.token_outlier_exclusion.renormalize_remaining_mean", True)
+        ):
+            raise ValueError(
+                "Token outlier exclusion requires renormalize_remaining_mean=true to avoid loss-scale shrinkage."
+            )
+        if bool(get_nested(cfg, "opsd.native_budget_weighting.enabled", False)):
+            raise ValueError("Token outlier exclusion cannot be combined with native budget weighting.")
+        if bool(get_nested(cfg, "opsd.trajectory_weighting.enabled", False)):
+            raise ValueError("Token outlier exclusion cannot be combined with trajectory weighting.")
     validate_paired_native_budget_config(cfg, method, parameter_scope, pruning_method)
     validate_phase_ratio_scaling_config(
         get_nested(cfg, "opsd.phase_ratio_scaling", None),
@@ -4448,6 +6430,8 @@ def train(cfg: dict[str, Any]) -> Path:
     resume_checkpoint, resume_metadata = prepare_resume_config(cfg, output_dir)
     log_path = output_dir / "training_log.jsonl"
     student_text_log_path = output_dir / "student_text_outputs.jsonl"
+    ratio_group_monitor_log_path = output_dir / "ratio_group_weight_monitor.jsonl"
+    trajectory_weight_monitor_log_path = output_dir / "trajectory_weight_monitor.jsonl"
     max_steps = int(get_nested(cfg, "training.max_steps", 1000))
     start_step = int(get_nested(cfg, "training.start_step", 0) or 0)
     stop_at_step = int(get_nested(cfg, "checkpointing.stop_at_step", max_steps) or max_steps)
@@ -4462,11 +6446,18 @@ def train(cfg: dict[str, Any]) -> Path:
         log_path.unlink()
     if is_main_process(rank) and student_text_log_path.exists() and start_step == 0:
         student_text_log_path.unlink()
+    if is_main_process(rank) and ratio_group_monitor_log_path.exists() and start_step == 0:
+        ratio_group_monitor_log_path.unlink()
+    if is_main_process(rank) and trajectory_weight_monitor_log_path.exists() and start_step == 0:
+        trajectory_weight_monitor_log_path.unlink()
     native_rank_log_path = output_dir / f"rank{rank}_native_budget_metrics.jsonl"
+    outlier_rank_log_path = output_dir / f"rank{rank}_token_outlier_metrics.jsonl"
     paired_rank_log_path = output_dir / f"rank{rank}_paired_sampling.jsonl"
     assignment_rank_log_path = output_dir / f"rank{rank}_sample_assignments.jsonl"
     if start_step == 0 and native_rank_log_path.exists():
         native_rank_log_path.unlink()
+    if start_step == 0 and outlier_rank_log_path.exists():
+        outlier_rank_log_path.unlink()
     if start_step == 0 and paired_rank_log_path.exists():
         paired_rank_log_path.unlink()
     if start_step == 0 and assignment_rank_log_path.exists():
@@ -4475,7 +6466,9 @@ def train(cfg: dict[str, Any]) -> Path:
         if is_main_process(rank):
             trim_jsonl_to_step(log_path, start_step)
             trim_jsonl_to_step(student_text_log_path, start_step)
+            trim_jsonl_to_step(ratio_group_monitor_log_path, start_step)
         trim_jsonl_to_step(native_rank_log_path, start_step)
+        trim_jsonl_to_step(outlier_rank_log_path, start_step)
         trim_jsonl_to_step(paired_rank_log_path, start_step)
         trim_jsonl_to_step(assignment_rank_log_path, start_step)
         distributed_barrier(distributed)
@@ -4540,9 +6533,12 @@ def train(cfg: dict[str, Any]) -> Path:
             layers_pattern=get_nested(cfg, "training.lora_layers_pattern", None),
         )
     visual_checkpoint_input_module = ""
-    if method == "epic_official" and bool(get_nested(cfg, "training.gradient_checkpointing", False)):
+    gradient_checkpointing_enabled = bool(
+        get_nested(cfg, "training.gradient_checkpointing", False)
+    )
+    if gradient_checkpointing_enabled:
         if not hasattr(model, "gradient_checkpointing_enable"):
-            raise RuntimeError("Loaded Qwen model does not support required gradient checkpointing.")
+            raise RuntimeError("Loaded Qwen model does not support requested gradient checkpointing.")
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={
                 "use_reentrant": bool(get_nested(cfg, "training.gradient_checkpointing_use_reentrant", False))
@@ -4643,6 +6639,12 @@ def train(cfg: dict[str, Any]) -> Path:
             f"opsd_ema_lazy_init={ema_settings.get('lazy_init', '')}\n"
             f"opsd_ema_parameter_count={len(ema_parameter_names)}\n"
             f"opsd_ema_shadow={ema_shadow is not None}\n"
+            f"opsd_token_outlier_exclusion={token_outlier_exclusion_enabled}\n"
+            f"opsd_token_outlier_top_k={get_nested(cfg, 'opsd.token_outlier_exclusion.top_k', 0)}\n"
+            f"opsd_token_outlier_top_k_by_ratio={get_nested(cfg, 'opsd.token_outlier_exclusion.top_k_by_ratio', None)}\n"
+            f"opsd_token_outlier_ranking_kl_direction={get_nested(cfg, 'opsd.token_outlier_exclusion.ranking_kl_direction', '')}\n"
+            f"gradient_checkpointing={gradient_checkpointing_enabled}\n"
+            f"gradient_checkpointing_use_reentrant={get_nested(cfg, 'training.gradient_checkpointing_use_reentrant', '') if gradient_checkpointing_enabled else ''}\n"
             f"epic_upstream_repository={EPIC_UPSTREAM_REPOSITORY if method == 'epic_official' else ''}\n"
             f"epic_upstream_commit={EPIC_UPSTREAM_COMMIT if method == 'epic_official' else ''}\n"
             f"epic_upstream_trainer_sha256={EPIC_UPSTREAM_TRAINER_SHA256 if method == 'epic_official' else ''}\n"
@@ -4692,6 +6694,13 @@ def train(cfg: dict[str, Any]) -> Path:
     global_step_unit = world_size * micro_batch_size if distributed else micro_batch_size
     effective_batch_size = global_step_unit * grad_accum
     probability_mode = trajectory_probability_mode(cfg)
+    trajectory_mode = str(
+        get_nested(cfg, "opsd.trajectory_weighting.mode", "")
+    ).strip().lower()
+    adaptive_sampler_online = (
+        bool(get_nested(cfg, "opsd.trajectory_weighting.enabled", False))
+        and trajectory_mode == "adaptive_budget_frontier_sampler_batch"
+    )
     probability_scope = str(
         get_nested(cfg, "opsd.trajectory_weighting.normalization_scope", "synchronized_block")
     ).strip().lower()
@@ -4843,17 +6852,55 @@ def train(cfg: dict[str, Any]) -> Path:
                             distributed=distributed,
                             rank=rank,
                             world_size=world_size,
+                            curriculum_state=curriculum_state,
                         )
                     )
                     if len(effective_batch_window) != grad_accum:
                         raise AssertionError("Effective-batch probe window has the wrong local size.")
-                    if not math.isclose(
+                    if probability_mode == "progress_adaptive_robust_frontier_batch":
+                        if not math.isclose(
+                            float(
+                                effective_batch_summary[
+                                    "trajectory_global_weighted_kl"
+                                ]
+                            ),
+                            float(
+                                effective_batch_summary[
+                                    "trajectory_global_unweighted_kl"
+                                ]
+                            ),
+                            rel_tol=2e-6,
+                            abs_tol=2e-7,
+                        ):
+                            raise AssertionError(
+                                "Progress-adaptive frontier did not preserve effective-batch KL mass."
+                            )
+                    elif (
+                        probability_mode not in DIRECT_GLOBAL_F_MODES
+                        and not math.isclose(
                         float(effective_batch_summary["trajectory_probability_weight_sum"]),
                         1.0,
                         rel_tol=0.0,
                         abs_tol=1e-6,
+                        )
                     ):
                         raise AssertionError("Effective-batch trajectory weights do not sum to one.")
+                    elif probability_mode in DIRECT_GLOBAL_F_MODES and (
+                        not math.isfinite(
+                            float(
+                                effective_batch_summary[
+                                    "trajectory_probability_weight_sum"
+                                ]
+                            )
+                        )
+                        or float(
+                            effective_batch_summary["trajectory_probability_weight_sum"]
+                        )
+                        < 0.0
+                    ):
+                        raise AssertionError(
+                            "Direct global trajectory objective has invalid detached weight mass."
+                        )
                     if is_main_process(rank):
                         probe_log = dict(effective_batch_summary)
                         probe_log.update(
@@ -4870,6 +6917,73 @@ def train(cfg: dict[str, Any]) -> Path:
                             output_dir / "effective_batch_probe_metrics.jsonl",
                             probe_log,
                         )
+                        if probability_mode in COUNTERFACTUAL_TEACHABILITY_MODES:
+                            monitor_row = {
+                                key: value
+                                for key, value in probe_log.items()
+                                if key != "global_records"
+                            }
+                            monitor_row["sample_weights"] = [
+                                {
+                                    "global_index": int(record["global_index"]),
+                                    "sample_id": str(record["sample_id"]),
+                                    "ratio": float(record["ratio"]),
+                                    "sampled_b_plus": float(record["sampled_b_plus"]),
+                                    "ratio_group_signal": float(
+                                        record["ratio_group_signal"]
+                                    ),
+                                    "weight_signal": float(record["weight_signal"]),
+                                    "probability_weight": float(
+                                        record["probability_weight"]
+                                    ),
+                                    "effective_multiplier": float(
+                                        record["probability_weight"]
+                                    )
+                                    * int(
+                                        monitor_row["trajectory_effective_batch_size"]
+                                    ),
+                                    "unweighted_kl": float(record["probe_loss"]),
+                                }
+                                for record in probe_log["global_records"]
+                            ]
+                            monitor_row["step"] = int(
+                                monitor_row["optimizer_batch_end_step"]
+                            )
+                            write_jsonl(
+                                ratio_group_monitor_log_path
+                                if probability_mode
+                                == "ratio_group_counterfactual_teachability_batch"
+                                else trajectory_weight_monitor_log_path,
+                                monitor_row,
+                            )
+                            groups = monitor_row.get("trajectory_ratio_groups", {})
+                            direct_mode = (
+                                probability_mode
+                                == "trajectory_counterfactual_teachability_softmax_batch"
+                            )
+                            angle_mode = monitor_row.get(
+                                "trajectory_weight_transform"
+                            ) in {
+                                "ratio_group_softmax_angle",
+                                "ratio_group_softmax_angle_sample_normalized",
+                            }
+                            compact = " ".join(
+                                f"{name}:n={stats['count']},"
+                                f"{'r' if direct_mode else 'cos' if angle_mode else 'g'}="
+                                f"{stats['trajectory_signal_mean'] if direct_mode else stats['projection_cosine'] if angle_mode else stats['projection_fraction']:.4f},"
+                                f"w={stats['mean_multiplier']:.3f},kl={stats['unweighted_kl_mean']:.5f}"
+                                for name, stats in sorted(groups.items())
+                            )
+                            print(
+                                "[trajectory-monitor] "
+                                f"samples={monitor_row['optimizer_batch_start_step']}:"
+                                f"{monitor_row['optimizer_batch_end_step']} "
+                                f"ess={monitor_row['trajectory_effective_sample_size']:.2f}/"
+                                f"{monitor_row['trajectory_effective_batch_size']} "
+                                f"loss_scale={monitor_row['trajectory_loss_scale_ratio']:.4f} "
+                                f"{compact}",
+                                flush=True,
+                            )
                 batch_losses: list[torch.Tensor] = []
                 batch_metrics: list[dict[str, Any]] = []
                 batch_samples: list[FormattedAOKVQASample] = []
@@ -4896,6 +7010,31 @@ def train(cfg: dict[str, Any]) -> Path:
                                 total_optimizer_steps=official_epic_total_optimizer_steps,
                             )
                             ratio = official_epic_sample.student_retention_ratio
+                        elif effective_batch_probability_weighting:
+                            effective_assignment = effective_batch_window[accum]
+                            if int(effective_assignment["global_index"]) != int(
+                                global_index
+                            ):
+                                raise AssertionError(
+                                    "Adaptive probe/replay global index mismatch."
+                                )
+                            if str(effective_assignment["sample_id"]) != str(
+                                sample.sample_id
+                            ):
+                                raise AssertionError(
+                                    "Adaptive probe/replay sample mismatch."
+                                )
+                            ratio = float(effective_assignment["ratio"])
+                        elif adaptive_sampler_online:
+                            if not isinstance(
+                                curriculum_state, AdaptiveBudgetFrontierState
+                            ):
+                                raise AssertionError(
+                                    "Adaptive budget sampler state is unavailable."
+                                )
+                            ratio = curriculum_state.select_ratio(
+                                global_index, sample.sample_id
+                            )
                         else:
                             ratio = sample_retention_ratio(
                                 cfg,
@@ -5031,6 +7170,16 @@ def train(cfg: dict[str, Any]) -> Path:
                                             "sampled_b_plus": float(
                                                 effective_record["sampled_b_plus"]
                                             ),
+                                            "native_b_plus_num_kept_visual_tokens": int(
+                                                effective_record["b_plus_visual_tokens"]
+                                            ),
+                                            "native_b_plus_random_mask_hash": effective_record.get(
+                                                "b_plus_random_mask_hash"
+                                            ),
+                                            "native_random_b_subset_b_plus": effective_record.get(
+                                                "random_b_subset_b_plus"
+                                            ),
+                                            "effective_batch_probe_native_budget_weighting_enabled": True,
                                             "effective_batch_sensitivity": float(
                                                 effective_record["signal"]
                                             ),
@@ -5044,17 +7193,19 @@ def train(cfg: dict[str, Any]) -> Path:
                                             "effective_batch_fixed_prefix_replay": True,
                                         }
                                     )
-                                    if (
-                                        probability_mode
-                                        == "ratio_group_counterfactual_teachability_batch"
-                                    ):
+                                    if probability_mode in COUNTERFACTUAL_TEACHABILITY_MODES:
                                         sample_metrics.update(
                                             {
                                                 "native_trajectory_budget_explained_fraction": float(
-                                                    effective_record["signal"]
+                                                    effective_record[
+                                                        "budget_explained_fraction"
+                                                    ]
                                                 ),
                                                 "effective_batch_ratio_group_signal": float(
                                                     effective_record["ratio_group_signal"]
+                                                ),
+                                                "effective_batch_weight_signal": float(
+                                                    effective_record["weight_signal"]
                                                 ),
                                                 "native_trajectory_budget_projection_mass": float(
                                                     effective_record["projection_mass"]
@@ -5064,6 +7215,13 @@ def train(cfg: dict[str, Any]) -> Path:
                                                 ),
                                             }
                                         )
+                                        if (
+                                            probability_mode
+                                            == "progress_adaptive_robust_frontier_batch"
+                                        ):
+                                            sample_metrics[
+                                                "derived_progress_adaptive_robust_need"
+                                            ] = float(effective_record["signal"])
                             elif method == "offpolicy":
                                 sample_loss, sample_metrics = offpolicy_step(model, processor, sample, cfg, ratio)
                             else:
@@ -5143,7 +7301,7 @@ def train(cfg: dict[str, Any]) -> Path:
                     summary_metrics = {
                         key: value
                         for key, value in effective_batch_summary.items()
-                        if key != "global_records"
+                        if key not in {"global_records", "trajectory_ratio_groups"}
                     }
                     trajectory_metrics = {
                         "trajectory_weighting_enabled": True,
@@ -5299,6 +7457,8 @@ def train(cfg: dict[str, Any]) -> Path:
                         save_checkpoint(model, output_dir / f"step_{global_step}", ema_shadow=ema_shadow)
                 if bool(get_nested(cfg, "opsd.native_budget_weighting.enabled", False)):
                     write_jsonl(output_dir / f"rank{rank}_native_budget_metrics.jsonl", row)
+                if bool(get_nested(cfg, "opsd.token_outlier_exclusion.enabled", False)):
+                    write_jsonl(outlier_rank_log_path, row)
                 if bool(get_nested(cfg, "opsd.phase_ratio_scaling.enabled", False)):
                     write_jsonl(output_dir / f"rank{rank}_phase_ratio_scaling.jsonl", row)
                 if bool(get_nested(cfg, "paired_sampling.enabled", False)):

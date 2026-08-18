@@ -14,11 +14,12 @@ from PIL import Image
 
 from .prompting import (
     FormattedAOKVQASample,
-    THINKING_INSTRUCTION,
     build_reasoning_prompt,
     build_target,
+    convert_target_reasoning_tags,
     is_thinking_prompt_mode,
     option_index_to_letter,
+    reasoning_instruction,
     strip_image_tokens,
 )
 
@@ -120,7 +121,7 @@ def _extract_optional_correct_letter(answer: str) -> str:
 def _generic_prompt(question: str, prompt_mode: str | bool | None = None) -> str:
     question = strip_image_tokens(question)
     if is_thinking_prompt_mode(prompt_mode):
-        return f"<image>\n\n{question}\n\n{THINKING_INSTRUCTION}"
+        return f"<image>\n\n{question}\n\n{reasoning_instruction(prompt_mode)}"
     return f"<image>\n\n{question}"
 
 
@@ -136,6 +137,7 @@ def normalize_reasoning_answer_jsonl_sample(
     target = str(_first_present(raw, ("answer", "ground_truth", "target", "processed_target"), "") or "").strip()
     if not target:
         raise ValueError(f"JSONL sample is missing a non-empty answer/target field: keys={sorted(raw)}")
+    target = convert_target_reasoning_tags(target, prompt_mode=prompt_mode)
     sample_id = str(_first_present(raw, ("sample_id", "id", "question_id"), index))
     correct_letter = _extract_optional_correct_letter(target)
     correct_index = ord(correct_letter) - ord("A") if correct_letter else -1

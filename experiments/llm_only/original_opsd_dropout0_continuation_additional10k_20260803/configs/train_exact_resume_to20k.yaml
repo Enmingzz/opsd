@@ -1,0 +1,154 @@
+base_model: Qwen/Qwen2.5-VL-7B-Instruct
+
+experiment:
+  name: original_opsd_dropout0_exact_resume_to20k
+  family: native_budget_weighting_pair
+  comparison_id: native_budget_weighting_dropout0_pair_20260730
+  objective: original_opsd_forward_kl
+  parameter_scope: language_decoder_only
+  vision_encoder_lora: false
+  init_model: Qwen/Qwen2.5-VL-7B-Instruct
+  legacy_adapter_initialization_allowed: false
+  output_root: /scratch/enmingzz/outputs/llm_only
+  dataset_tag: openmmreasoner_llava_cot_ordered20k_decontam_v1_seed42
+  clean_env_alignment: armen51682_vlmevalkit_transformers
+  excluded_from_legacy_main_table: true
+
+dataset:
+  name: /project/6101803/enmingzz/opsd/data/openmmreasoner_llava_cot_train20k_ordered_decontam_v1_seed42/train20k_exact_resume_order_qwentok512_imgtok1152_seed42.jsonl
+  decontamination_manifest: /project/6101803/enmingzz/opsd/data/openmmreasoner_llava_cot_train20k_ordered_decontam_v1_seed42/train20k_exact_resume_training_manifest.json
+  expected_rows: 20000
+  shuffle: false
+  use_splits:
+    - train
+  image_root: /scratch/enmingzz/openmmreasoner_llava_cot_image_root
+  limit: 0
+  min_pixels: 846720
+  max_pixels: 846720
+
+prompt:
+  enable_thinking: true
+
+training:
+  method: opsd_nogt
+  max_steps: 20000
+  start_step: 0
+  seed: 42
+  bf16: true
+  attn_implementation: flash_attention_2
+  device_map: auto
+  use_lora: true
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.0
+  lora_layers_to_transform:
+    - 0
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+    - 9
+    - 10
+    - 11
+    - 12
+    - 13
+    - 14
+    - 15
+    - 16
+    - 17
+    - 18
+    - 19
+    - 20
+    - 21
+    - 22
+    - 23
+    - 24
+    - 25
+    - 26
+    - 27
+  lora_layers_pattern: layers
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  expected_trainable_tensors: 392
+  expected_trainable_parameters: 40370176
+  learning_rate: 2.0e-5
+  weight_decay: 0.0
+  save_every: 0
+  gradient_accumulation_steps: 8
+  micro_batch_size: 1
+  max_sample_retries: 0
+
+generation:
+  max_new_tokens: 512
+  max_unparseable_new_tokens: 0
+  stop_on_parse: false
+  temperature: 0.0
+  top_p: 0.9
+  top_k: 0
+  manual_pruned_generate: false
+  require_kv_cache: true
+
+pruning:
+  method: visionzip
+  retention_ratio_schedule: paired_deterministic_uniform
+  train_retention_ratios:
+    - 0.1
+    - 0.2
+    - 0.3
+    - 0.4
+  allow_embedding_fallback: false
+
+paired_sampling:
+  enabled: true
+  namespace: native_budget_weighting_dropout0_pair_20260730_v1
+  ratio_seed: 42
+  rollout_seed: 42
+
+opsd:
+  teacher_strategy: ema
+  use_ema_teacher: true
+  ema_decay: 0.9999
+  ema_lazy_init: true
+  teacher_ground_truth_access: false
+  temperature: 1.0
+  native_budget_weighting:
+    enabled: false
+    budget_delta: 0.05
+    sensitivity_temperature: 1.0
+    kl_chunk_size: 32
+    eps: 1.0e-8
+
+checkpointing:
+  enabled: true
+  eval_snapshot_every: 256
+  resumable_every: 1024
+  save_step_zero: true
+  save_final_full: true
+  resume_from: /scratch/enmingzz/outputs/llm_only/original_opsd_dropout0_exact_resume_to20k_20260803/run/resume_checkpoints/step_009984
+  resume_mode: state_preserving_ordered_data_extension
+  resume_fork:
+    parent_checkpoint: /scratch/enmingzz/outputs/llm_only/native_budget_weighting_dropout0_pair_20260730/original_opsd_dropout0/resume_checkpoints/step_009984
+    parent_dataset: /project/6101803/enmingzz/opsd/data/openmmreasoner_llava_cot_train10k_decontam_v1_seed42/train10k_decontam_qwentok512_imgtok1152_seed42.jsonl
+    parent_dataset_rows: 10000
+    parent_dataset_sha256: f37ecfdd09e3188142e67954bd15933d2debf1ddc375dde17eca6ec3730a7280
+    combined_dataset_rows: 20000
+    combined_dataset_sha256: 9f1cf9dfbff291ee0ce7f34a236820c7da907f096bdb54ec0165eed845f3516f
+    ordering_manifest: /project/6101803/enmingzz/opsd/data/openmmreasoner_llava_cot_train20k_ordered_decontam_v1_seed42/train20k_exact_resume_order_manifest.json
+    additional_dataset: /project/6101803/enmingzz/opsd/data/openmmreasoner_llava_cot_train20k_ordered_decontam_v1_seed42/additional10k_decontam_qwentok512_imgtok1152_seed42.jsonl
+    additional_dataset_sha256: 9234f620b9475afde42d6fe827bd511cc400af46a70ab9941ca23e1351c7fdeb
+    resume_global_step: 9984
+    first_unconsumed_dataset_index: 9984
+    inherit_optimizer: true
+    inherit_rank_rng: true
+    inherit_ema: true
+    copy_parent_logs: true

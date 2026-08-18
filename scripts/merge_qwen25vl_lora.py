@@ -28,6 +28,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attn_implementation", default="flash_attention_2")
     parser.add_argument("--device_map", default="auto")
     parser.add_argument("--bf16", action="store_true", default=True)
+    parser.add_argument(
+        "--safe_merge",
+        action="store_true",
+        help="Use PEFT's checked dtype-preserving LoRA merge path.",
+    )
     parser.add_argument("--note", default="")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -64,7 +69,7 @@ def main() -> int:
     from peft import PeftModel
 
     model = PeftModel.from_pretrained(model, str(adapter_path))
-    model = model.merge_and_unload()
+    model = model.merge_and_unload(safe_merge=args.safe_merge)
     model.save_pretrained(str(output_dir), safe_serialization=True)
 
     processor = AutoProcessor.from_pretrained(str(base_model))
@@ -77,6 +82,10 @@ def main() -> int:
         "dtype": str(dtype),
         "attn_implementation_requested": args.attn_implementation,
         "attn_implementation_used": kwargs.get("attn_implementation", attn_impl),
+        "merge_semantics": (
+            "peft_merge_and_unload_safe" if args.safe_merge
+            else "peft_merge_and_unload_default"
+        ),
         "merged_at": datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z"),
         "note": args.note,
     }

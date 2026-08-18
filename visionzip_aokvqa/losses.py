@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import torch
 import torch.nn.functional as F
 
@@ -72,6 +74,101 @@ def compute_per_token_kl(
         chunk = F.kl_div(reference_log_probs, source_probs, reduction="none").sum(dim=-1)
         token_losses.append(chunk * (temperature**2))
     return torch.cat(token_losses, dim=0)
+
+
+def keep_mask_after_topk_exclusion(
+    ranking_kl: torch.Tensor,
+    valid_mask: torch.Tensor,
+    top_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exclude the largest detached token KL values while retaining one token.
+
+    Ranking is deterministic for ties: lower original token positions are
+    removed first. The returned keep mask and removed indices are detached.
+    """
+
+    with torch.no_grad():
+        values = ranking_kl.detach().float().reshape(-1)
+        valid = valid_mask.detach().to(device=values.device, dtype=torch.bool).reshape(-1)
+        if values.shape != valid.shape:
+            raise ValueError(f"Ranking KL and valid mask must align: {values.shape} vs {valid.shape}.")
+        if not valid.any():
+            raise ValueError("Top-k token exclusion requires at least one valid token.")
+        if not torch.isfinite(values[valid]).all():
+            raise ValueError("Ranking KL must be finite on all valid tokens.")
+        requested = int(top_k)
+        if requested < 0:
+            raise ValueError(f"top_k must be nonnegative, got {top_k}.")
+
+        valid_indices = torch.nonzero(valid, as_tuple=False).reshape(-1)
+        effective_k = min(requested, max(0, int(valid_indices.numel()) - 1))
+        keep = valid.clone()
+        if effective_k == 0:
+            removed = valid_indices[:0]
+        else:
+            ranked_local = torch.argsort(
+                values[valid_indices],
+                descending=True,
+                stable=True,
+            )
+            removed = valid_indices[ranked_local[:effective_k]]
+            keep[removed] = False
+        if not keep.any():
+            raise AssertionError("Top-k token exclusion removed every valid token.")
+    return keep.detach(), removed.detach()
+
+
+def resolve_token_outlier_top_k(
+    default_top_k: int,
+    top_k_by_ratio: Mapping[object, object] | None,
+    retention_ratio: float,
+) -> int:
+    """Resolve a nonnegative token-exclusion count for one retention ratio.
+
+    A ratio map takes precedence over the legacy scalar value. Ratio keys may
+    be YAML strings or numbers, but they must identify the requested ratio
+    unambiguously.
+    """
+
+    default = int(default_top_k)
+    if default < 0:
+        raise ValueError(f"Default top_k must be nonnegative, got {default_top_k}.")
+    if top_k_by_ratio is None:
+        return default
+    if not isinstance(top_k_by_ratio, Mapping) or not top_k_by_ratio:
+        raise ValueError("top_k_by_ratio must be a nonempty mapping when provided.")
+
+    target = float(retention_ratio)
+    if not torch.isfinite(torch.tensor(target)) or not 0.0 < target <= 1.0:
+        raise ValueError(f"retention_ratio must be in (0, 1], got {retention_ratio}.")
+
+    matches: list[int] = []
+    for raw_ratio, raw_top_k in top_k_by_ratio.items():
+        try:
+            ratio = float(raw_ratio)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"Invalid top_k_by_ratio key {raw_ratio!r}.") from error
+        if not 0.0 < ratio <= 1.0:
+            raise ValueError(f"top_k_by_ratio key must be in (0, 1], got {raw_ratio!r}.")
+        if isinstance(raw_top_k, bool):
+            raise ValueError(f"top_k_by_ratio value must be an integer, got {raw_top_k!r}.")
+        try:
+            top_k = int(raw_top_k)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"Invalid top_k_by_ratio value {raw_top_k!r}.") from error
+        if float(top_k) != float(raw_top_k) or top_k < 0:
+            raise ValueError(
+                f"top_k_by_ratio value must be a nonnegative integer, got {raw_top_k!r}."
+            )
+        if abs(ratio - target) <= 1e-8:
+            matches.append(top_k)
+
+    if len(matches) != 1:
+        raise ValueError(
+            "top_k_by_ratio must contain exactly one entry for retention ratio "
+            f"{target:.8f}; found {len(matches)}."
+        )
+    return matches[0]
 
 
 def compute_budget_gradient_alignment(
@@ -455,7 +552,7 @@ def compute_budget_contrastive_per_token_kl(
     return losses, torch.cat(target_shifts, dim=0).detach()
 
 
-def _generalized_jsd_chunk(
+def _generalized_jsd_token_chunk(
     teacher_logits: torch.Tensor,
     student_logits: torch.Tensor,
     beta: float,
@@ -498,14 +595,34 @@ def _generalized_jsd_chunk(
     normalized_clip_mode = str(clip_mode).lower()
     if token_clip is not None and float(token_clip) > 0.0 and normalized_clip_mode in {"official", "vocab", "vocab_element"}:
         jsd = jsd.clamp(max=float(token_clip))
-        return jsd.sum(dim=-1).mean()
+        return jsd.sum(dim=-1)
 
     token_loss = jsd.sum(dim=-1).clamp_min(0.0)
     if token_clip is not None and float(token_clip) > 0.0 and normalized_clip_mode in {"token", "token_sum"}:
         token_loss = token_loss.clamp(max=float(token_clip))
-    elif normalized_clip_mode not in {"token", "token_sum"}:
+    elif normalized_clip_mode not in {"token", "token_sum", "official", "vocab", "vocab_element"}:
         raise ValueError(f"Unsupported JSD clip_mode={clip_mode!r}. Use 'token' or 'official'.")
-    return token_loss.mean()
+    return token_loss
+
+
+def _generalized_jsd_chunk(
+    teacher_logits: torch.Tensor,
+    student_logits: torch.Tensor,
+    beta: float,
+    temperature: float,
+    top_k: int | None,
+    token_clip: float | None,
+    clip_mode: str,
+) -> torch.Tensor:
+    return _generalized_jsd_token_chunk(
+        teacher_logits,
+        student_logits,
+        beta=beta,
+        temperature=temperature,
+        top_k=top_k,
+        token_clip=token_clip,
+        clip_mode=clip_mode,
+    ).mean()
 
 
 def compute_generalized_jsd(
@@ -557,6 +674,54 @@ def compute_generalized_jsd(
         )
         counts.append(end - start)
     return torch.stack([loss * count for loss, count in zip(losses, counts)]).sum() / float(sum(counts))
+
+
+def compute_per_token_generalized_jsd(
+    teacher_logits: torch.Tensor,
+    student_logits: torch.Tensor,
+    beta: float = 0.5,
+    temperature: float = 1.0,
+    top_k: int | None = None,
+    token_clip: float | None = None,
+    clip_mode: str = "token",
+    chunk_size: int = 32,
+) -> torch.Tensor:
+    """Return generalized JSD independently at each generated-token position."""
+
+    if teacher_logits.shape != student_logits.shape:
+        raise ValueError(
+            f"Teacher/student logits must align: {teacher_logits.shape} vs {student_logits.shape}"
+        )
+    if teacher_logits.ndim not in {2, 3}:
+        raise ValueError("Generalized JSD logits must be [T, vocab] or [B, T, vocab].")
+    if int(teacher_logits.shape[-2]) <= 0:
+        raise ValueError("Generalized JSD requires at least one token position.")
+
+    temperature = float(temperature)
+    beta = float(beta)
+    if temperature <= 0.0:
+        raise ValueError(f"JSD temperature must be positive, got {temperature}.")
+    if beta < 0.0 or beta > 1.0:
+        raise ValueError(f"OPSD beta must be in [0, 1], got {beta}.")
+
+    teacher_logits = _flatten_token_logits(teacher_logits)
+    student_logits = _flatten_token_logits(student_logits)
+    chunk_size = max(1, int(chunk_size))
+    token_losses: list[torch.Tensor] = []
+    for start in range(0, int(teacher_logits.shape[0]), chunk_size):
+        end = min(start + chunk_size, int(teacher_logits.shape[0]))
+        token_losses.append(
+            _generalized_jsd_token_chunk(
+                teacher_logits[start:end],
+                student_logits[start:end],
+                beta=beta,
+                temperature=temperature,
+                top_k=top_k,
+                token_clip=token_clip,
+                clip_mode=clip_mode,
+            )
+        )
+    return torch.cat(token_losses, dim=0)
 
 
 def compute_token_ce(logits: torch.Tensor, target_ids: torch.Tensor) -> torch.Tensor:

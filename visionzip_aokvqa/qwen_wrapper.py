@@ -649,11 +649,50 @@ def set_visionzip_ratios(model: Any, dominant_ratio: float, contextual_ratio: fl
         setattr(target, "visionzip_contextual_ratio", float(contextual_ratio))
 
 
+def visionzip_dominant_only_enabled(model: Any) -> bool:
+    return any(
+        bool(getattr(target, "visionzip_dominant_only", False))
+        for target in _visionzip_model_targets(model)
+    )
+
+
+@contextmanager
+def temporary_visionzip_dominant_only(model: Any, enabled: bool = True):
+    """Opt into deletion-only dominant-token VisionZip for diagnostics.
+
+    The default official path always retains a 5% contextual-token bank. This
+    hook is deliberately opt-in so existing training and evaluation behavior
+    remains unchanged.
+    """
+    targets = _visionzip_model_targets(model)
+    previous = [
+        (target, getattr(target, "visionzip_dominant_only", None))
+        for target in targets
+    ]
+    for target in targets:
+        setattr(target, "visionzip_dominant_only", bool(enabled))
+    try:
+        yield
+    finally:
+        for target, value in previous:
+            if value is None:
+                try:
+                    delattr(target, "visionzip_dominant_only")
+                except AttributeError:
+                    pass
+            else:
+                setattr(target, "visionzip_dominant_only", value)
+
+
 @contextmanager
 def temporary_visionzip_ratios(model: Any, retention_ratio: float):
     retention = min(max(float(retention_ratio), 0.0), 1.0)
-    contextual = min(0.05, retention)
-    dominant = max(0.0, retention - contextual)
+    if visionzip_dominant_only_enabled(model):
+        contextual = 0.0
+        dominant = retention
+    else:
+        contextual = min(0.05, retention)
+        dominant = max(0.0, retention - contextual)
     targets = _visionzip_model_targets(model)
     previous = [
         (
@@ -693,6 +732,8 @@ def native_visionzip_role_counts(
     num_full: int,
     dominant_ratio: float,
     contextual_ratio: float,
+    *,
+    dominant_only: bool = False,
 ) -> tuple[int, int]:
     """Mirror the exact arithmetic used by the official VisionZip backend."""
     if num_full < 0:
@@ -701,7 +742,11 @@ def native_visionzip_role_counts(
     backend_dominant_ratio = 1.0 - backend_ratio
     dominant_num = int(backend_dominant_ratio * num_full)
     # Armen's Qwen2.5-VL VisionZip implementation fixes this branch at 5%.
-    contextual_num = max(int(0.05 * num_full), 1) if num_full else 0
+    contextual_num = (
+        0
+        if dominant_only
+        else max(int(0.05 * num_full), 1) if num_full else 0
+    )
     return dominant_num, contextual_num
 
 
@@ -730,10 +775,12 @@ def official_visionzip_metadata(
     pruned_input_ids = last["input_ids"].to(device=full_input_ids.device)
     num_full = int((full_input_ids == image_token_id).sum().item())
     num_kept = int((pruned_input_ids == image_token_id).sum().item())
+    dominant_only = visionzip_dominant_only_enabled(model)
     dominant_num, contextual_num = native_visionzip_role_counts(
         num_full,
         dominant_ratio,
         contextual_ratio,
+        dominant_only=dominant_only,
     )
     if num_kept != dominant_num + contextual_num:
         raise RuntimeError(
@@ -751,14 +798,19 @@ def official_visionzip_metadata(
         "num_full_visual_tokens": num_full,
         "num_kept_visual_tokens": num_kept,
         "visionzip_exact_metrics": True,
-        "visionzip_metric_source": "armen_qwen25vl_visionzip",
+        "visionzip_metric_source": (
+            "diagnostic_dominant_only_visionzip"
+            if dominant_only
+            else "armen_qwen25vl_visionzip"
+        ),
         "visionzip_target_tokens": num_kept,
         "visionzip_dominant_tokens": dominant_num,
         "visionzip_contextual_tokens": contextual_num,
         "visionzip_merged_tokens": max(0, num_full - dominant_num - contextual_num),
-        "visionzip_contextual_fraction": float(contextual_ratio),
+        "visionzip_contextual_fraction": 0.0 if dominant_only else float(contextual_ratio),
         "visionzip_dominant_ratio": float(dominant_ratio),
-        "visionzip_contextual_ratio": float(contextual_ratio),
+        "visionzip_contextual_ratio": 0.0 if dominant_only else float(contextual_ratio),
+        "visionzip_dominant_only": dominant_only,
     }
 
 
@@ -885,6 +937,9 @@ def build_random_pruned_inputs(
             "visionzip_contextual_ratio": 0.0,
         }
     )
+    # Keep the compact index tensor out of JSON logs, but expose it to training
+    # so paired native-budget runs can assert mask nesting at runtime.
+    pruned["random_keep_indices"] = keep_indices.detach().cpu()
     return pruned
 
 
