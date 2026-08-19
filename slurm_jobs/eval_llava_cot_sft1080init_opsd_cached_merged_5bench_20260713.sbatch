@@ -21,7 +21,7 @@ EXPECTED_BASE_MODEL="${EXPECTED_BASE_MODEL:-${OUT_ROOT}/merged_models/qwen25vl7b
 EXPECTED_ADAPTER_PATH="${EXPECTED_ADAPTER_PATH:-${OUT_ROOT}/checkpoints/llava_cot_sft1080merged_opsd_cachedrollout_qwentok512_maxpix1080_reasoning_ebs32_cleanarmen_20260712/llava_cot_sft1080merged_opsd_nogt_ema_maxpix1080_progressive_40to10_cachedrollout_ebs32/final}"
 MERGED_MODEL="${MERGED_MODEL:-${OUT_ROOT}/merged_models/qwen25vl7b_lcot_sft1080init_opsd_cached_final_merged_bf16_20260713}"
 METHOD_TAG="${METHOD_TAG:-lcot_sft1080init_opsd_cached_merged}"
-EVAL_TASK="${EVAL_TASK:?Set EVAL_TASK to mme, mmstar, mathvista, mathvision, or mmmupro}"
+EVAL_TASK="${EVAL_TASK:?Set EVAL_TASK to mme, mmstar, mathvista, mathverse, mathvision, or mmmupro}"
 RATIO_TAG="${RATIO_TAG:?Set RATIO_TAG to noprune, r010, r020, or r030}"
 
 case "${RATIO_TAG}" in
@@ -66,6 +66,11 @@ case "${EVAL_TASK,,}" in
     DATASET_NAME=MathVista_MINI
     EXPECTED_ROWS=1000
     POSTPROCESS=mathvista_qwen7
+    ;;
+  mathverse|mathverse_mini_vision_only)
+    DATASET_NAME=MathVerse_MINI_Vision_Only
+    EXPECTED_ROWS=788
+    POSTPROCESS=mathverse_qwen7
     ;;
   mathvision)
     DATASET_NAME=MathVision
@@ -287,12 +292,12 @@ case "${POSTPROCESS}" in
     [[ -n "${result_file}" && -f "${result_file}" ]]
     python "${OPSD_ROOT}/scripts/score_mathvista_with_qwen7.py" --result-file "${result_file}"
     ;;
-  mathvision_qwen7)
+  mathverse_qwen7|mathvision_qwen7)
     run_distributed_infer
     result_file="$(find_result_file)"
     [[ -n "${result_file}" && -f "${result_file}" ]]
     python "${OPSD_ROOT}/scripts/score_math_vqa_with_qwen7.py" \
-      --dataset MathVision \
+      --dataset "${DATASET_NAME}" \
       --result-file "${result_file}"
     ;;
   *)

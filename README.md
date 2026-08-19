@@ -1,9 +1,27 @@
-# OPSD VisionZip A-OKVQA Runbook
+# OPSD: Visual-Token-Pruning Recovery
 
-> The current minimal research-code index is [CORE_RESEARCH.md](CORE_RESEARCH.md).
-> It covers pass@k, LLM-only SFT/OPSD/JSD-weighted training, JSD sensitivity,
-> and the four-benchmark merged-checkpoint evaluation path. Generated results
-> and model artifacts are intentionally excluded from the GitHub release.
+> The maintained research workflow is [CORE_RESEARCH.md](CORE_RESEARCH.md).
+> GitHub currently publishes only the active **r010-only** OPSD training path,
+> projection-fraction diagnostics and ablations, pass@k tooling, and the
+> five-benchmark merged evaluation path. Checkpoints and generated results are
+> intentionally excluded.
+
+## Current status
+
+- **Done:** audited 10,240-sample r010-only OPSD baseline, projection/F
+  implementation, trajectory top/bottom controls, pass@k pipeline, and strict
+  raw-preserving benchmark post-processing.
+- **Running/queued:** affine/curriculum F, token partition/random-drop,
+  projection-mass, and ablation evaluation jobs.
+- **Not done:** the r010 20K run, complete five-benchmark ablation table,
+  multi-seed validation, and selection of a final reweighting/new OPSD method.
+- **Main goal:** find a simple, defensible projection-fraction-based objective
+  that improves over original r010-only OPSD.
+
+The material below is the legacy A-OKVQA checkpoint runbook. It remains for
+checkpoint compatibility and is not the active public training recipe.
+
+## Legacy A-OKVQA Runbook
 
 This repository contains the A-OKVQA training and VLMEvalKit evaluation code used for the Qwen2.5-VL + VisionZip OPSD experiments.
 

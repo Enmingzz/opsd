@@ -4,6 +4,11 @@ This is the clean working root for all new language-decoder-only experiments.
 No legacy adapter or merged model from the vision-encoder-plus-LLM experiments
 may be used as initialization here.
 
+The only active training launchers published in Git are the native VisionZip
+`r010` OPSD baseline and its projection-fraction ablations. Historical
+multi-ratio, progressive, and JSD-weighted launchers are deliberately excluded
+from the maintained GitHub workflow. See `../../CORE_RESEARCH.md`.
+
 ## Scope Contract
 
 Every new training configuration must:
@@ -20,14 +25,18 @@ The machine-readable requirements are in `scope_contract.json`.
 
 ## Layout
 
-- `first5_sft_then_opsd/`: first mechanism experiment, currently containing
-  the first-five-layer SFT stage.
-- `random_sft_opsd/`: full-decoder SFT and OPSD random-retention controls.
+- `opsd_random_r010_only_dropout0_20260815/`: canonical baseline, resumable
+  20K configuration, and five-benchmark evaluator.
+- `opsd_r010_f_delta002_ablation_dropout0_20260818/`: global trajectory-F
+  affine and intermediate-curriculum controls.
+- `opsd_r010_f_trajectory_partition_delta002_dropout0_20260817/`: hard
+  trajectory top/bottom-F controls.
+- `opsd_r010_f_token_partition_delta002_dropout0_20260818/`: token top/bottom-F
+  and matched random-drop controls.
+- `opsd_r010_projection_mass_va_group_dropout0_20260818/`: projection-mass
+  grouped-loss controls.
 - `../scripts/verify_lora_scope.py`: shared fresh-model and saved-adapter scope
-  verifier for every experiment in this root.
-- `outputs`: link to the clean scratch output root. Formal `checkpoints` and
-  `eval` start empty; `smoke` contains the verified first-five-layer preflight
-  and one-step adapter.
+  verifier.
 
 The existing evaluation implementation is shared code and is not copied into
 this directory. Results written by new evaluations must still use this root.
