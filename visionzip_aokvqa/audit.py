@@ -83,6 +83,8 @@ def load_model(cfg: dict[str, Any], allow_embedding_fallback: bool):
         alpha=int(get_nested(cfg, "training.lora_alpha", 32)),
         dropout=float(get_nested(cfg, "training.lora_dropout", 0.05)),
         target_modules=list(get_nested(cfg, "training.target_modules", [])) or None,
+        layers_to_transform=get_nested(cfg, "training.lora_layers_to_transform", None),
+        layers_pattern=get_nested(cfg, "training.lora_layers_pattern", None),
     )
     return model, processor
 

@@ -8,8 +8,13 @@ from typing import Any
 OPTION_LETTERS = ("A", "B", "C", "D")
 STANDARD_PROMPT_MODES = {"", "standard", "default", "direct", "direct_mode", "none", "false", "0"}
 THINKING_PROMPT_MODES = {"thinking", "think", "reasoning", "reasoning_mode", "reasoning_tags", "enable_thinking", "true", "1"}
+ANALYSIS_PROMPT_MODES = {"analysis", "analysis_mode", "analysis_tags"}
 THINKING_INSTRUCTION = (
     "First output the thinking process in <think> </think> tags and then output the final answer "
+    "in <answer> </answer> tags."
+)
+ANALYSIS_INSTRUCTION = (
+    "First output the reasoning process in <analysis> </analysis> tags and then output the final answer "
     "in <answer> </answer> tags."
 )
 
@@ -57,6 +62,12 @@ Final answer: {correct_option_letter}"""
 THINKING_TARGET_TEMPLATE = """<think>
 {brief_reasoning}
 </think>
+<answer>{correct_option_letter}</answer>"""
+
+
+ANALYSIS_TARGET_TEMPLATE = """<analysis>
+{brief_reasoning}
+</analysis>
 <answer>{correct_option_letter}</answer>"""
 
 
@@ -110,6 +121,32 @@ After reading the reference solution above, make sure you truly understand the r
 {thinking_instruction}"""
 
 
+OPSD_TEACHER_OPEN_PROMPT_TEMPLATE = """<image>
+
+{question}
+
+Here is a reference solution to this problem:
+=== Reference Solution Begin ===
+{reference_solution}
+=== Reference Solution End ===
+
+After reading the reference solution above, make sure you truly understand the reasoning behind each step - do not copy or paraphrase it. Now, using your own words and independent reasoning, derive the same final answer to the problem above. Think step by step, explore different approaches, and do not be afraid to backtrack or reconsider if something does not work out."""
+
+
+OPSD_TEACHER_OPEN_THINKING_PROMPT_TEMPLATE = """<image>
+
+{question}
+
+Here is a reference solution to this problem:
+=== Reference Solution Begin ===
+{reference_solution}
+=== Reference Solution End ===
+
+After reading the reference solution above, make sure you truly understand the reasoning behind each step - do not copy or paraphrase it. Now, using your own words and independent reasoning, derive the same final answer to the problem above. Think step by step, explore different approaches, and do not be afraid to backtrack or reconsider if something does not work out.
+
+{thinking_instruction}"""
+
+
 @dataclass
 class FormattedAOKVQASample:
     sample_id: str
@@ -145,14 +182,40 @@ def normalize_prompt_mode(prompt_mode: str | bool | None = None, enable_thinking
         return "standard"
     if value in THINKING_PROMPT_MODES:
         return "thinking"
+    if value in ANALYSIS_PROMPT_MODES:
+        return "analysis"
     raise ValueError(
         f"Unsupported prompt_mode={prompt_mode!r}. "
-        "Use direct/standard for direct mode or thinking/reasoning for <think>/<answer> mode."
+        "Use direct/standard, thinking/reasoning, or analysis tags."
     )
 
 
 def is_thinking_prompt_mode(prompt_mode: str | bool | None = None, enable_thinking: bool | None = None) -> bool:
-    return normalize_prompt_mode(prompt_mode, enable_thinking=enable_thinking) == "thinking"
+    return normalize_prompt_mode(prompt_mode, enable_thinking=enable_thinking) in {"thinking", "analysis"}
+
+
+def reasoning_instruction(
+    prompt_mode: str | bool | None = None,
+    enable_thinking: bool | None = None,
+) -> str:
+    mode = normalize_prompt_mode(prompt_mode, enable_thinking=enable_thinking)
+    if mode == "analysis":
+        return ANALYSIS_INSTRUCTION
+    if mode == "thinking":
+        return THINKING_INSTRUCTION
+    return ""
+
+
+def convert_target_reasoning_tags(
+    target: str,
+    prompt_mode: str | bool | None = None,
+    enable_thinking: bool | None = None,
+) -> str:
+    mode = normalize_prompt_mode(prompt_mode, enable_thinking=enable_thinking)
+    if mode != "analysis":
+        return str(target)
+    converted = re.sub(r"<\s*think\s*>", "<analysis>", str(target), flags=re.IGNORECASE)
+    return re.sub(r"<\s*/\s*think\s*>", "</analysis>", converted, flags=re.IGNORECASE)
 
 
 def build_reasoning_prompt(
@@ -165,14 +228,14 @@ def build_reasoning_prompt(
         raise ValueError(f"A-OKVQA prompt requires exactly four options, got {len(options)}.")
     clean_options = [str(option).strip() for option in options]
     mode = normalize_prompt_mode(prompt_mode, enable_thinking=enable_thinking)
-    template = THINKING_PROMPT_TEMPLATE if mode == "thinking" else PROMPT_TEMPLATE
+    template = THINKING_PROMPT_TEMPLATE if mode in {"thinking", "analysis"} else PROMPT_TEMPLATE
     return template.format(
         question=strip_image_tokens(question),
         option_0=clean_options[0],
         option_1=clean_options[1],
         option_2=clean_options[2],
         option_3=clean_options[3],
-        thinking_instruction=THINKING_INSTRUCTION,
+        thinking_instruction=reasoning_instruction(mode),
     )
 
 
@@ -187,7 +250,12 @@ def build_target(
         brief_reasoning = "The correct option is supported by the image and question."
     correct = str(correct_option_letter).strip().upper()
     mode = normalize_prompt_mode(prompt_mode, enable_thinking=enable_thinking)
-    template = THINKING_TARGET_TEMPLATE if mode == "thinking" else TARGET_TEMPLATE
+    if mode == "analysis":
+        template = ANALYSIS_TARGET_TEMPLATE
+    elif mode == "thinking":
+        template = THINKING_TARGET_TEMPLATE
+    else:
+        template = TARGET_TEMPLATE
     return template.format(
         brief_reasoning=brief_reasoning,
         correct_option_letter=correct,
@@ -203,22 +271,33 @@ def build_opsd_teacher_prompt(
 ) -> str:
     """Build the privileged teacher prompt used by the official OPSD setup."""
 
-    if len(options) != 4:
-        raise ValueError(f"A-OKVQA teacher prompt requires exactly four options, got {len(options)}.")
+    if len(options) not in {0, 4}:
+        raise ValueError(f"OPSD teacher prompt requires either zero or four options, got {len(options)}.")
     clean_options = [str(option).strip() for option in options]
     reference = str(reference_solution or "").strip()
     if not reference:
         reference = "Reasoning: The correct option is supported by the image and question."
     mode = normalize_prompt_mode(prompt_mode, enable_thinking=enable_thinking)
-    template = OPSD_TEACHER_THINKING_PROMPT_TEMPLATE if mode == "thinking" else OPSD_TEACHER_PROMPT_TEMPLATE
+    if clean_options:
+        template = (
+            OPSD_TEACHER_THINKING_PROMPT_TEMPLATE
+            if mode in {"thinking", "analysis"}
+            else OPSD_TEACHER_PROMPT_TEMPLATE
+        )
+    else:
+        template = (
+            OPSD_TEACHER_OPEN_THINKING_PROMPT_TEMPLATE
+            if mode in {"thinking", "analysis"}
+            else OPSD_TEACHER_OPEN_PROMPT_TEMPLATE
+        )
     return template.format(
         question=strip_image_tokens(question),
-        option_0=clean_options[0],
-        option_1=clean_options[1],
-        option_2=clean_options[2],
-        option_3=clean_options[3],
+        option_0=clean_options[0] if clean_options else "",
+        option_1=clean_options[1] if clean_options else "",
+        option_2=clean_options[2] if clean_options else "",
+        option_3=clean_options[3] if clean_options else "",
         reference_solution=reference,
-        thinking_instruction=THINKING_INSTRUCTION,
+        thinking_instruction=reasoning_instruction(mode),
     )
 
 

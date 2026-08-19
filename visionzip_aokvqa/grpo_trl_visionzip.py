@@ -539,6 +539,8 @@ def train(cfg: dict[str, Any]) -> Path:
             dropout=float(get_nested(cfg, "training.lora_dropout", 0.05)),
             target_modules=list(get_nested(cfg, "training.target_modules", [])) or None,
             adapter_path=str(get_nested(cfg, "training.adapter_path", "")),
+            layers_to_transform=get_nested(cfg, "training.lora_layers_to_transform", None),
+            layers_pattern=get_nested(cfg, "training.lora_layers_pattern", None),
         )
     model.to(primary_device(model))
 

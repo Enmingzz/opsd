@@ -1,0 +1,23 @@
+{
+  "additional_dataset": "/project/6101803/enmingzz/opsd/data/openmmreasoner_llava_cot_train20k_ordered_decontam_v1_seed42/additional10k_decontam_qwentok512_imgtok1152_seed42.jsonl",
+  "additional_dataset_sha256": "9234f620b9475afde42d6fe827bd511cc400af46a70ab9941ca23e1351c7fdeb",
+  "additional_segment_is_seed42_shuffle": true,
+  "additional_segment_rows": 10000,
+  "first_additional_dataset_index": 10000,
+  "first_additional_sample_id": "openmm_llava_cot_000140445",
+  "first_unconsumed_dataset_index": 9984,
+  "first_unconsumed_sample_id": "openmm_llava_cot_000169206",
+  "old_dataset": "/project/6101803/enmingzz/opsd/data/openmmreasoner_llava_cot_train10k_decontam_v1_seed42/train10k_decontam_qwentok512_imgtok1152_seed42.jsonl",
+  "old_dataset_sha256": "f37ecfdd09e3188142e67954bd15933d2debf1ddc375dde17eca6ec3730a7280",
+  "old_segment_is_seed42_shuffle": true,
+  "old_segment_rows": 10000,
+  "ordering_semantics": "loader consumes rows as written; dataset.shuffle=false",
+  "output_jsonl": "/project/6101803/enmingzz/opsd/data/openmmreasoner_llava_cot_train20k_ordered_decontam_v1_seed42/train20k_exact_resume_order_qwentok512_imgtok1152_seed42.jsonl",
+  "output_sha256": "9f1cf9dfbff291ee0ce7f34a236820c7da907f096bdb54ec0165eed845f3516f",
+  "parent_observed_rows_compared": 9984,
+  "parent_observed_sequence_exact": true,
+  "rows": 20000,
+  "schema_version": "exact_resume_order_v1",
+  "seed": 42,
+  "status": "passed"
+}

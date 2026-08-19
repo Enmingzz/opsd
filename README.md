@@ -1,4 +1,27 @@
-# OPSD VisionZip A-OKVQA Runbook
+# OPSD: Visual-Token-Pruning Recovery
+
+> The maintained research workflow is [CORE_RESEARCH.md](CORE_RESEARCH.md).
+> GitHub currently publishes only the active **r010-only** OPSD training path,
+> projection-fraction diagnostics and ablations, pass@k tooling, and the
+> five-benchmark merged evaluation path. Checkpoints and generated results are
+> intentionally excluded.
+
+## Current status
+
+- **Done:** audited 10,240-sample r010-only OPSD baseline, projection/F
+  implementation, trajectory top/bottom controls, pass@k pipeline, and strict
+  raw-preserving benchmark post-processing.
+- **Running/queued:** affine/curriculum F, token partition/random-drop,
+  projection-mass, and ablation evaluation jobs.
+- **Not done:** the r010 20K run, complete five-benchmark ablation table,
+  multi-seed validation, and selection of a final reweighting/new OPSD method.
+- **Main goal:** find a simple, defensible projection-fraction-based objective
+  that improves over original r010-only OPSD.
+
+The material below is the legacy A-OKVQA checkpoint runbook. It remains for
+checkpoint compatibility and is not the active public training recipe.
+
+## Legacy A-OKVQA Runbook
 
 This repository contains the A-OKVQA training and VLMEvalKit evaluation code used for the Qwen2.5-VL + VisionZip OPSD experiments.
 
@@ -192,6 +215,16 @@ Direct mode is the same except:
 export enable_thinking=False
 ```
 
+MMStar Qwen-judge postprocessing is off by default. To enable it:
+
+```bash
+export MMSTAR_QWEN_JUDGE=1
+export MMSTAR_QWEN_JUDGE_MODEL_PATH=Qwen/Qwen2.5-7B-Instruct
+export MMSTAR_QWEN_JUDGE_SCOPE=misses
+```
+
+With `MMSTAR_QWEN_JUDGE_SCOPE=misses`, the normal VLMEvalKit parser runs first, and Qwen only re-judges MMStar samples that the parser marked wrong. The judged answer is extracted from `<answer>...</answer>` first. Set `MMSTAR_QWEN_JUDGE_SCOPE=all` only if you want Qwen to re-judge every MMStar prediction with an answer tag.
+
 No-prune baseline:
 
 ```bash
@@ -383,5 +416,6 @@ Outputs:
 - `opsd512/ema_shadow.pt` is not needed for inference.
 - For POPE, `Overall` is F1. Use the `acc` column if you want accuracy.
 - The corrected VisionZip mapping is `r005 -> 1.00`, `r010 -> 0.95`, `r020 -> 0.85`, `r030 -> 0.75`.
+- MMStar Qwen-judge postprocessing is controlled by `MMSTAR_QWEN_JUDGE`. It is intended to fix answer-tag parsing failures such as `<answer>B. ...</answer>` being misread by the exact parser.
 - The cleanenv eval uses `max_pixels = 4096 * 28 * 28`. Older local scripts may still mention `16384 * 28 * 28`; do not mix those results.
 - The current exact cleanenv launcher lives outside the repo at `/project/6101803/enmingzz/ckpt_eval_trainenv/eval_one.sh`. The reproducibility-critical code changes are captured in `patches/vlmevalkit_armen51682_cleanenv_qwen25vl_lora_visionzip.patch`.

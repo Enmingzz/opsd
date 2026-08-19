@@ -1,0 +1,54 @@
+{
+  "scope": "language_decoder_only",
+  "active_training_retention_ratios": [
+    0.1
+  ],
+  "base_model": "Qwen/Qwen2.5-VL-7B-Instruct",
+  "allowed_language_decoder_layers": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27
+  ],
+  "required_lora_layers_pattern": "layers",
+  "new_run_defaults_effective_date": "2026-08-03",
+  "required_lora_dropout_for_new_runs": 0.0,
+  "learning_rate_policy_for_new_runs": "fixed",
+  "default_learning_rate_for_new_runs": 0.00002,
+  "scheduler_requires_explicit_named_ablation": true,
+  "forbidden_adapter_tensor_substrings": [
+    ".visual."
+  ],
+  "legacy_adapter_initialization_allowed": false,
+  "forbidden_initialization_roots": [
+    "/scratch/enmingzz/outputs/visionzip_aokvqa_reasoning",
+    "/scratch/enmingzz/outputs/visionzip_llava_cot_reasoning",
+    "/scratch/enmingzz/outputs/vision_encoder_plus_llm"
+  ],
+  "output_root": "/scratch/enmingzz/outputs/llm_only",
+  "required_post_save_check": "saved adapter contains no .visual. tensor names"
+}
