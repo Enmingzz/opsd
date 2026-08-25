@@ -254,6 +254,21 @@ d047055d20ab5823471ad1e925055335107d990bb921d7e36944237101f0b0f4
 Do not mix the judge vLLM environment with the training environment; their
 Torch/CUDA stacks are intentionally different.
 
+## Exact Killarney evaluation runtime bundle
+
+The complete evaluation entry points, raw `pip freeze --all`, effective import
+manifest, Alliance module list, exact Pillow-SIMD wheel, and byte-level
+verification tools are archived under:
+
+```text
+runtime_bundles/killarney_eval_20260824/
+```
+
+Use that bundle for reproducing the no-adapter, no-VisionZip MME baseline at
+model revision `cc594898137f460bfe9f0759e9844b3ce807cfb5`. In particular, read
+its Pillow metadata warning before treating the raw freeze as an installable
+lockfile.
+
 ## Minimal setup on another L40S machine
 
 1. Use Python 3.11, CUDA 12.6, and a driver new enough for CUDA 12.6.

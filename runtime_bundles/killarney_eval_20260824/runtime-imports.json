@@ -1,0 +1,133 @@
+{
+  "captured_at": "2026-08-25T03:17:57.607346+00:00",
+  "distribution_metadata": {
+    "Pillow": "12.1.0+computecanada",
+    "Pillow-SIMD": "9.5.0.post2+computecanada",
+    "accelerate": "1.13.0+computecanada",
+    "flash-attn": "2.8.3+torch29.computecanada",
+    "huggingface-hub": "0.34.3",
+    "peft": "0.18.1+computecanada",
+    "pip": "26.0.1+computecanada",
+    "pyarrow": "23.0.1",
+    "tokenizers": "0.22.2+computecanada",
+    "torch": "2.9.1+computecanada",
+    "transformers": "4.45.0.dev0"
+  },
+  "environment_dependencies": {
+    "activate_official_env_sha256": "f2e7059db469e8c736708911622844fcb8fea0f1c3803ea082db531fa42e868b",
+    "env_train_runtime_sha256": "255312b5feab9ebb815db7fba1cb50d3435ab37fd0be788938f1e0291f074e30",
+    "eval_one_sha256": "a07fe3afd7aaca7d6ce53f088b4ae7c4856904155d81f4e029a41349543a5680",
+    "vlm_env_sha256": "8e97cc09659dcfb8a8c8f1b92ccc323e080031690965047621c5d87108fc738e",
+    "vsi_official_sha256": "cdffb4a1b03617a9e5afcc6b612aaee2574cfe8abc4917be10bb077541a212be"
+  },
+  "evaluation": {
+    "adapter_path": "",
+    "dataset": "MME",
+    "enable_thinking": true,
+    "enable_visionzip": false,
+    "expected_rows": 2374,
+    "max_new_tokens": 2048,
+    "temperature": 0.0,
+    "visionzip_ratio": 0.0
+  },
+  "hostname": "kn130",
+  "imports": {
+    "PIL": {
+      "import_path": "/scratch/enmingzz/temp/venvs/vsi-official/lib/python3.11/site-packages/PIL/__init__.py",
+      "import_version": "9.5.0.post2"
+    },
+    "PIL._imaging": {
+      "import_path": "/scratch/enmingzz/temp/venvs/vsi-official/lib/python3.11/site-packages/PIL/_imaging.cpython-311-x86_64-linux-gnu.so",
+      "import_version": "<binary-extension>"
+    },
+    "accelerate": {
+      "import_path": "/scratch/enmingzz/temp/venvs/vsi-official/lib/python3.11/site-packages/accelerate/__init__.py",
+      "import_version": "1.13.0"
+    },
+    "cv2": {
+      "import_path": "/cvmfs/soft.computecanada.ca/easybuild/software/2023/x86-64-v3/CUDA/gcc12/cuda12.2/opencv/4.11.0/lib/python3.11/site-packages/cv2/__init__.py",
+      "import_version": "4.11.0"
+    },
+    "flash_attn": {
+      "import_path": "/scratch/enmingzz/temp/venvs/vsi-official/lib/python3.11/site-packages/flash_attn/__init__.py",
+      "import_version": "2.8.3"
+    },
+    "huggingface_hub": {
+      "import_path": "/scratch/enmingzz/cache/uv/archive-v0/DGthIN4hMUv1qyt2/huggingface_hub/__init__.py",
+      "import_version": "0.34.3"
+    },
+    "peft": {
+      "import_path": "/scratch/enmingzz/temp/venvs/vsi-official/lib/python3.11/site-packages/peft/__init__.py",
+      "import_version": "0.18.1"
+    },
+    "pyarrow": {
+      "import_path": "/cvmfs/soft.computecanada.ca/easybuild/software/2023/x86-64-v3/Compiler/gcccore/arrow/23.0.1/lib/python3.11/site-packages/pyarrow/__init__.py",
+      "import_version": "23.0.1"
+    },
+    "tokenizers": {
+      "import_path": "/scratch/enmingzz/temp/pydeps_armen_clean_tokenizers_only/tokenizers/__init__.py",
+      "import_version": "0.22.2"
+    },
+    "torch": {
+      "import_path": "/scratch/enmingzz/temp/venvs/vsi-official/lib/python3.11/site-packages/torch/__init__.py",
+      "import_version": "2.9.1"
+    },
+    "transformers": {
+      "import_path": "/project/6101803/enmingzz/ckpt_eval_trainenv/VLMEvalKit_armen51682/transformers/src/transformers/__init__.py",
+      "import_version": "4.57.0"
+    }
+  },
+  "model": {
+    "cache_root": "/scratch/enmingzz/temp/cache/huggingface/transformers/models--Qwen--Qwen2.5-VL-7B-Instruct",
+    "id": "Qwen/Qwen2.5-VL-7B-Instruct",
+    "resolved_revision": "cc594898137f460bfe9f0759e9844b3ce807cfb5",
+    "snapshot_path": "/scratch/enmingzz/temp/cache/huggingface/transformers/models--Qwen--Qwen2.5-VL-7B-Instruct/snapshots/cc594898137f460bfe9f0759e9844b3ce807cfb5"
+  },
+  "paths": {
+    "CKPT_EVAL_ROOT": "/project/6101803/enmingzz/ckpt_eval_trainenv",
+    "HF_HOME": "/scratch/enmingzz/temp/cache/huggingface",
+    "HF_HUB034_ROOT": "/scratch/enmingzz/cache/uv/archive-v0/DGthIN4hMUv1qyt2",
+    "LMUData": "/scratch/enmingzz/vlmevalkit_data",
+    "OPENCV_ROOT": "/cvmfs/soft.computecanada.ca/easybuild/software/2023/x86-64-v3/CUDA/gcc12/cuda12.2/opencv/4.11.0",
+    "PROJECT_ROOT": "/project/6101803/enmingzz",
+    "TOKENIZERS_QWEN25_ROOT": "/scratch/enmingzz/temp/pydeps_armen_clean_tokenizers_only",
+    "TRANSFORMERS_CACHE": "/scratch/enmingzz/temp/cache/huggingface/transformers",
+    "VLM_ROOT": "/project/6101803/enmingzz/ckpt_eval_trainenv/VLMEvalKit_armen51682",
+    "VSI_OFFICIAL_SITE_PACKAGES": "/scratch/enmingzz/temp/venvs/vsi-official/lib/python3.11/site-packages"
+  },
+  "pillow_artifact": {
+    "filename": "Pillow_SIMD-9.5.0.post2+computecanada-cp311-cp311-linux_x86_64.whl",
+    "installed_PIL_files_matching_wheel": 102,
+    "installed_PIL_files_mismatching_wheel": 0,
+    "installed_PIL_files_missing_from_wheel_comparison": 0,
+    "note": "PIL imports Pillow-SIMD 9.5.0.post2, while stale/coexisting Pillow distribution metadata reports 12.1.0+computecanada.",
+    "sha256": "df0d6f51f815ef94d1d513ebc751b34e93f5b68345b41b9016c315239c8c4f24",
+    "size_bytes": 1447458,
+    "source_path": "/cvmfs/soft.computecanada.ca/custom/python/wheelhouse/gentoo2023/x86-64-v3/Pillow_SIMD-9.5.0.post2+computecanada-cp311-cp311-linux_x86_64.whl"
+  },
+  "python": {
+    "executable": "/scratch/enmingzz/temp/venvs/vsi-official/bin/python",
+    "implementation": "CPython",
+    "platform": "Linux-6.8.0-136-generic-x86_64-Intel-R-_Xeon-R-_Gold_6338_CPU_@_2.00GHz-with-glibc2.37",
+    "version": "3.11.5 (main, Sep 18 2023, 12:23:42) [GCC 12.3.1 20230526]"
+  },
+  "sys_path": [
+    "",
+    "/project/6101803/enmingzz/ckpt_eval_trainenv/VLMEvalKit_armen51682",
+    "/project/6101803/enmingzz/ckpt_eval_trainenv/VLMEvalKit_armen51682/transformers/src",
+    "/project/6101803/enmingzz/ckpt_eval_trainenv/VLMEvalKit_armen51682/internvl",
+    "/project/6101803/enmingzz",
+    "/scratch/enmingzz/cache/uv/archive-v0/DGthIN4hMUv1qyt2",
+    "/scratch/enmingzz/temp/pydeps_armen_clean_tokenizers_only",
+    "/scratch/enmingzz/temp/venvs/vsi-official/lib/python3.11/site-packages",
+    "/cvmfs/soft.computecanada.ca/easybuild/software/2023/x86-64-v3/CUDA/gcc12/cuda12.2/opencv/4.11.0/lib/python3.11/site-packages",
+    "/cvmfs/soft.computecanada.ca/custom/python/site-packages",
+    "/cvmfs/soft.computecanada.ca/easybuild/software/2023/x86-64-v3/Compiler/gcccore/arrow/23.0.1/lib/python3.11/site-packages",
+    "/cvmfs/soft.computecanada.ca/easybuild/software/2023/x86-64-v3/Compiler/gcccore/python/3.11.5/lib/python311.zip",
+    "/cvmfs/soft.computecanada.ca/easybuild/software/2023/x86-64-v3/Compiler/gcccore/python/3.11.5/lib/python3.11",
+    "/cvmfs/soft.computecanada.ca/easybuild/software/2023/x86-64-v3/Compiler/gcccore/python/3.11.5/lib/python3.11/lib-dynload",
+    "__editable__.lmms_eval-0.2.3.finder.__path_hook__",
+    "/project/6101803/enmingzz/vlm/official_thinking_in_space/transformers/src",
+    "/scratch/enmingzz/temp/tmp/tmpj3mk4ymf"
+  ]
+}
