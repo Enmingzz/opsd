@@ -32,9 +32,11 @@ Transformers checkout, and the imported package versions.
 - `wheels/Pillow_SIMD-9.5.0.post2+computecanada-cp311-cp311-linux_x86_64.whl`:
   the exact wheel whose `PIL/` files are imported at evaluation time.
 
-Additional evidence is in `runtime-imports.json`, `module-list.txt`, and
-`pillow-imaging-ldd.txt`. The three small scripts under `activation_chain/`
-record the site-specific activation chain used by `env_train_runtime.sh`.
+Additional evidence is in `runtime-imports.json`, `dataset-manifest.json`,
+`module-list.txt`, and `pillow-imaging-ldd.txt`. The dataset manifest verifies
+that the actual `MME.tsv` has 2,375 lines (one header plus 2,374 examples) and
+records its SHA256. The three small scripts under `activation_chain/` record
+the site-specific activation chain used by `env_train_runtime.sh`.
 
 ## Important Pillow metadata conflict
 

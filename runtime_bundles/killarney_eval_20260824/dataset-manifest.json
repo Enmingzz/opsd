@@ -1,0 +1,9 @@
+{
+  "dataset": "MME",
+  "source_path": "/scratch/enmingzz/vlmevalkit_data/MME.tsv",
+  "size_bytes": 48139971,
+  "sha256": "3b6c914445710ce582ffb51ef8c6c410783ea52e8c517b0a33dbdc26c64ed680",
+  "line_count_including_header": 2375,
+  "header_rows": 1,
+  "data_rows": 2374
+}
