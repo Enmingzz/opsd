@@ -1,0 +1,779 @@
+diff --git a/run.py b/run.py
+index 12cffd04..934ad429 100644
+--- a/run.py
++++ b/run.py
+@@ -350,21 +350,21 @@ def main():
+                 # Set the judge kwargs first before evaluation or dumping
+ 
+ 
+-                num_total_dataset_generated_tokens = model.num_total_dataset_generated_tokens
+-                total_inference_time_in_seconds = model.total_inference_time_in_seconds
+-                total_initial_input_visual_tokens = model.total_initial_input_visual_tokens
+-                total_input_text_tokens = model.total_input_text_tokens
+-
+-                tokens_log = {
+-                    "Total Generated Tokens": num_total_dataset_generated_tokens,
+-                    "Total Inference Time (s)": total_inference_time_in_seconds,
+-                    "Total Input Visual Tokens": total_initial_input_visual_tokens,
+-                    "Total Input Text Tokens": total_input_text_tokens,
+-                }
+-
+                 tokens_log_file = osp.join(pred_root_meta, f'{model_name}_{dataset_name}_tokens_log.json')
+-
+-                dump(tokens_log, tokens_log_file)
++                if hasattr(model, 'num_total_dataset_generated_tokens'):
++                    tokens_log = {
++                        "Total Generated Tokens": model.num_total_dataset_generated_tokens,
++                        "Total Inference Time (s)": model.total_inference_time_in_seconds,
++                        "Total Input Visual Tokens": model.total_initial_input_visual_tokens,
++                        "Total Input Text Tokens": model.total_input_text_tokens,
++                    }
++                    dump(tokens_log, tokens_log_file)
++                elif osp.exists(tokens_log_file):
++                    # A fully cached resume returns the model name without
++                    # instantiating a model. Preserve the original audit log.
++                    tokens_log = load(tokens_log_file)
++                else:
++                    tokens_log = {}
+ 
+                 judge_kwargs = {
+                     'nproc': args.api_nproc,
+@@ -510,6 +510,8 @@ def main():
+             except Exception as e:
+                 logger.exception(f'Model {model_name} x Dataset {dataset_name} combination failed: {e}, '
+                                  'skipping this combination.')
++                if os.environ.get('VLMEVAL_STRICT_ERRORS', '0').lower() in ('1', 'true', 'yes', 'y'):
++                    raise
+                 continue
+ 
+     if WORLD_SIZE > 1:
+diff --git a/transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py b/transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py
+index a856471d..a2d823e9 100644
+--- a/transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py
++++ b/transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py
+@@ -25,6 +25,10 @@
+ # limitations under the License.
+ 
+ from dataclasses import dataclass
++import os
++from pathlib import Path
++import sys
++import types
+ from typing import Any, Callable, Optional, Union
+ 
+ import torch
+@@ -49,6 +53,33 @@ from .configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLTextConfig, Qw
+ 
+ logger = logging.get_logger(__name__)
+ 
++_OFFICIAL_DIVPRUNE_CALLER = None
++
++
++def _get_official_divprune_caller():
++    global _OFFICIAL_DIVPRUNE_CALLER
++    if _OFFICIAL_DIVPRUNE_CALLER is not None:
++        return _OFFICIAL_DIVPRUNE_CALLER
++
++    root = Path(os.environ.get("DIVPRUNE_OFFICIAL_ROOT", "/project/6101803/enmingzz/divprune_official")).resolve()
++    llava_root = root / "LLaVA"
++    if not (llava_root / "llava" / "model" / "llava_arch.py").is_file():
++        raise FileNotFoundError(f"Cannot find official DivPrune LLaVA code under {llava_root}")
++    sys.path.insert(0, str(llava_root))
++    from llava.model.llava_arch import LlavaMetaForCausalLM
++
++    class OfficialDivPruneCaller:
++        pass
++
++    caller = OfficialDivPruneCaller()
++    caller.pairwise_cosine_similarity = types.MethodType(
++        LlavaMetaForCausalLM.pairwise_cosine_similarity,
++        caller,
++    )
++    caller.DivPrune = types.MethodType(LlavaMetaForCausalLM.DivPrune, caller)
++    _OFFICIAL_DIVPRUNE_CALLER = caller
++    return caller
++
+ 
+ class Qwen2_5_VLMLP(nn.Module):
+     def __init__(self, config, bias: bool = False):
+@@ -1452,6 +1483,8 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
+ 
+         enable_visionzip: Optional[bool] = None,
+         visionzip_ratio: Optional[float] = None,
++        enable_divprune: Optional[bool] = None,
++        divprune_ratio: Optional[float] = None,
+         enable_kdvz: Optional[bool] = None,
+         kdvz_ratio: Optional[float] = None,
+ 
+@@ -1556,6 +1589,53 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
+                 delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=1)
+                 position_ids += delta.to(position_ids.device)
+ 
++        if select_pixel and enable_divprune:
++            if enable_visionzip or enable_kdvz or enable_policy:
++                raise ValueError("enable_divprune must not be combined with VisionZip, KDVZ, or policy pruning.")
++            if input_ids is None:
++                raise ValueError("DivPrune requires input_ids to locate visual placeholders.")
++            if batch_size != 1:
++                raise ValueError(f"DivPrune Qwen2.5-VL eval path currently expects batch_size=1, got {batch_size}.")
++
++            retained_ratio = float(divprune_ratio)
++            if not (0.0 < retained_ratio <= 1.0):
++                raise ValueError(f"divprune_ratio must be in (0, 1], got {divprune_ratio}.")
++
++            img_mask = (input_ids[:1] == placeholder_vision_token)[0]
++            st_idx = torch.nonzero(img_mask, as_tuple=True)[0]
++            if st_idx.numel() > 0:
++                first, last = st_idx[0].item(), st_idx[-1].item()
++                img_feature_len = last - first + 1
++                visual_tokens = inputs_embeds[0, first : last + 1]
++                selected_visual_tokens, _ = _get_official_divprune_caller().DivPrune(
++                    visual_tokens.float(),
++                    img_feature_len,
++                    None,
++                    threshold_ratio=retained_ratio,
++                )
++                selected_visual_tokens = selected_visual_tokens.sort().values
++
++                select_mask = torch.zeros(img_feature_len, dtype=torch.bool, device=inputs_embeds.device)
++                select_mask[selected_visual_tokens] = True
++                img_mask[first : last + 1] = ~select_mask
++                img_mask = ~img_mask
++
++                position_ids = position_ids[:, :, img_mask]
++                attention_mask = attention_mask[:, img_mask]
++                inputs_embeds = inputs_embeds[:, img_mask]
++                self._last_divprune_pruned_inputs = {
++                    "input_ids": input_ids[:, img_mask].detach() if input_ids is not None else None,
++                    "inputs_embeds": inputs_embeds.detach(),
++                    "attention_mask": attention_mask.detach() if attention_mask is not None else None,
++                    "position_ids": position_ids.detach() if position_ids is not None else None,
++                    "initial_visual_tokens": int(img_feature_len),
++                    "kept_visual_tokens": int(select_mask.sum().item()),
++                    "divprune_ratio": retained_ratio,
++                    "official_divprune_root": str(Path(os.environ.get("DIVPRUNE_OFFICIAL_ROOT", "/project/6101803/enmingzz/divprune_official")).resolve()),
++                }
++
++                del visual_tokens, selected_visual_tokens, select_mask
++
+         if select_pixel and enable_visionzip:
+             dominant_tokens_ratio = 1 - visionzip_ratio
+             dominant_num = int(dominant_tokens_ratio * attn_logits.size(0))
+@@ -1581,23 +1661,36 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
+             select_mask[topk_indices] = True
+             false_pos = (~select_mask).nonzero(as_tuple=True)[0]  
+             select_mask[false_pos[target_indices]] = True
+-            img_mask = (input_ids == self.config.image_token_id)[0]  
+-            st_idx = torch.nonzero(img_mask, as_tuple=True)[0]        
+-            if st_idx.numel() > 0:
+-                first, last = st_idx[0].item(), st_idx[-1].item()    
+-                img_mask[first:last+1] = ~select_mask
+-                img_mask = ~img_mask
+-                contexual_input_idx = false_pos[target_indices]+first
+-            hidden_states_filtered = inputs_embeds[:, first:last+1][:,contextual_mask]
++            img_mask = (input_ids == self.config.image_token_id)[0]
++            image_positions = torch.nonzero(img_mask, as_tuple=True)[0]
++            if image_positions.numel() > 0:
++                if image_positions.numel() != select_mask.numel():
++                    raise RuntimeError(
++                        "VisionZip visual token count mismatch: "
++                        f"found {image_positions.numel()} image placeholders but "
++                        f"{select_mask.numel()} visual features."
++                    )
++                # Multi-image prompts can have text between image blocks, so visual placeholders
++                # are not always one contiguous first:last span.
++                keep_mask = torch.ones_like(img_mask, dtype=torch.bool)
++                keep_mask[image_positions] = select_mask
++                contexual_input_idx = image_positions[false_pos[target_indices]]
++            hidden_states_filtered = inputs_embeds[:, image_positions][:,contextual_mask]
+             hidden_to_merge = hidden_states_filtered[:, ~torch.isin(torch.arange(hidden_states_filtered.shape[1], device=hidden_states_filtered.device), target_indices), :]
+             aggregated_hidden = torch.bmm(assign_one_hot.transpose(1, 2), hidden_to_merge) / counts
+             target_hidden = hidden_states_filtered[:, target_indices, :]  
+             
+             contextual_tokens = target_hidden + aggregated_hidden
+-            position_ids = position_ids[:,:,img_mask]
+-            attention_mask = attention_mask[:, img_mask]
++            position_ids = position_ids[:,:,keep_mask]
++            attention_mask = attention_mask[:, keep_mask]
+             inputs_embeds[:,contexual_input_idx] =  contextual_tokens
+-            inputs_embeds = inputs_embeds[:, img_mask]
++            inputs_embeds = inputs_embeds[:, keep_mask]
++            self._last_visionzip_pruned_inputs = {
++                "input_ids": input_ids[:, keep_mask].detach() if input_ids is not None else None,
++                "inputs_embeds": inputs_embeds.detach(),
++                "attention_mask": attention_mask.detach() if attention_mask is not None else None,
++                "position_ids": position_ids.detach() if position_ids is not None else None,
++            }
+             del contextual_tokens, hidden_states_filtered, hidden_to_merge,aggregated_hidden
+ 
+         
+@@ -1784,6 +1877,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
+ 
+         enable_visionzip: Optional[bool] = None,
+         visionzip_ratio: Optional[float] = None,
++        enable_divprune: Optional[bool] = None,
++        divprune_ratio: Optional[float] = None,
+         enable_kdvz: Optional[bool] = None,
+         kdvz_ratio: Optional[float] = None,
+ 
+@@ -1873,6 +1968,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
+             enable_policy=enable_policy,
+             enable_visionzip=enable_visionzip,
+             visionzip_ratio=visionzip_ratio,
++            enable_divprune=enable_divprune,
++            divprune_ratio=divprune_ratio,
+             enable_kdvz=enable_kdvz,
+             kdvz_ratio=kdvz_ratio,
+             enable_kd_kvcache=enable_kd_kvcache,
+@@ -2157,4 +2254,4 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
+         return input_ids, model_kwargs
+ 
+ 
+-__all__ = ["Qwen2_5_VLForConditionalGeneration", "Qwen2_5_VLModel", "Qwen2_5_VLPreTrainedModel", "Qwen2_5_VLTextModel"]
+\ No newline at end of file
++__all__ = ["Qwen2_5_VLForConditionalGeneration", "Qwen2_5_VLModel", "Qwen2_5_VLPreTrainedModel", "Qwen2_5_VLTextModel"]
+diff --git a/vlmeval/config.py b/vlmeval/config.py
+index c38d1c33..26c98646 100644
+--- a/vlmeval/config.py
++++ b/vlmeval/config.py
+@@ -1519,13 +1519,21 @@ qwen2vl_series = {
+     "Qwen": partial(
+         Qwen2VLChat,
+         model_path=os.environ.get("model_path", "Qwen/Qwen2.5-VL-7B-Instruct"),
++        adapter_path=os.environ.get("adapter_path", ""),
+         min_pixels=1280 * 28 * 28,
+-        max_pixels=16384 * 28 * 28,
++        max_pixels=4096 * 28 * 28,
+         use_custom_prompt=False,
+         enable_thinking=get_bool_env("enable_thinking", True),
+ 
+         num_return_sequences=int(os.environ.get("num_return_sequences", 1)),
+         temperature=float(os.environ.get("temperature", 0.7)),
++        use_kv_cache=get_bool_env("use_kv_cache", True),
++
++        enable_visionzip=get_bool_env("enable_visionzip", False),
++        visionzip_ratio=float(os.environ.get("visionzip_ratio", 0.0)),
++
++        enable_divprune=get_bool_env("enable_divprune", False),
++        divprune_ratio=float(os.environ.get("divprune_ratio", 0.0)),
+ 
+         enable_kdvz=get_bool_env("enable_kdvz", False),
+         kdvz_ratio=float(os.environ.get("kdvz_ratio", 0.0)),
+@@ -1548,6 +1556,13 @@ qwen2vl_series = {
+         enable_thinking=get_bool_env("enable_thinking", True),
+ 
+         temperature=float(os.environ.get("temperature", 0.7)),
++        use_kv_cache=get_bool_env("use_kv_cache", True),
++
++        enable_visionzip=get_bool_env("enable_visionzip", False),
++        visionzip_ratio=float(os.environ.get("visionzip_ratio", 0.0)),
++
++        enable_divprune=get_bool_env("enable_divprune", False),
++        divprune_ratio=float(os.environ.get("divprune_ratio", 0.0)),
+ 
+         enable_kdvz=get_bool_env("enable_kdvz", False),
+         kdvz_ratio=float(os.environ.get("kdvz_ratio", 0.0)),
+diff --git a/vlmeval/dataset/image_mcq.py b/vlmeval/dataset/image_mcq.py
+index 087483d6..d19c4c88 100644
+--- a/vlmeval/dataset/image_mcq.py
++++ b/vlmeval/dataset/image_mcq.py
+@@ -1,4 +1,5 @@
+ from datetime import date
++import os
+ import re
+ import warnings
+ 
+@@ -263,6 +264,8 @@ class ImageMCQDataset(ImageBaseDataset):
+         assert model in ['chatgpt-0125', 'exact_matching', 'gpt-4-0125']
+         name_str_map = {'chatgpt-0125': 'openai', 'gpt-4-0125': 'gpt4'}
+         name_str = name_str_map[model] if model in name_str_map else model
++        if dataset == 'MMStar' and os.environ.get('MMSTAR_QWEN_JUDGE', '0').lower() in ('1', 'true', 'yes', 'y'):
++            name_str = f'{name_str}_qwenjudge'
+ 
+         if model == 'exact_matching':
+             model = None
+@@ -528,6 +531,7 @@ class MMMUProDataset(MMMUDataset):
+             self.data['question'] = ['placeholder'] * len(self.data)
+ 
+     DATASET_URL = {
++        'MMMU_Pro_4c': '',
+         'MMMU_Pro_10c': 'https://opencompass.openxlab.space/utils/VLMEval/MMMU_Pro_10c.tsv',
+         'MMMU_Pro_10c_COT': 'https://opencompass.openxlab.space/utils/VLMEval/MMMU_Pro_10c.tsv',
+         'MMMU_Pro_V': 'https://opencompass.openxlab.space/utils/VLMEval/MMMU_Pro_V.tsv',
+diff --git a/vlmeval/dataset/utils/multiple_choice.py b/vlmeval/dataset/utils/multiple_choice.py
+index 55002d5a..b30e760c 100644
+--- a/vlmeval/dataset/utils/multiple_choice.py
++++ b/vlmeval/dataset/utils/multiple_choice.py
+@@ -2,7 +2,9 @@ import pandas as pd
+ from ...utils import can_infer, track_progress_rich, can_infer_lego
+ from ...smp import *
+ import numpy as np
++import os
+ import re
++import threading
+ 
+ MMB_abbrs = {
+     'coarse_perception': 'CP',
+@@ -342,6 +344,180 @@ def build_choices(item):
+     return ret
+ 
+ 
++def _env_flag(name, default=False):
++    value = os.environ.get(name, None)
++    if value is None:
++        return default
++    return str(value).strip().lower() in ('1', 'true', 'yes', 'y', 'on')
++
++
++def _mmstar_qwen_judge_enabled(dataset_name):
++    return dataset_name == 'MMStar' and _env_flag('MMSTAR_QWEN_JUDGE', False)
++
++
++def _mmstar_qwen_judge_scope():
++    return os.environ.get('MMSTAR_QWEN_JUDGE_SCOPE', 'misses').strip().lower()
++
++
++def _extract_answer_tag_text(prediction):
++    text = str(prediction)
++    matches = re.findall(r'<answer\b[^>]*>(.*?)</answer>', text, flags=re.IGNORECASE | re.DOTALL)
++    if matches:
++        answer = matches[-1]
++    elif _env_flag('MMSTAR_QWEN_JUDGE_ALLOW_OPEN_ANSWER', True):
++        match = re.search(r'<answer\b[^>]*>(.*)$', text, flags=re.IGNORECASE | re.DOTALL)
++        answer = match.group(1) if match else ''
++    else:
++        answer = ''
++    if not answer:
++        answer = text
++    answer = re.sub(r'<[^>]+>', ' ', answer)
++    answer = answer.replace('<|im_end|>', ' ').replace('<|endoftext|>', ' ')
++    answer = re.sub(r'\s+', ' ', answer).strip()
++    return answer
++
++
++def _format_options_for_judge(choices):
++    lines = []
++    for key, value in choices.items():
++        if not pd.isna(value):
++            lines.append(f'{key}. {value}')
++    return '\n'.join(lines)
++
++
++def _format_gt_for_judge(item, choices):
++    gt = str(item['GT']).strip().upper()
++    if gt in choices and not pd.isna(choices[gt]):
++        return f'{gt}. {choices[gt]}'
++    return gt
++
++
++def _build_mmstar_qwen_judge_prompt(item, extracted_answer, choices):
++    return (
++        'You are a strict judge for a multiple-choice visual question answering benchmark.\n'
++        'You cannot see the image. Judge only whether the model answer matches the ground-truth option text, '
++        'using the question, options, ground-truth answer, and model answer below.\n'
++        'If the model answer explicitly selects the ground-truth letter, mark CORRECT.\n'
++        'If the model answer gives text semantically equivalent to the ground-truth option, mark CORRECT.\n'
++        'Otherwise mark WRONG. Do not give partial credit.\n'
++        'Return exactly one word: CORRECT or WRONG.\n\n'
++        f'Question:\n{item["question"]}\n\n'
++        f'Options:\n{_format_options_for_judge(choices)}\n\n'
++        f'Ground-truth answer:\n{_format_gt_for_judge(item, choices)}\n\n'
++        f'Model answer:\n{extracted_answer}\n\n'
++        'Judgement:'
++    )
++
++
++class _LocalQwenJudge:
++
++    def __init__(self):
++        import torch
++        from transformers import AutoModelForCausalLM, AutoTokenizer
++
++        self.model_path = os.environ.get('MMSTAR_QWEN_JUDGE_MODEL_PATH', 'Qwen/Qwen2.5-7B-Instruct')
++        self.max_new_tokens = int(os.environ.get('MMSTAR_QWEN_JUDGE_MAX_NEW_TOKENS', 16))
++        device = os.environ.get('MMSTAR_QWEN_JUDGE_DEVICE', 'cuda:0' if torch.cuda.is_available() else 'cpu')
++        dtype_name = os.environ.get('MMSTAR_QWEN_JUDGE_DTYPE', 'bfloat16' if torch.cuda.is_available() else 'float32')
++        if dtype_name == 'auto':
++            torch_dtype = 'auto'
++        else:
++            torch_dtype = getattr(torch, dtype_name)
++
++        if device == 'auto':
++            device_map = 'auto'
++        else:
++            device_map = {'': device}
++
++        self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
++        self.model = AutoModelForCausalLM.from_pretrained(
++            self.model_path,
++            trust_remote_code=True,
++            torch_dtype=torch_dtype,
++            device_map=device_map,
++        ).eval()
++        self.input_device = next(self.model.parameters()).device
++
++    def generate(self, prompt):
++        import torch
++
++        messages = [
++            {
++                'role': 'system',
++                'content': 'You are a concise and strict answer judge. Return only CORRECT or WRONG.',
++            },
++            {'role': 'user', 'content': prompt},
++        ]
++        if hasattr(self.tokenizer, 'apply_chat_template'):
++            text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
++        else:
++            text = messages[0]['content'] + '\n\n' + messages[1]['content']
++        inputs = self.tokenizer([text], return_tensors='pt').to(self.input_device)
++        with torch.inference_mode():
++            output_ids = self.model.generate(
++                **inputs,
++                max_new_tokens=self.max_new_tokens,
++                do_sample=False,
++                pad_token_id=self.tokenizer.eos_token_id,
++            )
++        new_tokens = output_ids[0][inputs.input_ids.shape[1]:]
++        return self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
++
++
++_MMSTAR_QWEN_JUDGE = None
++_MMSTAR_QWEN_JUDGE_LOCK = threading.Lock()
++
++
++def _get_mmstar_qwen_judge():
++    global _MMSTAR_QWEN_JUDGE
++    with _MMSTAR_QWEN_JUDGE_LOCK:
++        if _MMSTAR_QWEN_JUDGE is None:
++            _MMSTAR_QWEN_JUDGE = _LocalQwenJudge()
++        return _MMSTAR_QWEN_JUDGE
++
++
++def _parse_mmstar_qwen_verdict(text):
++    text = str(text).strip().upper()
++    if re.search(r'\bWRONG\b', text) or re.search(r'\bINCORRECT\b', text):
++        return 0
++    if re.search(r'\bCORRECT\b', text):
++        return 1
++    return None
++
++
++def _mmstar_qwen_judge_eval(item, original_result):
++    extracted_answer = _extract_answer_tag_text(item['prediction'])
++    if not extracted_answer:
++        return original_result
++
++    choices = build_choices(item)
++    prompt = _build_mmstar_qwen_judge_prompt(item, extracted_answer, choices)
++    try:
++        raw_judgement = _get_mmstar_qwen_judge().generate(prompt)
++    except Exception as err:
++        if _env_flag('MMSTAR_QWEN_JUDGE_STRICT', True):
++            raise
++        original_result['log'] += f' MMStar Qwen judge failed: {type(err).__name__}: {err}. '
++        return original_result
++
++    verdict = _parse_mmstar_qwen_verdict(raw_judgement)
++    if verdict is None:
++        if _env_flag('MMSTAR_QWEN_JUDGE_STRICT', True):
++            raise RuntimeError(f'Cannot parse MMStar Qwen judge output: {raw_judgement}')
++        original_result['log'] += (
++            f' MMStar Qwen judge unparseable. Extracted answer: {extracted_answer}. '
++            f'Judge output: {raw_judgement}. '
++        )
++        return original_result
++
++    original_result['hit'] = verdict
++    original_result['log'] += (
++        f' MMStar Qwen judge enabled. Model answer: {extracted_answer}. '
++        f'GT: {_format_gt_for_judge(item, choices)}. Judge output: {raw_judgement}. '
++    )
++    return original_result
++
++
+ def prefetch_answer(item):
+     choices = build_choices(item)
+     return can_infer(item['prediction'], choices)
+@@ -424,9 +600,13 @@ def eval_vanilla(model, item, dataset_name=None):
+     res = extract_answer_from_item(model, item, dataset_name=dataset_name)
+     opt, match_log = res['opt'], res['log']
+     if opt == item['GT']:
+-        return dict(hit=1, log=f'Match Log: {match_log}. ')
++        result = dict(hit=1, log=f'Match Log: {match_log}. ')
+     else:
+-        return dict(hit=0, log=f'Match Log: {match_log}. ')
++        result = dict(hit=0, log=f'Match Log: {match_log}. ')
++    qwen_scope = _mmstar_qwen_judge_scope()
++    if _mmstar_qwen_judge_enabled(dataset_name) and (qwen_scope == 'all' or result['hit'] == 0):
++        result = _mmstar_qwen_judge_eval(item, result)
++    return result
+ 
+ 
+ # For Circular Evaluation
+@@ -469,6 +649,10 @@ def mcq_vanilla_eval(model, data, meta, nproc, result_file, dataset_name=None):
+     if osp.exists(result_file):
+         result = load(result_file)
+     answer_map = {i: c for i, c in zip(meta['index'], meta['answer'])}
++    if _mmstar_qwen_judge_enabled(dataset_name) and nproc != 1:
++        logger = get_logger('Evaluation')
++        logger.warning('MMSTAR_QWEN_JUDGE is enabled; forcing MCQ evaluation nproc=1 for local Qwen judge safety.')
++        nproc = 1
+ 
+     if 'MMMU' in dataset_name:
+         data = MMMU_preproc(data)
+diff --git a/vlmeval/inference.py b/vlmeval/inference.py
+index 5ed8bcf2..ba844d21 100644
+--- a/vlmeval/inference.py
++++ b/vlmeval/inference.py
+@@ -1,3 +1,5 @@
++import json
++
+ import torch
+ import torch.distributed as dist
+ from vlmeval.config import supported_VLM
+@@ -184,6 +186,68 @@ def _is_structured_record(v):
+     return isinstance(v, dict) and 'prediction' in v and 'extra_records' in v
+ 
+ 
++def _record_prediction(v):
++    if _is_structured_record(v):
++        return str(v.get('prediction', ''))
++    return str(v)
++
++
++def _record_extra(v):
++    if _is_structured_record(v):
++        extra = v.get('extra_records', {})
++        return extra if isinstance(extra, dict) else {}
++    return {}
++
++
++def _attach_extra_record_columns(data, records):
++    extras = [_record_extra(x) for x in records]
++    if not any(extras):
++        return
++
++    data['extra_records'] = extras
++    keys = sorted({key for extra in extras for key in extra})
++    for key in keys:
++        if key in data:
++            continue
++        data[key] = [extra.get(key, '') for extra in extras]
++
++
++def _json_safe_value(v):
++    if v is None:
++        return None
++    try:
++        if hasattr(v, 'item'):
++            v = v.item()
++    except Exception:
++        pass
++    if isinstance(v, (str, int, float, bool)):
++        return v
++    return str(v)
++
++
++def _dump_raw_prediction_sidecar(data, result_file):
++    if 'raw_prediction' not in data:
++        return
++
++    sidecar_file = osp.splitext(result_file)[0] + '_raw_predictions.jsonl'
++    preferred = [
++        'index',
++        'question',
++        'answer',
++        'category',
++        'l2-category',
++        'prediction',
++        'parsed_prediction',
++        'raw_prediction',
++        'generated_token_len',
++    ]
++    columns = [x for x in preferred if x in data]
++    with open(sidecar_file, 'w', encoding='utf-8') as f:
++        for _, row in data.iterrows():
++            record = {key: _json_safe_value(row[key]) for key in columns}
++            f.write(json.dumps(record, ensure_ascii=False) + '\n')
++
++
+ # A wrapper for infer_data, do the pre & post processing
+ def infer_data_job(
+     model, work_dir, model_name, dataset, verbose=False, api_nproc=4, ignore_failed=False, use_vllm=False
+@@ -223,12 +287,9 @@ def infer_data_job(
+         for x in data['index']:
+             assert x in data_all
+         if os.getenv('SPLIT_THINK', False):
+-            if all(_is_structured_record(data_all[x]) for x in data['index']):
+-                prediction = [data_all[x]['prediction'] for x in data['index']]
+-                extra_records = [data_all[x]['extra_records'] for x in data['index']]
+-                data['extra_records'] = extra_records
+-            else:
+-                prediction = [str(data_all[x]) for x in data['index']]
++            records = [data_all[x] for x in data['index']]
++            prediction = [_record_prediction(x) for x in records]
++            _attach_extra_record_columns(data, records)
+ 
+             def split_thinking(s):
+                 if '</think>' in s:
+@@ -252,12 +313,13 @@ def infer_data_job(
+         else:
+             # data['prediction'] = [str(data_all[x]) for x in data['index']]
+             # Add for agent evaluation
+-            if all(_is_structured_record(data_all[x]) for x in data['index']):
+-                data['prediction'] = [data_all[x]['prediction'] for x in data['index']]
+-                data['extra_records'] = [data_all[x]['extra_records'] for x in data['index']]
++            records = [data_all[x] for x in data['index']]
++            if any(_is_structured_record(x) for x in records):
++                data['prediction'] = [_record_prediction(x) for x in records]
++                _attach_extra_record_columns(data, records)
+             else:
+                 # for majority voting
+-                vals = [data_all[x] for x in data['index']]
++                vals = records
+ 
+                 if all(isinstance(v, list) for v in vals):
+                     if 'prediction' in data:
+@@ -274,6 +336,7 @@ def infer_data_job(
+         if 'image' in data:
+             data.pop('image')
+ 
++        _dump_raw_prediction_sidecar(data, result_file)
+         dump(data, result_file)
+         for i in range(world_size):
+             os.remove(tmpl.format(i))
+diff --git a/vlmeval/vlm/qwen2_vl/model.py b/vlmeval/vlm/qwen2_vl/model.py
+index 75e76f07..a2d3536d 100644
+--- a/vlmeval/vlm/qwen2_vl/model.py
++++ b/vlmeval/vlm/qwen2_vl/model.py
+@@ -192,6 +192,12 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
+         repetition_penalty=1.0,
+         use_kv_cache: bool = True,
+ 
++        enable_visionzip=False,
++        visionzip_ratio=0.0,
++
++        enable_divprune=False,
++        divprune_ratio=0.0,
++
+         enable_kdvz=False,
+         kdvz_ratio=0.0,
+ 
+@@ -245,6 +251,12 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
+             use_cache=use_kv_cache,
+ 
+             enable_policy=enable_policy,
++
++            enable_visionzip=enable_visionzip,
++            visionzip_ratio=visionzip_ratio,
++
++            enable_divprune=enable_divprune,
++            divprune_ratio=divprune_ratio,
+             
+             enable_kdvz=enable_kdvz,
+             kdvz_ratio=kdvz_ratio,
+@@ -259,6 +271,7 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
+         self.system_prompt = system_prompt
+         self.verbose = verbose
+         self.post_process = post_process
++        self.adapter_path = kwargs.get('adapter_path', '') or ''
+         self.fps = kwargs.pop('fps', 2)
+         self.nframe = kwargs.pop('nframe', 128)
+         if self.fps is None and self.nframe is None:
+@@ -347,6 +360,12 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
+                     model_path, dtype='bfloat16', device_map="auto", attn_implementation='flash_attention_2'
+                 )
+                 self.model.eval()
++            if self.adapter_path:
++                from peft import PeftModel
++
++                print('Loading PEFT adapter:', self.adapter_path)
++                self.model = PeftModel.from_pretrained(self.model, self.adapter_path)
++                self.model.eval()
+ 
+         from pprint import pprint
+         print("Generate kwargs:")
+@@ -364,6 +383,7 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
+         inputs list[dict[str, str]], each dict has keys: ['type', 'value']
+         """
+         content = []
++        image_count = sum(1 for s in inputs if s['type'] == 'image')
+         for s in inputs:
+             if s['type'] == 'image':
+                 item = {'type': 'image', 'image': ensure_image_url(s['value'])}
+@@ -372,6 +392,10 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
+                     warnings.warn(f"OCRBench dataset uses custom min_pixels={item['min_pixels']}")
+                     if self.max_pixels is not None:
+                         item['max_pixels'] = self.max_pixels
++                elif self._use_total_image_budget(dataset, image_count):
++                    min_pixels, max_pixels = self._per_image_pixel_budget(image_count)
++                    item['min_pixels'] = min_pixels
++                    item['max_pixels'] = max_pixels
+                 else:
+                     if self.min_pixels is not None:
+                         item['min_pixels'] = self.min_pixels
+@@ -412,6 +436,19 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
+             content.append(item)
+         return content
+ 
++    def _use_total_image_budget(self, dataset: str | None, image_count: int) -> bool:
++        if image_count <= 1 or dataset is None:
++            return False
++        return 'MMMU_PRO' in dataset.upper()
++
++    def _per_image_pixel_budget(self, image_count: int) -> tuple[int, int]:
++        token_area = 28 * 28
++        total_min_tokens = int(os.getenv('MMMU_PRO_TOTAL_MIN_IMAGE_TOKENS', self.min_pixels // token_area if self.min_pixels else 1280))
++        total_max_tokens = int(os.getenv('MMMU_PRO_TOTAL_MAX_IMAGE_TOKENS', self.max_pixels // token_area if self.max_pixels else 4096))
++        per_min_tokens = max(1, total_min_tokens // image_count)
++        per_max_tokens = max(per_min_tokens, total_max_tokens // image_count)
++        return per_min_tokens * token_area, per_max_tokens * token_area
++
+     def _prepare_content_vllm(self, inputs: list[dict[str, str]], dataset: str | None = None) -> list[dict[str, str]]:
+         """
+         inputs list[dict[str, str]], each dict has keys: ['type', 'value']
+@@ -419,6 +456,7 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
+         content = []
+         video_inputs = [s for s in inputs if s['type'] == 'video']
+         video_count = len(video_inputs)
++        image_count = sum(1 for s in inputs if s['type'] == 'image')
+         cur_image_count = 0
+         for s in inputs:
+             if s['type'] == 'image':
+@@ -428,6 +466,10 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
+                     warnings.warn(f"OCRBench dataset uses custom min_pixels={item['min_pixels']}")
+                     if self.max_pixels is not None:
+                         item['max_pixels'] = self.max_pixels
++                elif self._use_total_image_budget(dataset, image_count):
++                    min_pixels, max_pixels = self._per_image_pixel_budget(image_count)
++                    item['min_pixels'] = min_pixels
++                    item['max_pixels'] = max_pixels
+                 else:
+                     if self.min_pixels is not None:
+                         item['min_pixels'] = self.min_pixels
+@@ -811,11 +853,23 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
+         final_answers = []
+         # import pdb; pdb.set_trace()
+         for response in responses:
++            raw_response = response
+             num_generated_tokens = self.processor.tokenizer(response, return_tensors="pt").input_ids.shape[1]
+             self.num_total_dataset_generated_tokens += num_generated_tokens
+             if self.enable_thinking:
+                 response = self.extract_answer_from_thinking_response(response)
+-            final_answers.append(response.replace('\n', ' ').strip())
++            parsed_response = response.replace('\n', ' ').strip()
++            if os.environ.get('VLMEVAL_SAVE_RAW_PREDICTION', '1') != '0':
++                final_answers.append({
++                    'prediction': parsed_response,
++                    'extra_records': {
++                        'raw_prediction': raw_response,
++                        'parsed_prediction': parsed_response,
++                        'generated_token_len': int(num_generated_tokens),
++                    },
++                })
++            else:
++                final_answers.append(parsed_response)
+         
+         return final_answers[0] if len(final_answers) == 1 else final_answers
+ 

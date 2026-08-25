@@ -230,6 +230,9 @@ VisionZip Qwen2.5-VL implementation and pinned clean-Armen Transformers tree.
 The exact Killarney L40S package versions, patched source paths, model/data
 hashes, and evaluator runtime are recorded in
 `docs/reproducibility/CORE_TRAIN_EVAL_ENVIRONMENT_20260824.md`.
+The two distinct dirty VLMEvalKit/Transformers trees used for training and
+evaluation can be reconstructed and hash-verified from
+`third_party_patches/vlmevalkit_51682/`.
 
 ## Claim boundary
 

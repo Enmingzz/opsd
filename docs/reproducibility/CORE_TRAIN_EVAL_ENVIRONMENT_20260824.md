@@ -19,8 +19,9 @@ sha256sum \
 ```
 
 The repository still depends on separately patched VisionZip and VLMEvalKit
-trees. A Git commit from this repository alone is therefore not sufficient
-unless those source overrides also match the identities and hashes below.
+trees. The two exact dirty VLMEvalKit states are captured as verified patches
+under `third_party_patches/vlmevalkit_51682/`; reconstruct those checkouts and
+match the source-path precedence below before reproducing a run.
 
 ## Hardware and system runtime
 
@@ -128,10 +129,18 @@ That script places these paths first:
 | VLMEvalKit clean base | `51682a6baab948d3dbb4b867a3eab178504ac3f5` plus local evaluator patches |
 | Qwen2.5-VL-7B-Instruct HF revision | `cc594898137f460bfe9f0759e9844b3ce807cfb5` |
 
-The VLMEvalKit checkout is also dirty. Its local changes include the Qwen2.5
-VisionZip model wrapper, raw-output preservation, image-MCQ parsing, and
-inference/evaluator hooks. Copy the checkout or commit its patch before moving
-to another machine.
+The training and evaluation VLMEvalKit checkouts are intentionally different.
+Their local changes include the Qwen2.5-VL VisionZip model wrapper,
+FlashAttention training correction, raw-output preservation, image-MCQ
+parsing, and inference/evaluator hooks. Reconstruct both from the exact
+upstream commit with:
+
+```bash
+bash third_party_patches/vlmevalkit_51682/apply_and_verify.sh \
+  train /absolute/path/to/VLMEvalKit_train
+bash third_party_patches/vlmevalkit_51682/apply_and_verify.sh \
+  eval /absolute/path/to/VLMEvalKit_eval
+```
 
 ## Core file hashes
 

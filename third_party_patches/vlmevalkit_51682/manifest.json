@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-08-24",
+  "upstream": {
+    "repository": "https://github.com/open-compass/VLMEvalKit.git",
+    "commit": "51682a6baab948d3dbb4b867a3eab178504ac3f5"
+  },
+  "training_checkout": {
+    "killarney_path": "/project/6101803/enmingzz/opsd/third_party/VLMEvalKit_armen51682",
+    "patch": "train_checkout.patch",
+    "patch_sha256": "3d91b1c6dc97f193ab025d01ded22ecf70f13e6f90554f7d81c77cb1ef791073",
+    "patch_bytes": 8095,
+    "tracked_files_modified": 4,
+    "untracked_files": 0,
+    "target_hashes": "train_files.sha256"
+  },
+  "evaluation_checkout": {
+    "killarney_path": "/project/6101803/enmingzz/ckpt_eval_trainenv/VLMEvalKit_armen51682",
+    "patch": "eval_checkout.patch",
+    "patch_sha256": "8645fa7c606788716dcdc58cc4f0e6d5744839cf9119413ec2618ffb9bc56688",
+    "patch_bytes": 34548,
+    "tracked_files_modified": 7,
+    "untracked_files": 0,
+    "target_hashes": "eval_files.sha256"
+  }
+}
