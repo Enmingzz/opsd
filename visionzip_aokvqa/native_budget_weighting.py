@@ -275,6 +275,18 @@ class ProjectionFractionTokenPartition:
 
 
 @dataclass(frozen=True)
+class ProjectionFractionBottomDropPartition:
+    teacher_js: torch.Tensor
+    budget_js: torch.Tensor
+    teacher_plus_js: torch.Tensor
+    projection_mass: torch.Tensor
+    projection_fraction: torch.Tensor
+    dropped_mask: torch.Tensor
+    kept_mask: torch.Tensor
+    valid_mask: torch.Tensor
+
+
+@dataclass(frozen=True)
 class RandomTokenDropPartition:
     eligible_mask: torch.Tensor
     dropped_mask: torch.Tensor
@@ -296,6 +308,25 @@ class ProjectionMassGroupedWeights:
     weight: torch.Tensor
     valid_mask: torch.Tensor
     high_group_lambda: float
+    degenerate: bool
+
+
+@dataclass(frozen=True)
+class ProjectionFractionGroupedWeights:
+    teacher_js: torch.Tensor
+    budget_js: torch.Tensor
+    teacher_plus_js: torch.Tensor
+    projection_mass: torch.Tensor
+    projection_fraction: torch.Tensor
+    eligible_mask: torch.Tensor
+    selected_mask: torch.Tensor
+    complement_mask: torch.Tensor
+    raw_weight: torch.Tensor
+    loss_mass_scale: torch.Tensor
+    weight: torch.Tensor
+    valid_mask: torch.Tensor
+    selection: str
+    selected_group_lambda: float
     degenerate: bool
 
 
@@ -352,7 +383,7 @@ def projection_fraction_token_partition(
     select: str = "top",
     eps: float = 1e-8,
 ) -> ProjectionFractionTokenPartition:
-    """Select a detached top-F token partition or its exact complement."""
+    """Rank above-floor tokens by F and select the top set or its valid complement."""
 
     with torch.no_grad():
         tensors = [
@@ -404,7 +435,10 @@ def projection_fraction_token_partition(
                 stable=True,
             )
             top[eligible_indices[ranked_local[:top_count]]] = True
-        selected = top if selection == "top" else eligible & ~top
+        # The KL floor controls only which tokens may enter the top-F set. The
+        # bottom partition is the complement over every valid response token,
+        # including tokens below the ranking floor.
+        selected = top if selection == "top" else valid & ~top
 
     return ProjectionFractionTokenPartition(
         teacher_js=teacher.detach(),
@@ -415,6 +449,72 @@ def projection_fraction_token_partition(
         eligible_mask=eligible.detach(),
         top_mask=top.detach(),
         selected_mask=selected.detach(),
+        valid_mask=valid.detach(),
+    )
+
+
+def projection_fraction_bottom_drop_partition(
+    teacher_js: torch.Tensor,
+    budget_js: torch.Tensor,
+    teacher_plus_js: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    drop_fraction: float = 0.10,
+    eps: float = 1e-8,
+) -> ProjectionFractionBottomDropPartition:
+    """Drop the lowest-F response tokens without applying a KL eligibility floor."""
+
+    with torch.no_grad():
+        teacher, budget, teacher_plus = [
+            value.detach().float().reshape(-1)
+            for value in (teacher_js, budget_js, teacher_plus_js)
+        ]
+        valid = valid_mask.detach().to(device=teacher.device, dtype=torch.bool).reshape(-1)
+        if not all(value.shape == teacher.shape for value in (budget, teacher_plus, valid)):
+            raise ValueError("Bottom-F drop inputs and valid mask must align.")
+        if not valid.any():
+            raise ValueError("Bottom-F dropping requires a valid generated token.")
+        if not all(torch.isfinite(value[valid]).all() for value in (teacher, budget, teacher_plus)):
+            raise FloatingPointError("Bottom-F drop JSD inputs must be finite on valid positions.")
+        if (
+            (teacher[valid] < 0).any()
+            or (budget[valid] < 0).any()
+            or (teacher_plus[valid] < 0).any()
+        ):
+            raise ValueError("Bottom-F drop JSD inputs must be nonnegative.")
+        fraction = float(drop_fraction)
+        eps = float(eps)
+        if not math.isfinite(fraction) or not 0.0 < fraction < 1.0:
+            raise ValueError(f"drop_fraction must be in (0, 1), got {drop_fraction}.")
+        if not math.isfinite(eps) or eps <= 0.0:
+            raise ValueError(f"eps must be finite and positive, got {eps}.")
+
+        projection = 0.5 * (teacher + budget - teacher_plus)
+        projection_fraction = projection / (teacher + eps)
+        valid_indices = torch.nonzero(valid, as_tuple=False).reshape(-1)
+        valid_count = int(valid_indices.numel())
+        drop_count = min(
+            max(0, valid_count - 1),
+            max(1, int(math.ceil(fraction * valid_count))),
+        )
+        dropped = torch.zeros_like(valid)
+        if drop_count:
+            ranked_local = torch.argsort(
+                projection_fraction[valid_indices],
+                descending=False,
+                stable=True,
+            )
+            dropped[valid_indices[ranked_local[:drop_count]]] = True
+        kept = valid & ~dropped
+
+    return ProjectionFractionBottomDropPartition(
+        teacher_js=teacher.detach(),
+        budget_js=budget.detach(),
+        teacher_plus_js=teacher_plus.detach(),
+        projection_mass=projection.detach(),
+        projection_fraction=projection_fraction.detach(),
+        dropped_mask=dropped.detach(),
+        kept_mask=kept.detach(),
         valid_mask=valid.detach(),
     )
 
@@ -449,7 +549,9 @@ def deterministic_random_token_drop_partition(
         if not key:
             raise ValueError("sample_key must be nonempty.")
 
-        eligible = valid & (kl >= threshold)
+        # A zero threshold means no eligibility floor. Do not let tiny
+        # negative roundoff in an otherwise nonnegative KL exclude tokens.
+        eligible = valid if threshold == 0.0 else valid & (kl >= threshold)
         eligible_indices = torch.nonzero(eligible, as_tuple=False).reshape(-1)
         eligible_count = int(eligible_indices.numel())
         drop_count = (
@@ -608,6 +710,148 @@ def projection_mass_grouped_weights(
         weight=weight.detach(),
         valid_mask=valid.detach(),
         high_group_lambda=coefficient,
+        degenerate=degenerate,
+    )
+
+
+def projection_fraction_grouped_weights(
+    teacher_js: torch.Tensor,
+    budget_js: torch.Tensor,
+    teacher_plus_js: torch.Tensor,
+    per_token_loss: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    group_fraction: float,
+    selected_group_lambda: float,
+    selection: str = "top",
+    min_kl: float = 1e-5,
+    preserve_loss_mass: bool = False,
+    eps: float = 1e-8,
+) -> ProjectionFractionGroupedWeights:
+    """Mix selected-F and complement token losses with an explicit coefficient.
+
+    The selected group is the requested top or bottom fraction of eligible
+    tokens ranked by ``F = ((A + B - C) / 2) / A``. The KL floor only controls
+    ranking eligibility; every valid generated token belongs to exactly one of
+    the two loss groups. Raw weights reconstruct
+    ``lambda * mean(selected) + (1-lambda) * mean(complement)`` when consumed
+    by a mean over valid tokens.
+    """
+
+    fraction = float(group_fraction)
+    coefficient = float(selected_group_lambda)
+    threshold = float(min_kl)
+    eps = float(eps)
+    selection = str(selection).strip().lower()
+    if not math.isfinite(fraction) or not 0.0 < fraction < 1.0:
+        raise ValueError(f"group_fraction must be in (0, 1), got {group_fraction}.")
+    if not math.isfinite(coefficient) or not 0.0 < coefficient < 1.0:
+        raise ValueError(
+            "selected_group_lambda must be in (0, 1), got "
+            f"{selected_group_lambda}."
+        )
+    if not math.isfinite(threshold) or threshold < 0.0:
+        raise ValueError(f"min_kl must be finite and nonnegative, got {min_kl}.")
+    if not math.isfinite(eps) or eps <= 0.0:
+        raise ValueError(f"eps must be finite and positive, got {eps}.")
+    if selection not in {"top", "bottom"}:
+        raise ValueError(f"selection must be 'top' or 'bottom', got {selection!r}.")
+
+    with torch.no_grad():
+        teacher, budget, teacher_plus, loss = [
+            value.detach().float().reshape(-1)
+            for value in (teacher_js, budget_js, teacher_plus_js, per_token_loss)
+        ]
+        valid = valid_mask.detach().to(device=teacher.device, dtype=torch.bool).reshape(-1)
+        if not all(value.shape == teacher.shape for value in (budget, teacher_plus, loss, valid)):
+            raise ValueError("Projection-fraction grouped inputs and valid mask must align.")
+        if not valid.any():
+            raise ValueError("Projection-fraction grouping requires a valid generated token.")
+        for name, values in (
+            ("teacher_js", teacher),
+            ("budget_js", budget),
+            ("teacher_plus_js", teacher_plus),
+            ("per_token_loss", loss),
+        ):
+            if not torch.isfinite(values[valid]).all():
+                raise ValueError(f"{name} must be finite on valid positions.")
+        if (
+            (teacher[valid] < -1e-6).any()
+            or (budget[valid] < -1e-6).any()
+            or (teacher_plus[valid] < -1e-6).any()
+            or (loss[valid] < -1e-6).any()
+        ):
+            raise ValueError("JSD and OPSD loss inputs must be nonnegative.")
+
+        projection = 0.5 * (teacher + budget - teacher_plus)
+        projection_fraction = projection / teacher.clamp_min(eps)
+        # A zero threshold explicitly means rank every valid response token.
+        # This avoids excluding tiny negative round-off values from FP32 KL.
+        eligible = valid if threshold == 0.0 else valid & (loss >= threshold)
+        eligible_indices = torch.nonzero(eligible, as_tuple=False).reshape(-1)
+        eligible_count = int(eligible_indices.numel())
+        selected_count = (
+            min(eligible_count, max(1, int(math.ceil(fraction * eligible_count))))
+            if eligible_count
+            else 0
+        )
+        selected = torch.zeros_like(valid)
+        if selected_count:
+            ranked = torch.argsort(
+                projection_fraction[eligible_indices],
+                descending=selection == "top",
+                stable=True,
+            )
+            selected[eligible_indices[ranked[:selected_count]]] = True
+        complement = valid & ~selected
+        valid_count = int(valid.sum())
+        complement_count = int(complement.sum())
+        degenerate = selected_count == 0 or complement_count == 0
+
+        raw_weight = torch.zeros_like(loss)
+        if degenerate:
+            raw_weight[valid] = 1.0
+        else:
+            raw_weight[selected] = coefficient * valid_count / selected_count
+            raw_weight[complement] = (
+                (1.0 - coefficient) * valid_count / complement_count
+            )
+            if not torch.allclose(
+                raw_weight[valid].mean(),
+                torch.ones((), device=loss.device, dtype=torch.float32),
+                rtol=1e-6,
+                atol=1e-7,
+            ):
+                raise FloatingPointError("Grouped raw token weights must have mean one.")
+
+        reference_mass = loss[valid].sum()
+        grouped_mass = (raw_weight[valid] * loss[valid]).sum()
+        if preserve_loss_mass and float(reference_mass) > eps:
+            if not torch.isfinite(grouped_mass) or float(grouped_mass) <= 0.0:
+                raise FloatingPointError(
+                    f"Invalid grouped OPSD loss mass: {float(grouped_mass)}"
+                )
+            loss_mass_scale = reference_mass / grouped_mass
+        else:
+            loss_mass_scale = torch.ones((), device=loss.device, dtype=torch.float32)
+        weight = torch.zeros_like(loss)
+        weight[valid] = raw_weight[valid] * loss_mass_scale
+
+    return ProjectionFractionGroupedWeights(
+        teacher_js=teacher.detach(),
+        budget_js=budget.detach(),
+        teacher_plus_js=teacher_plus.detach(),
+        projection_mass=projection.detach(),
+        projection_fraction=projection_fraction.detach(),
+        eligible_mask=eligible.detach(),
+        selected_mask=selected.detach(),
+        complement_mask=complement.detach(),
+        raw_weight=raw_weight.detach(),
+        loss_mass_scale=loss_mass_scale.detach(),
+        weight=weight.detach(),
+        valid_mask=valid.detach(),
+        selection=selection,
+        selected_group_lambda=coefficient,
         degenerate=degenerate,
     )
 

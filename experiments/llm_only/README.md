@@ -35,6 +35,10 @@ The machine-readable requirements are in `scope_contract.json`.
   and matched random-drop controls.
 - `opsd_r010_projection_mass_va_group_dropout0_20260818/`: projection-mass
   grouped-loss controls.
+- `opsd_r010_f_bottom20_l030_d001_nofloor_dropout0_20260824/`: bottom-20% F
+  grouped-loss run with lambda 0.30, r010 to r011, and no KL ranking floor.
+- `opsd_r010_random_drop10_tokens_delta001_dropout0_20260824/`: deterministic
+  random-drop-10% response-token control matched to the r010 to r011 probe.
 - `../scripts/verify_lora_scope.py`: shared fresh-model and saved-adapter scope
   verifier.
 

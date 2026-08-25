@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import math
 
 import torch
 import torch.nn.functional as F
@@ -115,6 +116,36 @@ def keep_mask_after_topk_exclusion(
             keep[removed] = False
         if not keep.any():
             raise AssertionError("Top-k token exclusion removed every valid token.")
+    return keep.detach(), removed.detach()
+
+
+def keep_mask_above_kl_floor(
+    ranking_kl: torch.Tensor,
+    valid_mask: torch.Tensor,
+    min_kl: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Keep valid token positions whose detached KL is at least ``min_kl``.
+
+    The comparison is inclusive so a threshold of ``1e-5`` removes exactly
+    the positions with KL < 1e-5. Unlike top-k exclusion, an empty keep set is
+    allowed and must be handled by the caller with a graph-connected zero.
+    """
+
+    with torch.no_grad():
+        values = ranking_kl.detach().float().reshape(-1)
+        valid = valid_mask.detach().to(device=values.device, dtype=torch.bool).reshape(-1)
+        if values.shape != valid.shape:
+            raise ValueError(f"Ranking KL and valid mask must align: {values.shape} vs {valid.shape}.")
+        if not valid.any():
+            raise ValueError("Token KL floor filtering requires at least one valid token.")
+        if not torch.isfinite(values[valid]).all():
+            raise ValueError("Ranking KL must be finite on all valid tokens.")
+        threshold = float(min_kl)
+        if not math.isfinite(threshold) or threshold < 0.0:
+            raise ValueError(f"min_kl must be finite and nonnegative, got {min_kl}.")
+
+        keep = valid & (values >= threshold)
+        removed = torch.nonzero(valid & ~keep, as_tuple=False).reshape(-1)
     return keep.detach(), removed.detach()
 
 

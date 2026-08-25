@@ -121,6 +121,21 @@ def test_global_f_validation_accepts_absolute_seven_point_five_delta() -> None:
     )
 
 
+def test_native_budget_validation_accepts_absolute_one_percent_delta() -> None:
+    cfg = _paired_native_budget_cfg()
+    cfg["pruning"]["train_retention_ratios"] = [0.1]
+    cfg["paired_sampling"]["allow_custom_retention_ratios"] = True
+    cfg["opsd"]["native_budget_weighting"].update(
+        {"budget_delta_mode": "absolute", "budget_delta": 0.01}
+    )
+    validate_paired_native_budget_config(
+        cfg,
+        method="opsd_nogt",
+        parameter_scope="language_decoder_only",
+        pruning_method="visionzip",
+    )
+
+
 def test_adaptive_budget_warmup_is_exactly_balanced_and_deterministic() -> None:
     left = AdaptiveBudgetFrontierState(seed=123)
     right = AdaptiveBudgetFrontierState(seed=123)

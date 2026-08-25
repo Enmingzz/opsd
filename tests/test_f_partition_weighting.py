@@ -5,6 +5,8 @@ import torch
 
 from opsd.visionzip_aokvqa.native_budget_weighting import (
     deterministic_random_token_drop_partition,
+    projection_fraction_bottom_drop_partition,
+    projection_fraction_grouped_weights,
     projection_fraction_token_partition,
 )
 from opsd.visionzip_aokvqa.trajectory_weighting import (
@@ -25,7 +27,7 @@ def _token_inputs() -> tuple[torch.Tensor, ...]:
     return teacher, budget, teacher_plus, ranking_kl, valid
 
 
-def test_token_projection_top_and_bottom_are_exact_eligible_complements() -> None:
+def test_token_projection_top_and_bottom_are_exact_valid_complements() -> None:
     inputs = _token_inputs()
     top = projection_fraction_token_partition(
         *inputs,
@@ -42,10 +44,11 @@ def test_token_projection_top_and_bottom_are_exact_eligible_complements() -> Non
     assert top.eligible_mask.tolist() == [False, True, True, True, True, True]
     assert top.top_mask.tolist() == [False, True, False, False, False, False]
     assert torch.equal(top.top_mask, bottom.top_mask)
-    assert torch.equal(top.selected_mask | bottom.selected_mask, top.eligible_mask)
+    assert torch.equal(top.selected_mask | bottom.selected_mask, top.valid_mask)
     assert not bool((top.selected_mask & bottom.selected_mask).any())
     assert int(top.selected_mask.sum()) == 1
-    assert int(bottom.selected_mask.sum()) == 4
+    assert int(bottom.selected_mask.sum()) == 5
+    assert bool(bottom.selected_mask[0])
     assert not top.projection_fraction.requires_grad
 
 
@@ -68,24 +71,96 @@ def test_token_projection_selected_mean_preserves_per_token_loss_scale() -> None
     assert torch.allclose(differentiable_kl.grad, expected)
 
 
-@pytest.mark.parametrize("selection", ["top", "bottom"])
-def test_token_projection_allows_no_eligible_tokens(selection: str) -> None:
+def test_bottom_f_drop_ranks_all_valid_tokens_without_kl_floor() -> None:
     teacher, budget, teacher_plus, ranking_kl, valid = _token_inputs()
-    partition = projection_fraction_token_partition(
+    partition = projection_fraction_bottom_drop_partition(
+        teacher,
+        budget,
+        teacher_plus,
+        valid,
+        drop_fraction=0.10,
+    )
+    assert partition.dropped_mask.tolist() == [True, False, False, False, False, False]
+    assert int(partition.dropped_mask.sum()) == 1
+    assert int(partition.kept_mask.sum()) == 5
+    assert torch.equal(partition.dropped_mask | partition.kept_mask, valid)
+    assert not bool((partition.dropped_mask & partition.kept_mask).any())
+    assert ranking_kl[0] < 1e-5
+    assert not partition.projection_fraction.requires_grad
+
+
+def test_bottom_f_drop_uses_ceil_and_keeps_at_least_one_token() -> None:
+    teacher = torch.ones(11)
+    budget = torch.full((11,), 0.2)
+    projection_fraction = torch.linspace(-0.5, 0.5, 11)
+    teacher_plus = teacher + budget - 2.0 * projection_fraction * teacher
+    valid = torch.ones(11, dtype=torch.bool)
+    partition = projection_fraction_bottom_drop_partition(
+        teacher,
+        budget,
+        teacher_plus,
+        valid,
+        drop_fraction=0.10,
+    )
+    assert int(partition.dropped_mask.sum()) == 2
+    assert int(partition.kept_mask.sum()) == 9
+
+    singleton = projection_fraction_bottom_drop_partition(
+        teacher[:1],
+        budget[:1],
+        teacher_plus[:1],
+        valid[:1],
+        drop_fraction=0.10,
+    )
+    assert not bool(singleton.dropped_mask.any())
+    assert bool(singleton.kept_mask.all())
+
+
+def test_bottom_f_drop_mean_has_gradients_only_on_kept_tokens() -> None:
+    teacher, budget, teacher_plus, ranking_kl, valid = _token_inputs()
+    partition = projection_fraction_bottom_drop_partition(
+        teacher,
+        budget,
+        teacher_plus,
+        valid,
+        drop_fraction=0.10,
+    )
+    losses = ranking_kl.clone().requires_grad_(True)
+    losses[partition.kept_mask].mean().backward()
+    assert torch.equal(losses.grad[partition.dropped_mask], torch.zeros(1))
+    assert torch.allclose(
+        losses.grad[partition.kept_mask],
+        torch.full((5,), 0.2),
+    )
+
+
+def test_token_projection_no_eligible_tokens_puts_all_valid_tokens_in_bottom() -> None:
+    teacher, budget, teacher_plus, ranking_kl, valid = _token_inputs()
+    top = projection_fraction_token_partition(
         teacher,
         budget,
         teacher_plus,
         ranking_kl,
         valid,
         min_kl=1.0,
-        select=selection,
+        select="top",
     )
-    assert not bool(partition.eligible_mask.any())
-    assert not bool(partition.top_mask.any())
-    assert not bool(partition.selected_mask.any())
+    bottom = projection_fraction_token_partition(
+        teacher,
+        budget,
+        teacher_plus,
+        ranking_kl,
+        valid,
+        min_kl=1.0,
+        select="bottom",
+    )
+    assert not bool(top.eligible_mask.any())
+    assert not bool(top.top_mask.any())
+    assert not bool(top.selected_mask.any())
+    assert torch.equal(bottom.selected_mask, valid)
 
 
-def test_token_projection_one_eligible_token_keeps_exact_complement() -> None:
+def test_token_projection_one_eligible_token_keeps_valid_complement() -> None:
     teacher, budget, teacher_plus, ranking_kl, valid = _token_inputs()
     top = projection_fraction_token_partition(
         teacher,
@@ -107,9 +182,89 @@ def test_token_projection_one_eligible_token_keeps_exact_complement() -> None:
     )
     assert int(top.eligible_mask.sum()) == 1
     assert torch.equal(top.selected_mask, top.eligible_mask)
-    assert not bool(bottom.selected_mask.any())
-    assert torch.equal(top.selected_mask | bottom.selected_mask, top.eligible_mask)
+    assert int(bottom.selected_mask.sum()) == int(valid.sum()) - 1
+    assert torch.equal(top.selected_mask | bottom.selected_mask, valid)
     assert not bool((top.selected_mask & bottom.selected_mask).any())
+
+
+@pytest.mark.parametrize("selection", ["top", "bottom"])
+def test_projection_fraction_grouped_reconstructs_direct_group_loss(
+    selection: str,
+) -> None:
+    teacher, budget, teacher_plus, ranking_kl, valid = _token_inputs()
+    differentiable_kl = ranking_kl.clone().requires_grad_(True)
+    grouped = projection_fraction_grouped_weights(
+        teacher,
+        budget,
+        teacher_plus,
+        differentiable_kl,
+        valid,
+        group_fraction=0.2,
+        selected_group_lambda=0.3,
+        selection=selection,
+        min_kl=1e-5,
+    )
+    weighted = (grouped.weight[valid] * differentiable_kl[valid]).mean()
+    direct = (
+        0.3 * differentiable_kl[grouped.selected_mask].mean()
+        + 0.7 * differentiable_kl[grouped.complement_mask].mean()
+    )
+    assert torch.allclose(weighted, direct)
+    assert torch.allclose(grouped.raw_weight[valid].mean(), torch.tensor(1.0))
+    assert torch.equal(
+        grouped.selected_mask | grouped.complement_mask,
+        grouped.valid_mask,
+    )
+    assert not bool((grouped.selected_mask & grouped.complement_mask).any())
+    assert not grouped.weight.requires_grad
+    weighted.backward()
+    assert differentiable_kl.grad is not None
+
+
+def test_projection_fraction_grouped_matching_fraction_is_vanilla_mean() -> None:
+    n = 10
+    teacher = torch.ones(n)
+    budget = torch.linspace(0.01, 0.10, n)
+    projection_fraction = torch.linspace(-0.02, 0.05, n)
+    teacher_plus = teacher + budget - 2.0 * projection_fraction * teacher
+    losses = torch.linspace(0.1, 1.0, n)
+    valid = torch.ones(n, dtype=torch.bool)
+    grouped = projection_fraction_grouped_weights(
+        teacher,
+        budget,
+        teacher_plus,
+        losses,
+        valid,
+        group_fraction=0.2,
+        selected_group_lambda=0.2,
+        selection="top",
+        min_kl=0.0,
+    )
+    assert torch.allclose(grouped.raw_weight[valid], torch.ones(n))
+    assert torch.allclose(
+        (grouped.weight[valid] * losses[valid]).mean(),
+        losses.mean(),
+    )
+
+
+def test_projection_fraction_grouped_zero_floor_ranks_every_valid_token() -> None:
+    teacher, budget, teacher_plus, ranking_kl, valid = _token_inputs()
+    ranking_kl = ranking_kl.clone()
+    ranking_kl[0] = -1e-7
+    grouped = projection_fraction_grouped_weights(
+        teacher,
+        budget,
+        teacher_plus,
+        ranking_kl,
+        valid,
+        group_fraction=0.20,
+        selected_group_lambda=0.40,
+        selection="bottom",
+        min_kl=0.0,
+    )
+    assert torch.equal(grouped.eligible_mask, valid)
+    assert int(grouped.selected_mask.sum()) == 2
+    assert int(grouped.complement_mask.sum()) == 4
 
 
 def test_empty_token_partition_has_graph_connected_zero_loss() -> None:
@@ -157,6 +312,22 @@ def test_random_drop20_applies_kl_floor_before_random_partition() -> None:
     assert partition.eligible_mask.tolist() == [False, False, True, True, True]
     assert int(partition.dropped_mask.sum()) == 1
     assert int(partition.selected_mask.sum()) == 2
+
+
+def test_random_drop_zero_floor_includes_tiny_negative_roundoff() -> None:
+    kl = torch.tensor([-1e-8, 0.0, 1e-6, 0.1, 0.2])
+    valid = torch.ones(5, dtype=torch.bool)
+    partition = deterministic_random_token_drop_partition(
+        kl,
+        valid,
+        sample_key="sample-no-floor",
+        seed=7,
+        drop_fraction=0.2,
+        min_kl=0.0,
+    )
+    assert torch.equal(partition.eligible_mask, valid)
+    assert int(partition.dropped_mask.sum()) == 1
+    assert int(partition.selected_mask.sum()) == 4
 
 
 def test_trajectory_partition_is_exactly_twenty_percent_over_five_batches() -> None:

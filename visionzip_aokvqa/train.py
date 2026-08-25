@@ -50,6 +50,7 @@ from opsd.visionzip_aokvqa.losses import (
     compute_sequence_logprob,
     compute_token_ce,
     grpo_policy_loss,
+    keep_mask_above_kl_floor,
     keep_mask_after_topk_exclusion,
     resolve_token_outlier_top_k,
 )
@@ -76,6 +77,8 @@ from opsd.visionzip_aokvqa.native_budget_weighting import (
     max_kl_fraction_softmax_inverse_jsd_weights,
     native_budget_robustness_weights,
     normalize_candidate_loss_mass,
+    projection_fraction_bottom_drop_partition,
+    projection_fraction_grouped_weights,
     projection_fraction_token_partition,
     projection_mass_grouped_weights,
     symmetric_teacher_gap_stability_weights,
@@ -192,6 +195,8 @@ TOKEN_PROJECTION_PARTITION_MODES = {
 }
 TOKEN_RANDOM_DROP_MODE = "token_random_drop20"
 TOKEN_PROJECTION_MASS_GROUPED_MODE = "token_projection_mass_grouped"
+TOKEN_PROJECTION_FRACTION_GROUPED_MODE = "token_projection_fraction_grouped"
+TOKEN_PROJECTION_BOTTOM_DROP_MODE = "token_projection_fraction_drop_bottom"
 
 
 def load_yaml(path: str | Path) -> dict[str, Any]:
@@ -1357,6 +1362,8 @@ def opsd_nogt_step(
                 *TOKEN_PROJECTION_PARTITION_MODES,
                 TOKEN_RANDOM_DROP_MODE,
                 TOKEN_PROJECTION_MASS_GROUPED_MODE,
+                TOKEN_PROJECTION_FRACTION_GROUPED_MODE,
+                TOKEN_PROJECTION_BOTTOM_DROP_MODE,
             }:
                 sensitivity = compute_per_token_generalized_jsd(
                     b_plus_logits,
@@ -1616,6 +1623,12 @@ def opsd_nogt_step(
                 token_weight[valid] = 1.0
                 eligible_count = int(eligible.sum().cpu())
                 selected_count = int(valid.sum().cpu())
+                selected_eligible_count = int((valid & eligible).sum().cpu())
+                below_kl_floor = valid_mask & ~eligible
+                below_kl_floor_count = int(below_kl_floor.sum().cpu())
+                selected_below_kl_floor_count = int(
+                    (valid & below_kl_floor).sum().cpu()
+                )
                 eligible_projection_fraction = projection_fraction[eligible]
                 mode_metrics = {
                     "native_token_partition": partition_name,
@@ -1628,8 +1641,12 @@ def opsd_nogt_step(
                     ),
                     "native_token_partition_valid_tokens": int(valid_mask.sum().cpu()),
                     "native_token_partition_eligible_tokens": eligible_count,
-                    "native_token_partition_excluded_low_kl_tokens": int(
-                        (valid_mask & ~eligible).sum().cpu()
+                    "native_token_partition_below_kl_floor_tokens": below_kl_floor_count,
+                    "native_token_partition_below_kl_floor_selected_tokens": (
+                        selected_below_kl_floor_count
+                    ),
+                    "native_token_partition_excluded_low_kl_tokens": (
+                        below_kl_floor_count - selected_below_kl_floor_count
                     ),
                     "native_token_partition_top_tokens": int(top.sum().cpu()),
                     "native_token_partition_random_dropped_tokens": (
@@ -1639,7 +1656,14 @@ def opsd_nogt_step(
                     ),
                     "native_token_partition_selected_tokens": selected_count,
                     "native_token_partition_selected_fraction_of_eligible": (
-                        float(selected_count / eligible_count) if eligible_count else 0.0
+                        float(selected_eligible_count / eligible_count)
+                        if eligible_count
+                        else 0.0
+                    ),
+                    "native_token_partition_selected_fraction_of_valid": (
+                        float(selected_count / int(valid_mask.sum().cpu()))
+                        if valid_mask.any()
+                        else 0.0
                     ),
                     "native_token_partition_degenerate_eligible": eligible_count < 2,
                     "native_token_partition_empty_selected": selected_count == 0,
@@ -1794,6 +1818,229 @@ def opsd_nogt_step(
                     "native_projection_group_degenerate": weights.degenerate,
                 }
                 loss_type = "opsd_nogt_token_projection_mass_grouped_forward_kl"
+            elif weighting_mode == TOKEN_PROJECTION_FRACTION_GROUPED_MODE:
+                teacher_js_tokens = compute_per_token_generalized_jsd(
+                    teacher_logits,
+                    student_logits.detach(),
+                    beta=0.5,
+                    temperature=float(
+                        get_nested(
+                            cfg,
+                            "opsd.native_budget_weighting.sensitivity_temperature",
+                            1.0,
+                        )
+                    ),
+                    top_k=None,
+                    token_clip=None,
+                    clip_mode="token",
+                    chunk_size=int(
+                        get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)
+                    ),
+                ).detach().float()
+                teacher_plus_js_tokens = compute_per_token_generalized_jsd(
+                    teacher_logits,
+                    b_plus_logits,
+                    beta=0.5,
+                    temperature=float(
+                        get_nested(
+                            cfg,
+                            "opsd.native_budget_weighting.sensitivity_temperature",
+                            1.0,
+                        )
+                    ),
+                    top_k=None,
+                    token_clip=None,
+                    clip_mode="token",
+                    chunk_size=int(
+                        get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)
+                    ),
+                ).detach().float()
+                group_fraction = float(
+                    get_nested(cfg, "opsd.native_budget_weighting.top_fraction", 0.10)
+                )
+                selected_group_lambda = float(
+                    get_nested(
+                        cfg,
+                        "opsd.native_budget_weighting.selected_group_lambda",
+                        0.30,
+                    )
+                )
+                selection = str(
+                    get_nested(cfg, "opsd.native_budget_weighting.selection", "top")
+                ).strip().lower()
+                min_teacher_kl = float(
+                    get_nested(cfg, "opsd.native_budget_weighting.min_teacher_kl", 1e-5)
+                )
+                preserve_loss_mass = bool(
+                    get_nested(cfg, "opsd.native_budget_weighting.preserve_loss_mass", False)
+                )
+                weights = projection_fraction_grouped_weights(
+                    teacher_js_tokens,
+                    sensitivity,
+                    teacher_plus_js_tokens,
+                    per_token_opsd,
+                    valid_mask,
+                    group_fraction=group_fraction,
+                    selected_group_lambda=selected_group_lambda,
+                    selection=selection,
+                    min_kl=min_teacher_kl,
+                    preserve_loss_mass=preserve_loss_mass,
+                    eps=eps,
+                )
+                valid = weights.valid_mask
+                token_weight = weights.weight
+                selected = weights.selected_mask
+                complement = weights.complement_mask
+                raw_grouped_kl = (
+                    weights.raw_weight[valid] * per_token_opsd[valid]
+                ).mean()
+                selected_teacher_kl = per_token_opsd.detach().float()[selected]
+                selected_teacher_kl_ge_1e5 = selected_teacher_kl >= 1e-5
+                mode_metrics = {
+                    "native_projection_metric": "((A+B-C)/2)/A",
+                    "native_group_objective": (
+                        "lambda_selected_mean_plus_one_minus_lambda_complement_mean"
+                    ),
+                    "native_f_group_selection": selection,
+                    "native_top_fraction": group_fraction,
+                    "native_selected_group_lambda": selected_group_lambda,
+                    "native_complement_group_lambda": 1.0 - selected_group_lambda,
+                    "native_min_teacher_kl": min_teacher_kl,
+                    "native_preserve_loss_mass": preserve_loss_mass,
+                    "native_eligible_tokens": int(weights.eligible_mask.sum().cpu()),
+                    "native_selected_group_tokens": int(selected.sum().cpu()),
+                    "native_selected_group_teacher_kl_ge_1e5_tokens": int(
+                        selected_teacher_kl_ge_1e5.sum().cpu()
+                    ),
+                    "native_selected_group_teacher_kl_lt_1e5_tokens": int(
+                        (~selected_teacher_kl_ge_1e5).sum().cpu()
+                    ),
+                    "native_complement_group_tokens": int(complement.sum().cpu()),
+                    "native_selected_group_fraction": float(
+                        selected.sum().cpu() / valid.sum().cpu()
+                    ),
+                    "native_projection_fraction_min": float(
+                        weights.projection_fraction[valid].min().cpu()
+                    ),
+                    "native_projection_fraction_mean": float(
+                        weights.projection_fraction[valid].mean().cpu()
+                    ),
+                    "native_projection_fraction_max": float(
+                        weights.projection_fraction[valid].max().cpu()
+                    ),
+                    "native_selected_group_opsd_kl_mean": (
+                        float(per_token_opsd[selected].detach().mean().cpu())
+                        if selected.any()
+                        else None
+                    ),
+                    "native_complement_group_opsd_kl_mean": (
+                        float(per_token_opsd[complement].detach().mean().cpu())
+                        if complement.any()
+                        else None
+                    ),
+                    "native_raw_grouped_kl": float(raw_grouped_kl.detach().cpu()),
+                    "native_raw_token_weight_min": float(
+                        weights.raw_weight[valid].min().cpu()
+                    ),
+                    "native_raw_token_weight_mean": float(
+                        weights.raw_weight[valid].mean().cpu()
+                    ),
+                    "native_raw_token_weight_max": float(
+                        weights.raw_weight[valid].max().cpu()
+                    ),
+                    "native_loss_mass_scale": float(weights.loss_mass_scale.cpu()),
+                    "native_projection_group_degenerate": weights.degenerate,
+                }
+                loss_type = "opsd_nogt_token_projection_fraction_grouped_forward_kl"
+            elif weighting_mode == TOKEN_PROJECTION_BOTTOM_DROP_MODE:
+                teacher_js_tokens = compute_per_token_generalized_jsd(
+                    teacher_logits,
+                    student_logits.detach(),
+                    beta=0.5,
+                    temperature=float(
+                        get_nested(
+                            cfg,
+                            "opsd.native_budget_weighting.sensitivity_temperature",
+                            1.0,
+                        )
+                    ),
+                    top_k=None,
+                    token_clip=None,
+                    clip_mode="token",
+                    chunk_size=int(
+                        get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)
+                    ),
+                ).detach().float()
+                teacher_plus_js_tokens = compute_per_token_generalized_jsd(
+                    teacher_logits,
+                    b_plus_logits,
+                    beta=0.5,
+                    temperature=float(
+                        get_nested(
+                            cfg,
+                            "opsd.native_budget_weighting.sensitivity_temperature",
+                            1.0,
+                        )
+                    ),
+                    top_k=None,
+                    token_clip=None,
+                    clip_mode="token",
+                    chunk_size=int(
+                        get_nested(cfg, "opsd.native_budget_weighting.kl_chunk_size", 32)
+                    ),
+                ).detach().float()
+                drop_fraction = float(
+                    get_nested(cfg, "opsd.native_budget_weighting.drop_fraction", 0.10)
+                )
+                bottom_drop = projection_fraction_bottom_drop_partition(
+                    teacher_js_tokens,
+                    sensitivity,
+                    teacher_plus_js_tokens,
+                    valid_mask,
+                    drop_fraction=drop_fraction,
+                    eps=eps,
+                )
+                valid = bottom_drop.kept_mask
+                dropped = bottom_drop.dropped_mask
+                token_weight = torch.zeros_like(per_token_opsd.detach().float())
+                token_weight[valid] = 1.0
+                dropped_kl = per_token_opsd.detach().float()[dropped]
+                kept_kl = per_token_opsd.detach().float()[valid]
+                full_kl_mass = per_token_opsd.detach().float()[valid_mask].sum()
+                dropped_kl_mass = dropped_kl.sum()
+                mode_metrics = {
+                    "native_projection_metric": "((A+B-C)/2)/(A+eps)",
+                    "native_token_partition": "drop_bottom_F_keep_complement",
+                    "native_token_partition_drop_fraction": drop_fraction,
+                    "native_token_partition_valid_tokens": int(valid_mask.sum().cpu()),
+                    "native_token_partition_dropped_tokens": int(dropped.sum().cpu()),
+                    "native_token_partition_kept_tokens": int(valid.sum().cpu()),
+                    "native_token_partition_actual_dropped_fraction": float(
+                        dropped.float().sum().cpu() / valid_mask.sum().cpu()
+                    ),
+                    "native_token_partition_uses_kl_floor": False,
+                    "native_token_partition_dropped_f_min": float(
+                        bottom_drop.projection_fraction[dropped].min().cpu()
+                    ) if dropped.any() else None,
+                    "native_token_partition_dropped_f_mean": float(
+                        bottom_drop.projection_fraction[dropped].mean().cpu()
+                    ) if dropped.any() else None,
+                    "native_token_partition_dropped_f_max": float(
+                        bottom_drop.projection_fraction[dropped].max().cpu()
+                    ) if dropped.any() else None,
+                    "native_token_partition_kept_f_mean": float(
+                        bottom_drop.projection_fraction[valid].mean().cpu()
+                    ),
+                    "native_token_partition_dropped_opsd_kl_mean": (
+                        float(dropped_kl.mean().cpu()) if dropped.any() else None
+                    ),
+                    "native_token_partition_kept_opsd_kl_mean": float(kept_kl.mean().cpu()),
+                    "native_token_partition_dropped_opsd_kl_mass_fraction": float(
+                        (dropped_kl_mass / full_kl_mass.clamp_min(1e-8)).cpu()
+                    ),
+                    "native_loss_mass_scale": 1.0,
+                }
+                loss_type = "opsd_nogt_token_projection_fraction_drop_bottom_forward_kl"
             elif weighting_mode == "trajectory_probe":
                 student_budget_jsd = compute_generalized_jsd(
                     b_plus_logits,
@@ -2839,8 +3086,14 @@ def opsd_nogt_step(
             unweighted_kl = trajectory_scalar_kl
             if weighting_mode == "trajectory_probe":
                 kl = trajectory_scalar_kl
-        elif weighting_mode in {*TOKEN_PROJECTION_PARTITION_MODES, TOKEN_RANDOM_DROP_MODE}:
-            if weighting_mode == TOKEN_RANDOM_DROP_MODE:
+        elif weighting_mode in {
+            *TOKEN_PROJECTION_PARTITION_MODES,
+            TOKEN_RANDOM_DROP_MODE,
+            TOKEN_PROJECTION_BOTTOM_DROP_MODE,
+        }:
+            if weighting_mode == TOKEN_PROJECTION_BOTTOM_DROP_MODE:
+                unweighted_kl = per_token_opsd[valid_mask].mean()
+            elif weighting_mode == TOKEN_RANDOM_DROP_MODE:
                 if token_random_drop_partition is None:
                     raise AssertionError("Random token drop partition was not computed.")
                 unweighted_kl = per_token_opsd[token_random_drop_partition.valid_mask].mean()
@@ -2856,7 +3109,11 @@ def opsd_nogt_step(
             weighted_token_kl = (token_weight[valid] * per_token_opsd[valid]).mean()
             unweighted_token_kl = per_token_opsd[valid].mean()
             kl = trajectory_scalar_kl + weighted_token_kl - unweighted_token_kl
-        elif weighting_mode in {*TOKEN_PROJECTION_PARTITION_MODES, TOKEN_RANDOM_DROP_MODE}:
+        elif weighting_mode in {
+            *TOKEN_PROJECTION_PARTITION_MODES,
+            TOKEN_RANDOM_DROP_MODE,
+            TOKEN_PROJECTION_BOTTOM_DROP_MODE,
+        }:
             # Keep a graph-connected zero for a legitimately empty partition.
             # This preserves strict top/complement semantics without a vanilla-loss fallback.
             kl = (
@@ -2960,10 +3217,70 @@ def opsd_nogt_step(
         )
         del b_plus_logits
     else:
+        kl_floor_filter_enabled = bool(
+            get_nested(cfg, "opsd.token_kl_floor_filter.enabled", False)
+        )
         outlier_exclusion_enabled = bool(
             get_nested(cfg, "opsd.token_outlier_exclusion.enabled", False)
         )
-        if outlier_exclusion_enabled:
+        if kl_floor_filter_enabled:
+            min_kl = float(get_nested(cfg, "opsd.token_kl_floor_filter.min_kl", 1e-5))
+            valid = generated_token_valid_mask(gen_ids)
+            forward_per_token_kl = compute_per_token_kl(
+                teacher_logits,
+                student_logits,
+                temperature=opsd_temperature,
+                chunk_size=int(
+                    get_nested(cfg, "opsd.token_kl_floor_filter.kl_chunk_size", 32)
+                ),
+            )
+            keep_mask, removed_indices = keep_mask_above_kl_floor(
+                forward_per_token_kl.detach(),
+                valid,
+                min_kl,
+            )
+            unfiltered_forward_kl = forward_per_token_kl[valid].mean()
+            kl = (
+                forward_per_token_kl[keep_mask].mean()
+                if keep_mask.any()
+                else forward_per_token_kl.sum() * 0.0
+            )
+            detached_forward_kl = forward_per_token_kl.detach().float()
+            removed_forward = detached_forward_kl[removed_indices]
+            valid_forward_sum = detached_forward_kl[valid].sum()
+            removed_forward_sum = removed_forward.sum()
+            removed_mass_fraction = removed_forward_sum / valid_forward_sum.clamp_min(1e-8)
+            valid_count = int(valid.sum().cpu())
+            kept_count = int(keep_mask.sum().cpu())
+            removed_count = int(removed_indices.numel())
+            weighting_metrics.update(
+                {
+                    "loss_type": "opsd_nogt_forward_kl_floor_filtered",
+                    "unweighted_kl_loss": float(unfiltered_forward_kl.detach().cpu()),
+                    "weighted_kl_loss": float(kl.detach().cpu()),
+                    "token_kl_floor_direction": "KL(teacher || student)",
+                    "token_kl_floor_threshold": min_kl,
+                    "token_kl_floor_comparison": "keep_kl_greater_than_or_equal_threshold",
+                    "token_kl_floor_valid_tokens": valid_count,
+                    "token_kl_floor_kept_tokens": kept_count,
+                    "token_kl_floor_removed_tokens": removed_count,
+                    "token_kl_floor_kept_fraction": kept_count / valid_count,
+                    "token_kl_floor_removed_fraction": removed_count / valid_count,
+                    "token_kl_floor_removed_kl_mass_fraction": float(
+                        removed_mass_fraction.cpu()
+                    ),
+                    "token_kl_floor_remaining_mean_normalized": True,
+                    "token_kl_floor_selection_detached": not keep_mask.requires_grad,
+                    "token_kl_floor_empty_selection": kept_count == 0,
+                    "token_kl_floor_filtered_to_unfiltered_loss_ratio": float(
+                        (
+                            kl.detach().float()
+                            / unfiltered_forward_kl.detach().float().clamp_min(1e-8)
+                        ).cpu()
+                    ),
+                }
+            )
+        elif outlier_exclusion_enabled:
             requested_top_k = resolve_token_outlier_top_k(
                 int(get_nested(cfg, "opsd.token_outlier_exclusion.top_k", 0) or 0),
                 get_nested(cfg, "opsd.token_outlier_exclusion.top_k_by_ratio", None),
@@ -5335,7 +5652,7 @@ def validate_paired_native_budget_config(
             delta = float(
                 get_nested(cfg, "opsd.native_budget_weighting.budget_delta", float("nan"))
             )
-            allowed_deltas = (0.02, 0.03, 0.05, 0.075, 0.10)
+            allowed_deltas = (0.01, 0.02, 0.03, 0.05, 0.075, 0.10)
             if not any(
                 math.isclose(delta, allowed, rel_tol=0.0, abs_tol=1e-12)
                 for allowed in allowed_deltas
@@ -5391,6 +5708,8 @@ def validate_paired_native_budget_config(
             "token_projection_fraction_bottom80",
             TOKEN_RANDOM_DROP_MODE,
             TOKEN_PROJECTION_MASS_GROUPED_MODE,
+            TOKEN_PROJECTION_FRACTION_GROUPED_MODE,
+            TOKEN_PROJECTION_BOTTOM_DROP_MODE,
         }
         if weighting_mode not in allowed_modes:
             raise ValueError(
@@ -5455,6 +5774,56 @@ def validate_paired_native_budget_config(
                 raise ValueError(
                     "Projection-mass grouping requires high_group_lambda in (0, 1)."
                 )
+        if weighting_mode == TOKEN_PROJECTION_FRACTION_GROUPED_MODE:
+            group_fraction = float(
+                get_nested(
+                    cfg,
+                    "opsd.native_budget_weighting.top_fraction",
+                    float("nan"),
+                )
+            )
+            selected_group_lambda = float(
+                get_nested(
+                    cfg,
+                    "opsd.native_budget_weighting.selected_group_lambda",
+                    float("nan"),
+                )
+            )
+            selection = str(
+                get_nested(cfg, "opsd.native_budget_weighting.selection", "")
+            ).strip().lower()
+            min_teacher_kl = float(
+                get_nested(
+                    cfg,
+                    "opsd.native_budget_weighting.min_teacher_kl",
+                    float("nan"),
+                )
+            )
+            if not math.isfinite(group_fraction) or not 0.0 < group_fraction < 1.0:
+                raise ValueError("Projection-F grouping requires top_fraction in (0, 1).")
+            if (
+                not math.isfinite(selected_group_lambda)
+                or not 0.0 < selected_group_lambda < 1.0
+            ):
+                raise ValueError(
+                    "Projection-F grouping requires selected_group_lambda in (0, 1)."
+                )
+            if selection not in {"top", "bottom"}:
+                raise ValueError("Projection-F grouping selection must be top or bottom.")
+            if not math.isfinite(min_teacher_kl) or min_teacher_kl < 0.0:
+                raise ValueError(
+                    "Projection-F grouping requires finite nonnegative min_teacher_kl."
+                )
+        if weighting_mode == TOKEN_PROJECTION_BOTTOM_DROP_MODE:
+            drop_fraction = float(
+                get_nested(
+                    cfg,
+                    "opsd.native_budget_weighting.drop_fraction",
+                    float("nan"),
+                )
+            )
+            if not math.isfinite(drop_fraction) or not 0.0 < drop_fraction < 1.0:
+                raise ValueError("Bottom-F token dropping requires drop_fraction in (0, 1).")
         if weighting_mode in {
             "max_kl_fraction_softmax_inverse_jsd",
             "max_kl_fraction_softmax_inverse_jsd_group_balanced",
@@ -6297,6 +6666,42 @@ def train(cfg: dict[str, Any]) -> Path:
     token_outlier_exclusion_enabled = bool(
         get_nested(cfg, "opsd.token_outlier_exclusion.enabled", False)
     )
+    token_kl_floor_filter_enabled = bool(
+        get_nested(cfg, "opsd.token_kl_floor_filter.enabled", False)
+    )
+    if token_kl_floor_filter_enabled:
+        if method != "opsd_nogt":
+            raise ValueError("Token KL floor filtering is restricted to training.method=opsd_nogt.")
+        min_kl = float(get_nested(cfg, "opsd.token_kl_floor_filter.min_kl", float("nan")))
+        if not math.isfinite(min_kl) or min_kl < 0.0:
+            raise ValueError("opsd.token_kl_floor_filter.min_kl must be finite and nonnegative.")
+        reduction = str(
+            get_nested(cfg, "opsd.token_kl_floor_filter.reduction", "mean_kept")
+        ).strip().lower()
+        if reduction != "mean_kept":
+            raise ValueError("Token KL floor filtering requires reduction=mean_kept.")
+        direction = str(
+            get_nested(
+                cfg,
+                "opsd.token_kl_floor_filter.kl_direction",
+                "teacher_to_student",
+            )
+        ).strip().lower()
+        if direction != "teacher_to_student":
+            raise ValueError(
+                "Token KL floor filtering must preserve OPSD KL(q_teacher || p_student)."
+            )
+        kl_chunk_size = int(
+            get_nested(cfg, "opsd.token_kl_floor_filter.kl_chunk_size", 32)
+        )
+        if kl_chunk_size <= 0:
+            raise ValueError("opsd.token_kl_floor_filter.kl_chunk_size must be positive.")
+        if token_outlier_exclusion_enabled:
+            raise ValueError("Token KL floor filtering cannot be combined with top-k exclusion.")
+        if bool(get_nested(cfg, "opsd.native_budget_weighting.enabled", False)):
+            raise ValueError("Token KL floor filtering cannot be combined with native budget weighting.")
+        if bool(get_nested(cfg, "opsd.trajectory_weighting.enabled", False)):
+            raise ValueError("Token KL floor filtering cannot be combined with trajectory weighting.")
     if token_outlier_exclusion_enabled:
         if method != "opsd_nogt":
             raise ValueError("Token outlier exclusion is restricted to training.method=opsd_nogt.")
@@ -6452,12 +6857,15 @@ def train(cfg: dict[str, Any]) -> Path:
         trajectory_weight_monitor_log_path.unlink()
     native_rank_log_path = output_dir / f"rank{rank}_native_budget_metrics.jsonl"
     outlier_rank_log_path = output_dir / f"rank{rank}_token_outlier_metrics.jsonl"
+    kl_floor_rank_log_path = output_dir / f"rank{rank}_token_kl_floor_metrics.jsonl"
     paired_rank_log_path = output_dir / f"rank{rank}_paired_sampling.jsonl"
     assignment_rank_log_path = output_dir / f"rank{rank}_sample_assignments.jsonl"
     if start_step == 0 and native_rank_log_path.exists():
         native_rank_log_path.unlink()
     if start_step == 0 and outlier_rank_log_path.exists():
         outlier_rank_log_path.unlink()
+    if start_step == 0 and kl_floor_rank_log_path.exists():
+        kl_floor_rank_log_path.unlink()
     if start_step == 0 and paired_rank_log_path.exists():
         paired_rank_log_path.unlink()
     if start_step == 0 and assignment_rank_log_path.exists():
@@ -6469,6 +6877,7 @@ def train(cfg: dict[str, Any]) -> Path:
             trim_jsonl_to_step(ratio_group_monitor_log_path, start_step)
         trim_jsonl_to_step(native_rank_log_path, start_step)
         trim_jsonl_to_step(outlier_rank_log_path, start_step)
+        trim_jsonl_to_step(kl_floor_rank_log_path, start_step)
         trim_jsonl_to_step(paired_rank_log_path, start_step)
         trim_jsonl_to_step(assignment_rank_log_path, start_step)
         distributed_barrier(distributed)
@@ -6643,6 +7052,9 @@ def train(cfg: dict[str, Any]) -> Path:
             f"opsd_token_outlier_top_k={get_nested(cfg, 'opsd.token_outlier_exclusion.top_k', 0)}\n"
             f"opsd_token_outlier_top_k_by_ratio={get_nested(cfg, 'opsd.token_outlier_exclusion.top_k_by_ratio', None)}\n"
             f"opsd_token_outlier_ranking_kl_direction={get_nested(cfg, 'opsd.token_outlier_exclusion.ranking_kl_direction', '')}\n"
+            f"opsd_token_kl_floor_filter={token_kl_floor_filter_enabled}\n"
+            f"opsd_token_kl_floor_min_kl={get_nested(cfg, 'opsd.token_kl_floor_filter.min_kl', '')}\n"
+            f"opsd_token_kl_floor_reduction={get_nested(cfg, 'opsd.token_kl_floor_filter.reduction', '')}\n"
             f"gradient_checkpointing={gradient_checkpointing_enabled}\n"
             f"gradient_checkpointing_use_reentrant={get_nested(cfg, 'training.gradient_checkpointing_use_reentrant', '') if gradient_checkpointing_enabled else ''}\n"
             f"epic_upstream_repository={EPIC_UPSTREAM_REPOSITORY if method == 'epic_official' else ''}\n"
@@ -7459,6 +7871,8 @@ def train(cfg: dict[str, Any]) -> Path:
                     write_jsonl(output_dir / f"rank{rank}_native_budget_metrics.jsonl", row)
                 if bool(get_nested(cfg, "opsd.token_outlier_exclusion.enabled", False)):
                     write_jsonl(outlier_rank_log_path, row)
+                if bool(get_nested(cfg, "opsd.token_kl_floor_filter.enabled", False)):
+                    write_jsonl(kl_floor_rank_log_path, row)
                 if bool(get_nested(cfg, "opsd.phase_ratio_scaling.enabled", False)):
                     write_jsonl(output_dir / f"rank{rank}_phase_ratio_scaling.jsonl", row)
                 if bool(get_nested(cfg, "paired_sampling.enabled", False)):

@@ -25,7 +25,7 @@ The main research objective is **not yet complete**: identify a simple,
 principled projection-fraction reweighting rule or modified OPSD objective
 that improves over original r010-only OPSD on the benchmark suite.
 
-## Status (2026-08-18)
+## Status (2026-08-24)
 
 ### Completed
 
@@ -44,16 +44,22 @@ that improves over original r010-only OPSD on the benchmark suite.
   random masks per sample.
 - Implemented merged-model evaluation with raw prediction sidecars and the
   canonical parser-first MathVista/MathVerse strict fallback protocols.
+- Completed the fixed-teacher LCOT-1K divergence sweep over 11 r010-only
+  checkpoints. The reproducible scorer stores exact FP32 JSD and both KL
+  directions for r010 to r011/r012/r015 on checkpoint-specific rollouts.
+- Added explicit projection-fraction grouped loss controls, bottom-F token
+  dropping, KL-floor filtering, and a deterministic random-token-drop control.
 
-### Running or queued
+### Current launchers
 
-- Global affine-F and intermediate-curriculum-F r010 runs.
-- Token bottom-80% r010 run.
-- Deterministic random-drop-20% token control.
-- Projection-mass grouped r010 runs.
+- Bottom-20% F grouped loss with lambda 0.30, r010 to r011 intervention, and
+  no KL eligibility floor.
+- Deterministic random-drop-10% response-token control matched to the r010 to
+  r011 probe configuration.
 - Five-benchmark evaluation of completed r010 ablations.
 
-These jobs are not treated as completed results in this repository.
+The repository publishes executable configurations, not cluster job state.
+Checkpoints, logs, and evaluation results remain outside Git.
 
 ### Not completed
 
@@ -136,9 +142,11 @@ Core implementation:
 
 - `visionzip_aokvqa/native_budget_weighting.py`
 - `visionzip_aokvqa/trajectory_weighting.py`
+- `visionzip_aokvqa/losses.py`
 - `visionzip_aokvqa/train.py`
 - `tests/test_f_partition_weighting.py`
 - `tests/test_projection_mass_grouped_weighting.py`
+- `tests/test_token_kl_floor_filter.py`
 - `tests/test_token_outlier_exclusion.py`
 
 Current r010 ablations:
@@ -147,6 +155,29 @@ Current r010 ablations:
 - `experiments/llm_only/opsd_r010_f_trajectory_partition_delta002_dropout0_20260817/`
 - `experiments/llm_only/opsd_r010_f_token_partition_delta002_dropout0_20260818/`
 - `experiments/llm_only/opsd_r010_projection_mass_va_group_dropout0_20260818/`
+- `experiments/llm_only/opsd_r010_f_bottom20_l030_d001_nofloor_dropout0_20260824/`
+- `experiments/llm_only/opsd_r010_random_drop10_tokens_delta001_dropout0_20260824/`
+
+## Fixed-teacher budget diagnostics
+
+The canonical r010-only LCOT-1K scorer generates a fresh greedy rollout for
+each checkpoint, then replays the same text under r010, expanded native
+VisionZip budgets, and the adapter-disabled full-token base teacher:
+
+```text
+analysis/r010_only_lcot1k_fixed_teacher_deltas_20260823/
+```
+
+The smaller RandomPruner control uses the first 200 holdout samples, steps
+0/1024/2048/3072, and a deterministic nested r010 to r011 random ranking:
+
+```text
+analysis/random_pruner_original_opsd_lcot200_fixed_teacher_d01_20260824/
+```
+
+Generated rollouts, token metrics, and plots are intentionally ignored by
+Git; both directories contain their runner, validator, analysis, and Slurm
+entry points.
 
 ## Five-benchmark evaluation
 
@@ -184,8 +215,10 @@ pytest -q \
   experiments/llm_only/opsd_random_r010_only_dropout0_20260815/tests/test_r010_20k_resume_contract.py \
   tests/test_f_partition_weighting.py \
   tests/test_projection_mass_grouped_weighting.py \
+  tests/test_token_kl_floor_filter.py \
   tests/test_token_outlier_exclusion.py \
   tests/test_trajectory_weighting.py \
+  analysis/r010_only_lcot1k_fixed_teacher_deltas_20260823/tests/test_metrics.py \
   tests/test_mathvista_strict_gt_postprocess.py \
   tests/test_mathverse_strict_gt_postprocess.py \
   hypothesis_validate/tests/test_random_fixed_mask_rollout.py
@@ -193,6 +226,10 @@ pytest -q \
 
 GPU smoke tests require the cluster environment supplying the official
 VisionZip Qwen2.5-VL implementation and pinned clean-Armen Transformers tree.
+
+The exact Killarney L40S package versions, patched source paths, model/data
+hashes, and evaluator runtime are recorded in
+`docs/reproducibility/CORE_TRAIN_EVAL_ENVIRONMENT_20260824.md`.
 
 ## Claim boundary
 
